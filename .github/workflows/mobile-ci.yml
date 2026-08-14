@@ -41,8 +41,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: mobile/package.json
       - run: npm install --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run doctor
