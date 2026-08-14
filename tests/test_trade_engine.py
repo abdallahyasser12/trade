@@ -49,6 +49,7 @@ from models import (
     MarketClock,
     OrderPurpose,
     OrderRecord,
+    SignalDecision,
     StopReason,
 )
 from risk_manager import RiskManager
@@ -1093,3 +1094,237 @@ def test_exit_cancels_stop_before_selling_and_books_pnl(tmp_path):
     assert len(sells) == 1
     assert sells[0]["fill_price"] == pytest.approx(97.0)
     assert sells[0]["realized_pnl"] == pytest.approx((97.0 - 100.0) * qty)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for crash-window findings from the adversarial review:
+# lost HTTP responses, deferred exits, and fills that complete while the
+# process is down must never produce duplicate live orders, untracked
+# sells, dropped exits, or a refused restart of the bot's own position.
+# ---------------------------------------------------------------------------
+
+
+class LostResponseBroker(FakeBroker):
+    """FakeBroker where a submit can succeed AT THE BROKER but the HTTP
+    response is lost (the call raises after the order was accepted)."""
+
+    def __init__(self, now: datetime = NOW):
+        super().__init__(now=now)
+        self.lose_next_stop_response = False
+        self.lose_next_sell_response = False
+
+    def submit_stop_order(self, symbol, qty, stop_price, client_order_id):
+        record = super().submit_stop_order(symbol, qty, stop_price, client_order_id)
+        if self.lose_next_stop_response:
+            self.lose_next_stop_response = False
+            raise BrokerError("connection dropped after the stop was accepted")
+        return record
+
+    def submit_market_order(self, symbol, qty, side, client_order_id):
+        record = super().submit_market_order(symbol, qty, side, client_order_id)
+        if self.lose_next_sell_response and side == "sell":
+            self.lose_next_sell_response = False
+            raise BrokerError("connection dropped after the sell was accepted")
+        return record
+
+
+class FlakyCancelBroker(FakeBroker):
+    """FakeBroker whose cancel_order fails a set number of times first."""
+
+    def __init__(self, now: datetime = NOW):
+        super().__init__(now=now)
+        self.cancel_failures_remaining = 0
+
+    def cancel_order(self, broker_order_id):
+        if self.cancel_failures_remaining > 0:
+            self.cancel_failures_remaining -= 1
+            raise BrokerError("cancel temporarily unavailable")
+        super().cancel_order(broker_order_id)
+
+
+def _swap_broker(h: Harness, broker_cls):
+    """Replace the harness broker with a stateful subclass, preserving clock."""
+    new_broker = broker_cls(now=h.now.now)
+    new_broker.clock = h.broker.clock
+    h.broker = new_broker
+    h.engine.broker = new_broker
+    return new_broker
+
+
+def test_lost_stop_submit_response_never_arms_second_stop(tmp_path):
+    """Finding: a stop submit whose response is lost must be adopted from
+    broker truth on the next cycle, not duplicated (two resting sells for
+    2x the position could turn the account short)."""
+    h = build_harness(tmp_path)
+    broker = _swap_broker(h, LostResponseBroker)
+    h.feed.frame = make_buy_bars(NOW)
+    broker.lose_next_stop_response = True
+
+    h.engine._startup()
+    h.engine.run_iteration()  # entry fills; stop submit "fails" after acceptance
+
+    # The stop exists at the broker even though the engine saw an error.
+    stops_at_broker = [o for o in broker.orders.values() if o.purpose == "stop"]
+    assert len(stops_at_broker) == 1
+
+    # Next cycles reconcile the persisted intent against broker truth.
+    h.engine.run_iteration()
+    h.engine.run_iteration()
+
+    assert len(submitted_by_purpose(h, OrderPurpose.STOP.value)) == 1
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None
+    assert pos["stop_client_order_id"] == stops_at_broker[0].client_order_id
+
+
+def test_lost_exit_submit_response_is_healed_not_shadowed_by_new_stop(tmp_path):
+    """Finding: a sell whose response is lost must be re-tracked from the
+    persisted order id; meanwhile no new protective stop may be armed
+    under the live sell (stop + filled sell would go short)."""
+    h = build_harness(tmp_path)
+    broker = _swap_broker(h, LostResponseBroker)
+    h.feed.frame = make_buy_bars(NOW)
+    h.engine._startup()
+    h.engine.run_iteration()  # position + stop armed
+    assert len(submitted_by_purpose(h, OrderPurpose.STOP.value)) == 1
+
+    exit_now = NOW + timedelta(days=3)
+    advance_time(h, exit_now)
+    broker.clock = h.broker.clock
+    broker.fill_price = 97.0
+    broker.lose_next_sell_response = True
+    h.feed.frame = make_exit_bars(exit_now)
+    with pytest.raises(BrokerError):
+        h.engine.run_iteration()  # sell accepted+filled at broker, response lost
+
+    # The engine lost track in memory but persisted the order id first.
+    assert h.engine._pending_exit is None
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["exit_client_order_id"]
+
+    h.engine.run_iteration()  # heals from broker truth
+
+    assert h.store.get_bot_position(SYMBOL) is None
+    assert len(submitted_by_purpose(h, OrderPurpose.STOP.value)) == 1  # no new stop
+    sells = [t for t in h.store.get_trades() if t["action"] == "SELL"]
+    assert len(sells) == 1
+    assert sells[0]["realized_pnl"] is not None
+
+
+def test_deferred_exit_is_retried_until_it_completes(tmp_path):
+    """Finding: an EXIT whose stop-cancel fails must not be dropped just
+    because the bar was already consumed — the persisted intent retries it
+    on later cycles, and no stop is re-armed while it is pending."""
+    h = build_harness(tmp_path)
+    broker = _swap_broker(h, FlakyCancelBroker)
+    h.feed.frame = make_buy_bars(NOW)
+    h.engine._startup()
+    h.engine.run_iteration()  # position + stop armed
+    stops_before = len(submitted_by_purpose(h, OrderPurpose.STOP.value))
+
+    exit_now = NOW + timedelta(days=3)
+    advance_time(h, exit_now)
+    broker.clock = h.broker.clock
+    broker.fill_price = 97.0
+    broker.cancel_failures_remaining = 1
+    h.feed.frame = make_exit_bars(exit_now)
+    h.engine.run_iteration()  # cancel fails; exit deferred, intent persisted
+
+    assert submitted_by_purpose(h, OrderPurpose.EXIT.value) == []
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["exit_pending_reason"] == "bearish_crossover"
+
+    h.engine.run_iteration()  # same bar (already processed) — retry fires anyway
+
+    exits = submitted_by_purpose(h, OrderPurpose.EXIT.value)
+    assert len(exits) == 1
+    assert h.store.get_bot_position(SYMBOL) is None
+    assert len(submitted_by_purpose(h, OrderPurpose.STOP.value)) == stops_before
+    sells = [t for t in h.store.get_trades() if t["action"] == "SELL"]
+    assert len(sells) == 1
+    assert sells[0]["reason"] == "bearish_crossover"
+
+
+def test_restart_adopts_position_from_own_entry_filled_while_down(tmp_path):
+    """Finding: an entry that fills while the process is down must be
+    adopted at restart (the orders table proves ownership) instead of
+    blocking the session and leaving the position unprotected."""
+    h = build_harness(tmp_path)
+    entry_ts = NOW - timedelta(days=1)
+    cid = make_client_order_id("deadbeefcafe", OrderPurpose.ENTRY.value, entry_ts, symbol=SYMBOL)
+    filled_entry = OrderRecord(
+        broker_order_id="prior-1",
+        client_order_id=cid,
+        symbol=SYMBOL,
+        purpose=OrderPurpose.ENTRY.value,
+        side="buy",
+        requested_qty=5.0,
+        filled_qty=5.0,
+        status="filled",
+        fill_price=101.0,
+        stop_price=None,
+        submitted_at=entry_ts,
+        updated_at=entry_ts,
+    )
+    h.broker.orders[cid] = filled_entry
+    h.broker.positions[SYMBOL] = BrokerPosition(
+        symbol=SYMBOL, qty=5.0, avg_entry_price=101.0, current_price=101.0,
+        market_value=505.0, unrealized_pl=0.0, unrealized_plpc=0.0,
+    )
+    h.store.record_order(filled_entry, "prior-session")
+    h.store.set_kv(
+        trade_engine.PENDING_ENTRY_KEY_PREFIX + SYMBOL,
+        json.dumps({"client_order_id": cid, "atr": 2.5, "signal": None}),
+    )
+
+    h.engine._startup()  # must adopt, not raise
+
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None
+    assert pos["qty"] == pytest.approx(5.0)
+    assert pos["entry_price"] == pytest.approx(101.0)
+    assert pos["atr_at_entry"] == pytest.approx(2.5)
+    buys = [t for t in h.store.get_trades() if t["action"] == "BUY"]
+    assert any(t["reason"] == "entry_fill_recovered_at_restart" for t in buys)
+
+    h.feed.frame = make_buy_bars(NOW)
+    h.engine.run_iteration()  # arms the protective stop for the adopted position
+
+    stops = submitted_by_purpose(h, OrderPurpose.STOP.value)
+    assert len(stops) == 1
+    expected_stop = 101.0 - 2.5 * h.strategy_cfg.atr_multiplier
+    assert stops[0].stop_price == pytest.approx(expected_stop)
+    assert stops[0].requested_qty == pytest.approx(5.0)
+
+
+def test_missing_atr_at_entry_falls_back_to_latest_signal_atr(tmp_path):
+    """Finding: a recovered position with no persisted ATR context must
+    still get a protective stop (from the latest computed ATR) instead of
+    running unprotected."""
+    h = build_harness(tmp_path)
+    h.broker.positions[SYMBOL] = BrokerPosition(
+        symbol=SYMBOL, qty=4.0, avg_entry_price=100.0, current_price=100.0,
+        market_value=400.0, unrealized_pl=0.0, unrealized_plpc=0.0,
+    )
+    h.store.set_bot_position(
+        SYMBOL,
+        {
+            "qty": 4,
+            "entry_price": 100.0,
+            "atr_at_entry": None,
+            "stop_price": None,
+            "stop_client_order_id": None,
+            "session_id": h.engine.session_id,
+            "entry_time": (NOW - timedelta(days=1)).isoformat(),
+        },
+    )
+    with h.engine._lock:
+        h.engine._status.last_signal = SignalDecision(
+            action=BotAction.HOLD, timestamp=NOW, reason="no_crossover", atr=3.0
+        )
+
+    h.engine._ensure_protective_stop(NOW)
+
+    stops = submitted_by_purpose(h, OrderPurpose.STOP.value)
+    assert len(stops) == 1
+    assert stops[0].stop_price == pytest.approx(100.0 - 3.0 * h.strategy_cfg.atr_multiplier)

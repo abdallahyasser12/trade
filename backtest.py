@@ -9,9 +9,11 @@ Execution model (documented, tested):
 * Protective stop: for an open long with stop S, on each subsequent bar
   (including the entry bar, after the fill): if the bar OPENS at/below S
   the fill is the open price (gap through the stop — you do not get S);
-  otherwise if the bar's LOW touches S the fill is S.  On the entry bar
-  itself a gap-open below S is impossible because S is strictly below
-  the entry fill, so only the low check applies there.
+  otherwise if the bar's LOW touches S the fill is min(S, bar open) — a
+  stop exit is never booked at a better price than the bar's open.  The
+  min() matters on the entry bar with slippage: the entry fills at
+  open×(1+s), so with a small ATR distance S can sit above the raw open,
+  and the honest fill there is the open, not S.
 * Slippage is directionally realistic: BUY fills at price*(1+bps/10000),
   SELL fills at price*(1-bps/10000).
 * ``commission_per_trade`` is charged per executed order (entry and exit
@@ -224,7 +226,9 @@ def run_backtest(
             if not entered_this_bar and open_px <= stop_price:
                 stop_fill = open_px  # gapped through the stop
             elif low_px <= stop_price:
-                stop_fill = stop_price
+                # Never better than the bar's open: with entry slippage the
+                # stop can sit above the raw open on the entry bar itself.
+                stop_fill = min(stop_price, open_px)
             if stop_fill is not None:
                 exit_px = stop_fill * (1.0 - slippage)
                 close_position(ts, exit_px, "atr_stop")

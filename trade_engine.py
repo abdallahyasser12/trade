@@ -21,6 +21,7 @@ Key safety behaviors implemented here:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
@@ -61,6 +62,11 @@ KILL_SWITCH_KEY = "kill_switch"
 ENGINE_STATUS_KEY = "engine_status"
 LAST_SIGNAL_KEY = "last_signal"
 POSITION_SNAPSHOT_KEY_PREFIX = "position_snapshot:"
+PENDING_ENTRY_KEY_PREFIX = "pending_entry:"
+
+# Give up on a strategy exit after this many rejected/failed sell attempts
+# and fall back to re-arming the protective stop instead.
+_MAX_EXIT_ATTEMPTS = 3
 
 # Minimum equity to be exempt from FINRA's pattern-day-trading restriction.
 PDT_EQUITY_THRESHOLD = 25_000.0
@@ -132,6 +138,10 @@ class TradeEngine:
         with self._lock:
             snap = EngineStatus(**{**self._status.__dict__})
             snap.warnings = list(self._status.warnings)
+            # Deep-copy the signal: it holds mutable dicts the engine thread
+            # may update later (entry_block), and the UI thread serializes
+            # this snapshot concurrently.
+            snap.last_signal = copy.deepcopy(self._status.last_signal)
             return snap
 
     def start(self) -> None:
@@ -260,11 +270,14 @@ class TradeEngine:
         bot_pos = self.store.get_bot_position(self.symbol)
 
         if broker_pos is not None and bot_pos is None:
-            raise BrokerError(
-                f"A {broker_pos.qty:g}-share position in {self.symbol} already exists "
-                "that this bot did not open. The bot only manages positions it created. "
-                "Close or move that position manually, then start the bot again."
-            )
+            if not self._adopt_position_from_own_fill(broker_pos):
+                raise BrokerError(
+                    f"A {broker_pos.qty:g}-share position in {self.symbol} already exists "
+                    "that this bot did not open. The bot only manages positions it "
+                    "created. Close or move that position manually, then start the "
+                    "bot again."
+                )
+            return
         if broker_pos is None and bot_pos is not None:
             self._log(
                 "WARNING",
@@ -286,6 +299,75 @@ class TradeEngine:
                 f"Resuming management of existing bot position: {bot_pos.get('qty')} "
                 f"{self.symbol} @ {bot_pos.get('entry_price')}",
             )
+
+    def _adopt_position_from_own_fill(self, broker_pos) -> bool:
+        """Recover a position created by one of OUR entry orders that filled
+        while the process was down (crash window between submit and fill
+        handling).  The orders table plus the broker's order state prove
+        ownership.  Returns True when the position was adopted."""
+        candidates = [
+            o
+            for o in self.store.get_orders(limit=50)
+            if o.get("symbol") == self.symbol
+            and o.get("purpose") == OrderPurpose.ENTRY.value
+            and o.get("side") == "buy"
+        ]
+        pending_ctx: dict = {}
+        raw_ctx = self.store.get_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
+        if raw_ctx:
+            try:
+                pending_ctx = json.loads(raw_ctx)
+            except json.JSONDecodeError:
+                pending_ctx = {}
+        for row in candidates:
+            try:
+                order = self.broker.get_order_by_client_id(row["client_order_id"])
+            except BrokerError:
+                continue
+            if order is None or order.filled_qty <= 0:
+                continue
+            if abs(order.filled_qty - broker_pos.qty) > 1e-9:
+                continue
+            self.store.record_order(order, self.session_id)
+            atr_at_entry = (
+                pending_ctx.get("atr")
+                if pending_ctx.get("client_order_id") == order.client_order_id
+                else None
+            )
+            self.store.set_bot_position(
+                self.symbol,
+                {
+                    "qty": order.filled_qty,
+                    "entry_price": order.fill_price,
+                    "atr_at_entry": atr_at_entry,
+                    "stop_price": None,
+                    "stop_client_order_id": None,
+                    "session_id": self.session_id,
+                    "entry_time": (order.updated_at or self.now_fn()).isoformat(),
+                },
+            )
+            self.store.record_trade(
+                self.session_id,
+                self.symbol,
+                action="BUY",
+                qty=order.filled_qty,
+                fill_price=order.fill_price,
+                realized_pnl=None,
+                reason="entry_fill_recovered_at_restart",
+                signal_snapshot=pending_ctx.get("signal")
+                if pending_ctx.get("client_order_id") == order.client_order_id
+                else None,
+                timestamp=self.now_fn(),
+            )
+            self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
+            self._log(
+                "WARNING",
+                f"Reconciliation: adopted {order.filled_qty:g} {self.symbol} filled by "
+                f"bot entry order {order.client_order_id} while the engine was down. "
+                "A protective stop will be armed.",
+            )
+            return True
+        return False
 
     def _cancel_orphan_stop(self, bot_pos: dict) -> None:
         """Cancel a bot stop order left behind after its position vanished."""
@@ -311,10 +393,21 @@ class TradeEngine:
         for order in open_orders:
             self.store.record_order(order, self.session_id)
             if order.purpose == OrderPurpose.ENTRY.value:
+                # Recover the ATR/signal context persisted when the entry
+                # was submitted, so the eventual fill still gets its stop.
+                ctx: dict = {}
+                raw_ctx = self.store.get_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
+                if raw_ctx:
+                    try:
+                        stored = json.loads(raw_ctx)
+                        if stored.get("client_order_id") == order.client_order_id:
+                            ctx = stored
+                    except json.JSONDecodeError:
+                        ctx = {}
                 self._pending_entry = {
                     "client_order_id": order.client_order_id,
-                    "atr": None,
-                    "signal": None,
+                    "atr": ctx.get("atr"),
+                    "signal": ctx.get("signal"),
                 }
                 self._log("WARNING", f"Adopted pending entry order {order.client_order_id}")
             elif order.purpose == OrderPurpose.EXIT.value:
@@ -411,6 +504,7 @@ class TradeEngine:
             return
 
         self._reconcile_pending_orders(now)
+        self._retry_exit_intent(now)
         self._ensure_protective_stop(now)
         self._snapshot_position(now)
 
@@ -523,9 +617,28 @@ class TradeEngine:
         return False
 
     def _reconcile_pending_orders(self, now: datetime) -> None:
-        """Confirm fills from broker state and act on transitions."""
+        """Confirm fills from broker state and act on transitions.
+
+        In-flight order intent is persisted BEFORE each submit, so this
+        also restores tracking that a crash or lost HTTP response wiped
+        from memory — broker state is the truth being reconciled against.
+        """
+        if self._pending_entry is None:
+            raw = self.store.get_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
+            if raw:
+                try:
+                    self._pending_entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
         if self._pending_entry is not None:
             self._reconcile_entry_order(now)
+        if self._pending_exit is None:
+            bot_pos = self.store.get_bot_position(self.symbol)
+            if bot_pos is not None and bot_pos.get("exit_client_order_id"):
+                self._pending_exit = {
+                    "client_order_id": bot_pos["exit_client_order_id"],
+                    "reason": bot_pos.get("exit_pending_reason") or "exit",
+                }
         if self._pending_exit is not None:
             self._reconcile_exit_order(now)
         self._reconcile_stop_order(now)
@@ -544,13 +657,16 @@ class TradeEngine:
         if order is None:
             self._log(
                 "WARNING",
-                f"Pending entry {pending['client_order_id']} not found at broker; clearing.",
+                f"Pending entry {pending['client_order_id']} not found at broker — "
+                "the submit never landed; entry dropped (conservative).",
             )
             self._pending_entry = None
+            self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
             return
         if not order.is_terminal:
             return  # still working (accepted / partially_filled) — wait.
         self._pending_entry = None
+        self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
         if order.filled_qty > 0:
             atr_at_entry = pending.get("atr")
             signal = pending.get("signal")
@@ -595,17 +711,23 @@ class TradeEngine:
     def _reconcile_exit_order(self, now: datetime) -> None:
         pending = self._pending_exit
         order = self._refresh_order(pending["client_order_id"])
+        bot_pos = self.store.get_bot_position(self.symbol)
         if order is None:
+            # The submit never landed at the broker.  Keep the durable exit
+            # INTENT so the exit is retried, but drop the dead order id.
             self._log(
                 "WARNING",
-                f"Pending exit {pending['client_order_id']} not found at broker; clearing.",
+                f"Pending exit {pending['client_order_id']} not found at broker — "
+                "the submit never landed; the exit will be retried.",
             )
             self._pending_exit = None
+            if bot_pos is not None and bot_pos.get("exit_client_order_id"):
+                bot_pos["exit_client_order_id"] = None
+                self.store.set_bot_position(self.symbol, bot_pos)
             return
         if not order.is_terminal:
             return
         self._pending_exit = None
-        bot_pos = self.store.get_bot_position(self.symbol)
         if order.filled_qty > 0 and bot_pos is not None:
             entry_price = float(bot_pos.get("entry_price") or 0.0)
             pnl = (float(order.fill_price or 0.0) - entry_price) * order.filled_qty
@@ -625,6 +747,7 @@ class TradeEngine:
                 bot_pos["qty"] = remaining
                 bot_pos["stop_client_order_id"] = None
                 bot_pos["stop_price"] = None
+                self._clear_exit_intent(bot_pos)
                 self.store.set_bot_position(self.symbol, bot_pos)
                 self._log(
                     "WARNING",
@@ -640,12 +763,34 @@ class TradeEngine:
                     f"(realized P&L ${pnl:,.2f})",
                 )
         elif order.filled_qty <= 0:
+            attempts = int(bot_pos.get("exit_attempts") or 0) if bot_pos else 0
+            if bot_pos is not None:
+                bot_pos["exit_client_order_id"] = None
+                if attempts >= _MAX_EXIT_ATTEMPTS:
+                    # Give up on the strategy exit; keep the position
+                    # protected by its stop instead of looping forever.
+                    self._clear_exit_intent(bot_pos)
+                    self.store.set_bot_position(self.symbol, bot_pos)
+                    self._log(
+                        "ERROR",
+                        f"Exit order failed {attempts} times ({order.status}) — giving up "
+                        "on the strategy exit and re-arming the protective stop.",
+                    )
+                    self._ensure_protective_stop(now)
+                    return
+                self.store.set_bot_position(self.symbol, bot_pos)
             self._log(
                 "WARNING",
                 f"Exit order {order.client_order_id} ended {order.status} with no fill — "
-                "position still open; protective stop will be re-armed.",
+                "the exit will be retried.",
             )
-            self._ensure_protective_stop(now)
+
+    @staticmethod
+    def _clear_exit_intent(bot_pos: dict) -> None:
+        bot_pos["exit_pending_reason"] = None
+        bot_pos["exit_bar_epoch"] = None
+        bot_pos["exit_client_order_id"] = None
+        bot_pos["exit_attempts"] = 0
 
     def _reconcile_stop_order(self, now: datetime) -> None:
         bot_pos = self.store.get_bot_position(self.symbol)
@@ -655,7 +800,19 @@ class TradeEngine:
         if not stop_id:
             return
         order = self._refresh_order(stop_id)
-        if order is None or not order.is_terminal:
+        if order is None:
+            # Intent was persisted but the broker never received the order
+            # (submit failed before acceptance).  Clear the dead id so the
+            # stop is re-armed with a fresh one.
+            self._log(
+                "WARNING",
+                f"Protective stop {stop_id} not found at broker — re-arming.",
+            )
+            bot_pos["stop_client_order_id"] = None
+            self.store.set_bot_position(self.symbol, bot_pos)
+            self._ensure_protective_stop(now)
+            return
+        if not order.is_terminal:
             return
         if order.filled_qty > 0:
             entry_price = float(bot_pos.get("entry_price") or 0.0)
@@ -690,7 +847,7 @@ class TradeEngine:
             bot_pos["stop_client_order_id"] = None
             bot_pos["stop_price"] = None
             self.store.set_bot_position(self.symbol, bot_pos)
-            if self._pending_exit is None:
+            if self._pending_exit is None and not bot_pos.get("exit_pending_reason"):
                 self._log(
                     "WARNING",
                     f"Protective stop ended {order.status} while position open — re-arming.",
@@ -703,19 +860,62 @@ class TradeEngine:
         Stop price = actual fill price − ATR_at_entry × multiplier, fixed
         from entry (no trailing).  Stop quantity always matches the bot
         position quantity.
+
+        Duplicate-stop safety: the intended client id is persisted to the
+        bot position BEFORE the submit, and any open bot stop already
+        resting at the broker is adopted instead of stacking a second one
+        — two resting sells could turn the account short.
         """
         if self._pending_exit is not None:
             return  # an exit is in flight; do not re-arm a stop under it.
         bot_pos = self.store.get_bot_position(self.symbol)
         if bot_pos is None or float(bot_pos.get("qty", 0)) <= 0:
             return
+        if bot_pos.get("exit_pending_reason"):
+            return  # a strategy exit is being pursued; don't arm under it.
         if bot_pos.get("stop_client_order_id"):
             return
+
+        # Adopt any bot stop already resting at the broker (e.g. a submit
+        # whose HTTP response was lost) rather than submitting a second one.
+        try:
+            open_orders = self.broker.list_open_orders(self.symbol)
+        except BrokerError as exc:
+            self._log("WARNING", f"Cannot verify open orders before arming stop: {exc}")
+            return
+        for existing_order in open_orders:
+            if existing_order.purpose == OrderPurpose.STOP.value:
+                bot_pos["stop_client_order_id"] = existing_order.client_order_id
+                if existing_order.stop_price is not None:
+                    bot_pos["stop_price"] = existing_order.stop_price
+                self.store.set_bot_position(self.symbol, bot_pos)
+                self.store.record_order(existing_order, self.session_id)
+                self._log(
+                    "WARNING",
+                    f"Adopted already-resting protective stop {existing_order.client_order_id} "
+                    "instead of submitting a duplicate.",
+                )
+                return
 
         entry_price = float(bot_pos.get("entry_price") or 0.0)
         atr_at_entry = bot_pos.get("atr_at_entry")
         stop_price = bot_pos.get("stop_price")
         if stop_price is None:
+            if (not atr_at_entry) and self._status.last_signal is not None:
+                # Recovery fallback (e.g. entry adopted after a restart with
+                # no persisted context): protect with the latest computed ATR
+                # rather than leaving the position unprotected.
+                with self._lock:
+                    fallback_atr = (
+                        self._status.last_signal.atr if self._status.last_signal else None
+                    )
+                if fallback_atr:
+                    atr_at_entry = fallback_atr
+                    self._log(
+                        "WARNING",
+                        "ATR-at-entry unavailable; using the latest computed ATR "
+                        f"({fallback_atr:.4f}) for the protective stop.",
+                    )
             if not atr_at_entry or entry_price <= 0:
                 self._log(
                     "WARNING",
@@ -735,14 +935,23 @@ class TradeEngine:
         client_id = make_client_order_id(
             self.session_id, OrderPurpose.STOP.value, now, symbol=self.symbol
         )
-        existing = self.store.get_order_by_client_id(client_id)
-        if existing is not None:
+        if self.store.get_order_by_client_id(client_id) is not None:
             return  # already created this cycle (idempotency guard)
-        order = self.broker.submit_stop_order(self.symbol, qty, stop_price, client_id)
-        self.store.record_order(order, self.session_id)
+        # Persist the intent BEFORE submitting: if the submit's response is
+        # lost, the next cycle reconciles this id against broker truth
+        # instead of arming a second stop.
         bot_pos["stop_client_order_id"] = client_id
         bot_pos["stop_price"] = stop_price
         self.store.set_bot_position(self.symbol, bot_pos)
+        try:
+            order = self.broker.submit_stop_order(self.symbol, qty, stop_price, client_id)
+        except BrokerError as exc:
+            self._log(
+                "WARNING",
+                f"Protective stop submit failed ({exc}); will reconcile and retry.",
+            )
+            return
+        self.store.record_order(order, self.session_id)
         self._log(
             "INFO",
             f"Protective stop placed: sell {qty} {self.symbol} @ stop {stop_price:.2f}",
@@ -807,8 +1016,12 @@ class TradeEngine:
         if not self.engine_config.flat_before_close:
             return
         bot_pos = self.store.get_bot_position(self.symbol)
-        if bot_pos is None or self._pending_exit is not None:
-            return
+        if (
+            bot_pos is None
+            or self._pending_exit is not None
+            or bot_pos.get("exit_pending_reason")
+        ):
+            return  # nothing to do, or an exit is already being pursued.
         seconds_to_close = (clock.next_close - now).total_seconds()
         if 0 <= seconds_to_close <= self.engine_config.flat_before_close_minutes * 60:
             self._log(
@@ -833,18 +1046,46 @@ class TradeEngine:
     ) -> None:
         """Safely exit the bot position: cancel the bot's protective stop
         first (so the exit can never combine with the stop into a short),
-        then submit a market sell for the confirmed broker quantity."""
+        then submit a market sell for the confirmed broker quantity.
+
+        The exit INTENT is persisted before any broker call, so a deferral
+        (unconfirmed cancel), an exception, or a crash never silently drops
+        the exit — every cycle retries it until it completes or exhausts
+        its attempts.  The order id is likewise persisted before the
+        submit, so a lost HTTP response is healed from broker truth
+        instead of producing an untracked live sell.
+        """
         now = self.now_fn()
-        broker_pos = self.broker.get_position(self.symbol)  # broker truth (§99)
         bot_pos = self.store.get_bot_position(self.symbol)
-        if broker_pos is None or bot_pos is None:
+        if bot_pos is None:
+            self._log("WARNING", "Exit requested but no bot position found — no action.")
+            return
+
+        # Persist the durable exit intent first.
+        if bot_pos.get("exit_pending_reason") != reason:
+            bot_pos["exit_pending_reason"] = reason
+            bot_pos["exit_bar_epoch"] = int(bar_ts.timestamp())
+            bot_pos.setdefault("exit_attempts", 0)
+            self.store.set_bot_position(self.symbol, bot_pos)
+
+        # Heal a previously-submitted exit whose response was lost.
+        exit_id = bot_pos.get("exit_client_order_id")
+        if exit_id:
+            order = self._refresh_order(exit_id)
+            if order is not None:
+                self._pending_exit = {"client_order_id": exit_id, "reason": reason}
+                return  # tracked again; the reconciler takes it from here.
+            bot_pos["exit_client_order_id"] = None
+            self.store.set_bot_position(self.symbol, bot_pos)
+
+        broker_pos = self.broker.get_position(self.symbol)  # broker truth (§99)
+        if broker_pos is None:
             self._log(
                 "WARNING",
-                "Exit requested but no broker/bot position found — reconciling instead.",
+                "Exit requested but the broker shows no position — reconciling instead.",
             )
-            if broker_pos is None and bot_pos is not None:
-                self._cancel_orphan_stop(bot_pos)
-                self.store.clear_bot_position(self.symbol)
+            self._cancel_orphan_stop(bot_pos)
+            self.store.clear_bot_position(self.symbol)
             return
 
         stop_id = bot_pos.get("stop_client_order_id")
@@ -854,7 +1095,11 @@ class TradeEngine:
                 try:
                     self.broker.cancel_order(stop_order.broker_order_id)
                 except BrokerError as exc:
-                    self._log("WARNING", f"Could not cancel protective stop yet: {exc}")
+                    self._log(
+                        "WARNING",
+                        f"Could not cancel protective stop yet ({exc}) — the exit "
+                        "will be retried next cycle.",
+                    )
                     return
                 # Confirm the cancel with a short interruptible wait.
                 for _ in range(10):
@@ -867,14 +1112,16 @@ class TradeEngine:
                 if refreshed is not None and not refreshed.is_terminal:
                     self._log(
                         "WARNING",
-                        "Protective stop cancel not confirmed yet — deferring exit to "
-                        "next cycle to avoid a double sell.",
+                        "Protective stop cancel not confirmed yet — the exit will be "
+                        "retried next cycle to avoid a double sell.",
                     )
                     return
                 if refreshed is not None and refreshed.filled_qty > 0:
                     # The stop filled while we were canceling — the
                     # reconciler will book it; no exit order needed.
                     self._log("INFO", "Stop filled during cancel; skipping exit order.")
+                    self._clear_exit_intent(bot_pos)
+                    self.store.set_bot_position(self.symbol, bot_pos)
                     return
             bot_pos["stop_client_order_id"] = None
             self.store.set_bot_position(self.symbol, bot_pos)
@@ -886,9 +1133,18 @@ class TradeEngine:
         client_id = make_client_order_id(
             self.session_id, OrderPurpose.EXIT.value, bar_ts, symbol=self.symbol
         )
-        if self.store.get_order_by_client_id(client_id) is not None:
-            self._log("INFO", f"Exit order {client_id} already exists — not resubmitting.")
+        known = self.store.get_order_by_client_id(client_id)
+        at_broker = self.broker.get_order_by_client_id(client_id) if known is None else None
+        if known is not None or at_broker is not None:
+            bot_pos["exit_client_order_id"] = client_id
+            self.store.set_bot_position(self.symbol, bot_pos)
+            self._pending_exit = {"client_order_id": client_id, "reason": reason}
+            self._log("INFO", f"Exit order {client_id} already exists — tracking it.")
             return
+        # Persist the order-id intent BEFORE submitting (lost-response safety).
+        bot_pos["exit_client_order_id"] = client_id
+        bot_pos["exit_attempts"] = int(bot_pos.get("exit_attempts") or 0) + 1
+        self.store.set_bot_position(self.symbol, bot_pos)
         order = self.broker.submit_market_order(self.symbol, qty, "sell", client_id)
         self.store.record_order(order, self.session_id)
         self._pending_exit = {"client_order_id": client_id, "reason": reason}
@@ -900,13 +1156,40 @@ class TradeEngine:
         self._quick_poll_order(client_id)
         self._reconcile_pending_orders(self.now_fn())
 
+    def _retry_exit_intent(self, now: datetime) -> None:
+        """Re-drive a persisted exit intent that has no live order behind it
+        (deferred cancel, failed submit, process restart)."""
+        bot_pos = self.store.get_bot_position(self.symbol)
+        if bot_pos is None:
+            return
+        reason = bot_pos.get("exit_pending_reason")
+        if not reason:
+            return
+        if self._pending_exit is not None or bot_pos.get("exit_client_order_id"):
+            return
+        if int(bot_pos.get("exit_attempts") or 0) >= _MAX_EXIT_ATTEMPTS:
+            self._clear_exit_intent(bot_pos)
+            self.store.set_bot_position(self.symbol, bot_pos)
+            self._log(
+                "ERROR",
+                f"Exit ({reason}) exhausted its attempts — abandoning the strategy exit; "
+                "the protective stop will be re-armed.",
+            )
+            self._ensure_protective_stop(now)
+            return
+        epoch = bot_pos.get("exit_bar_epoch")
+        bar_ts = (
+            datetime.fromtimestamp(epoch, tz=timezone.utc) if epoch else now
+        )
+        self._log("INFO", f"Retrying pending exit ({reason}).")
+        self._initiate_exit(reason, bar_ts)
+
     def _handle_buy_signal(
         self, decision: SignalDecision, bar_ts: datetime, clock, account, now: datetime
     ) -> None:
         block = self._entry_block_reason(decision, bar_ts, clock, account, now)
         if block is not None:
-            decision.details["entry_block"] = block
-            self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
+            self._mark_entry_blocked(decision, block)
             self._log(
                 "WARNING",
                 f"BUY signal blocked: {block}",
@@ -920,8 +1203,7 @@ class TradeEngine:
                 close_price, float(decision.atr), self.strategy_config.atr_multiplier
             )
         except ValueError as exc:
-            decision.details["entry_block"] = "stop_not_computable"
-            self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
+            self._mark_entry_blocked(decision, "stop_not_computable")
             self._log("WARNING", f"BUY signal blocked: cannot compute a valid stop ({exc})")
             return
         sizing = self.risk_manager.calculate_position_size(
@@ -931,8 +1213,7 @@ class TradeEngine:
             stop_price=stop_estimate,
         )
         if not sizing.approved:
-            decision.details["entry_block"] = sizing.rejection_reason
-            self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
+            self._mark_entry_blocked(decision, sizing.rejection_reason)
             self._log(
                 "WARNING",
                 f"BUY signal rejected by risk manager: {sizing.rejection_reason}",
@@ -950,6 +1231,20 @@ class TradeEngine:
             self._log("INFO", f"Entry order {client_id} already exists — not resubmitting.")
             return
 
+        # Persist the entry context BEFORE submitting: if the response is
+        # lost or the process dies, the next cycle (or restart) reconciles
+        # this id against broker truth, and the eventual fill still knows
+        # its ATR-at-entry for the protective stop.
+        self.store.set_kv(
+            PENDING_ENTRY_KEY_PREFIX + self.symbol,
+            json.dumps(
+                {
+                    "client_order_id": client_id,
+                    "atr": float(decision.atr),
+                    "signal": decision.to_dict(),
+                }
+            ),
+        )
         order = self.broker.submit_market_order(self.symbol, sizing.qty, "buy", client_id)
         self.store.record_order(order, self.session_id)
         self._pending_entry = {
@@ -965,6 +1260,13 @@ class TradeEngine:
         )
         self._quick_poll_order(client_id)
         self._reconcile_pending_orders(self.now_fn())
+
+    def _mark_entry_blocked(self, decision: SignalDecision, block: Optional[str]) -> None:
+        """Attach the block reason to the published signal (under the lock —
+        the UI thread snapshots this object concurrently) and persist it."""
+        with self._lock:
+            decision.details["entry_block"] = block
+        self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
 
     def _entry_block_reason(
         self, decision: SignalDecision, bar_ts: datetime, clock, account, now: datetime

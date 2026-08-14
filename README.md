@@ -196,7 +196,9 @@ The backtest is honest about what it can and cannot know:
   **open** — never at bar N's close, which the strategy could not have traded at.
 - **Conservative stop fills:** if a bar *opens* at or below the stop (a gap), the fill is
   the open price — you do **not** get the stop price; otherwise, if the bar's low touches
-  the stop, the fill is the stop price.
+  the stop, the fill is the stop price capped at the bar's open (a stop exit is never
+  booked at a better price than the bar opened at, which matters on the entry bar itself
+  when slippage is configured).
 - **Directional slippage:** buys fill slightly higher, sells slightly lower — slippage
   always works against you.
 - **Slippage and commission are configurable and default to 0**, and that assumption is

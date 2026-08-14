@@ -315,7 +315,9 @@ def build_config_inputs() -> tuple[StrategyConfig, RiskConfig, BacktestConfig, E
     with r3:
         max_daily_loss = st.number_input("Maximum session loss (%)", min_value=0.5, max_value=100.0,
                                          value=3.0, step=0.5,
-                                         help="New entries halt for the session once equity falls this far below the session start.")
+                                         help="Live: the session stops (no new entries; restart requires acknowledgement) "
+                                              "once equity falls this far below the session start. "
+                                              "Backtest: entries pause for the rest of that day, measured from the day's first equity.")
     with r4:
         min_position_value = st.number_input("Minimum position value ($)", min_value=0.0,
                                              value=100.0, step=50.0,
@@ -830,7 +832,7 @@ def render_position_and_pnl(store: StateStore, session_id: str | None) -> None:
             p4.metric("Unrealized P&L %", f"{plpc * 100:+.2f}%" if plpc is not None else "—")
             st.caption(
                 f"Broker snapshot from {fmt_ts(snapshot.get('timestamp'))} — written by the "
-                "engine each cycle; the dashboard never calls Alpaca directly."
+                "engine each cycle; this live panel reads local state only."
             )
         if stop_price and entry_price:
             risk_amount = (entry_price - float(stop_price)) * qty
