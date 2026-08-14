@@ -20,6 +20,7 @@ __pycache__/
 *.sqlite3
 *.db-wal
 *.db-shm
+*.engine.lock
 data/
 
 # OS / editor

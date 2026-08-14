@@ -344,7 +344,10 @@ def run_backtest(
         "backtest": backtest_config.to_dict(),
         "bar_adjustment": backtest_config.adjustment,
         "execution_model": "signal on completed bar N fills at bar N+1 open",
-        "stop_model": "gap-open through stop fills at open; otherwise low<=stop fills at stop",
+        "stop_model": (
+            "gap-open through stop fills at open; otherwise low<=stop fills at "
+            "min(stop, open) — never better than the bar's open"
+        ),
         "account_model": "cash account, whole shares, buying power == cash",
         "bars_used": int(len(df)),
         "warmup_bars": warmup,

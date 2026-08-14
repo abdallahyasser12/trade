@@ -158,7 +158,65 @@ class StateStore:
 
     def close(self) -> None:
         with self._lock:
+            self.release_engine_lock()
             self._conn.close()
+
+    # ------------------------------------------------------------------
+    # Cross-process engine lock
+    # ------------------------------------------------------------------
+    #
+    # Exactly one live trading engine may run against one state database,
+    # across ALL processes.  An OS advisory lock on a sibling lockfile is
+    # held from engine startup to engine finalize; a second engine (second
+    # `streamlit run`, or an orphan left by a dev auto-reload) fails to
+    # acquire it and refuses to trade.  The lock dies with the process, so
+    # a crash can never leave it stuck.
+
+    def acquire_engine_lock(self) -> bool:
+        """Take the exclusive cross-process engine lock.  Non-blocking;
+        returns True on success, False when another engine holds it."""
+        with self._lock:
+            if self.db_path == ":memory:":
+                return True  # private database; nothing to protect
+            if getattr(self, "_engine_lock_file", None) is not None:
+                return False  # this store's engine already holds it
+            lock_path = self.db_path + ".engine.lock"
+            handle = open(lock_path, "a+")
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except ImportError:  # pragma: no cover — Windows
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                handle.close()
+                return False
+            self._engine_lock_file = handle
+            return True
+
+    def release_engine_lock(self) -> None:
+        """Release the engine lock if this store holds it.  Idempotent."""
+        with self._lock:
+            handle = getattr(self, "_engine_lock_file", None)
+            if handle is None:
+                return
+            self._engine_lock_file = None
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except ImportError:  # pragma: no cover — Windows
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                handle.close()
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Run one statement inside the lock and commit."""

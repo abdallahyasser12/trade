@@ -276,6 +276,13 @@ live tab shows the account's PDT flag and current day-trade count.
   threshold (default 30 s), trading pauses — bar-completion logic depends on local time.
 - **Stale-data guard:** if the newest completed bar is too old (default: 3 bar-lengths
   intraday), the bot skips the trading decision instead of acting on outdated prices.
+- **Single engine per state database:** engine startup takes an OS-level lock on a
+  sibling of the SQLite file and holds it until shutdown. A second app instance (or an
+  engine orphaned by a source reload) refuses to trade against the same database. The
+  lock dies with its process, so a crash can never leave it stuck.
+- **Kill switch enforced by the engine:** after an emergency stop, daily-loss halt, or
+  fatal error, the engine itself refuses to start until the unclean stop is
+  acknowledged in the dashboard — not just the Start button.
 - Other engine invariants: each bar is processed at most once (persisted across
   restarts), the same submission attempt has a deterministic order ID while a confirmed
   terminal retry gets a distinct bounded ID, and fills are always confirmed from broker

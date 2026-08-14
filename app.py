@@ -1023,6 +1023,12 @@ def main() -> None:
     store = get_store()
     creds = get_credentials()
     conn = get_connection_check(creds.fingerprint)
+    if not conn["ok"] and conn["error"] != "credentials_missing":
+        # A failed verification (network outage, Alpaca hiccup, bad key)
+        # must not be pinned for the process lifetime: drop the cached
+        # result so the next rerun retries. Start stays disabled until a
+        # verification actually succeeds (fail-closed either way).
+        get_connection_check.clear()
 
     st.title("📈 Trend Bot — Alpaca Paper Trading")
     st.caption(

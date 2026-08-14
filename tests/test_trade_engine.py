@@ -1959,3 +1959,62 @@ def test_startup_books_exit_fill_that_closed_the_position_before_crash(tmp_path)
     assert sells[0]["qty"] == pytest.approx(10.0)
     assert sells[0]["realized_pnl"] == pytest.approx((105.0 - 100.0) * 10.0)
     assert h.store.get_bot_position(SYMBOL) is None
+
+
+def test_second_engine_on_same_database_refuses_to_start(tmp_path):
+    """Cross-process safety: exactly one engine may trade one state
+    database.  A second engine (second app instance / reload orphan)
+    must refuse at startup, and a clean shutdown must free the lock."""
+    h1 = build_harness(tmp_path)
+    h1.engine._startup()
+
+    broker2 = type(h1.broker)(now=NOW)
+    store2 = StateStore(str(tmp_path / "state.db"))
+    engine2 = trade_engine.TradeEngine(
+        broker=broker2,
+        data_feed=type(h1.feed)(),
+        strategy=TrendStrategy(h1.strategy_cfg),
+        risk_manager=RiskManager(h1.risk_cfg),
+        state_store=store2,
+        strategy_config=h1.strategy_cfg,
+        risk_config=h1.risk_cfg,
+        engine_config=h1.engine_cfg,
+        now_fn=h1.now,
+    )
+    with pytest.raises(BrokerError, match="Another trading engine"):
+        engine2._startup()
+
+    h1.engine._finalize()
+    engine2._startup()  # lock freed by the first engine's shutdown
+    engine2._finalize()
+    store2.close()
+
+
+def test_failed_startup_releases_the_engine_lock(tmp_path):
+    """A startup that fails after taking the engine lock must release it,
+    or a config mistake would require a process restart to retry."""
+    h = build_harness(tmp_path)
+    h.broker.verify_error = BrokerError("verification unavailable")
+    with pytest.raises(BrokerError, match="verification unavailable"):
+        h.engine._startup()
+    h.broker.verify_error = None
+    h.engine._startup()  # retry must succeed without any manual cleanup
+
+
+def test_done_for_day_partial_entry_remainder_is_canceled_and_fill_protected(tmp_path):
+    """A partially filled entry parked in a non-terminal status other than
+    'partially_filled' (e.g. done_for_day) must still have its remainder
+    canceled and its filled shares protected — not wait indefinitely."""
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    entry = _inject_partial_entry(h)
+    entry.status = "done_for_day"
+
+    h.engine.run_iteration()
+
+    assert h.broker.orders[entry.client_order_id].status == "canceled"
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["qty"] == pytest.approx(40.0)
+    stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(stops) == 1 and stops[0].requested_qty == pytest.approx(40.0)
+    assert len([t for t in h.store.get_trades() if t["action"] == "BUY"]) == 1

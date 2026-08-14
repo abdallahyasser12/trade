@@ -230,6 +230,19 @@ class TradeEngine:
                 "A previous session ended with an unclean stop (kill switch armed). "
                 "Acknowledge it in the dashboard before starting the bot again."
             )
+        if not self.store.acquire_engine_lock():
+            raise BrokerError(
+                "Another trading engine already holds the lock on this state "
+                "database (a second app instance, or an orphaned engine from a "
+                "source reload). Exactly one engine may trade per database."
+            )
+        try:
+            self._startup_locked()
+        except BaseException:
+            self.store.release_engine_lock()
+            raise
+
+    def _startup_locked(self) -> None:
         account = self.broker.verify_paper_account()
 
         asset = self.broker.get_asset(self.symbol)
@@ -600,6 +613,7 @@ class TradeEngine:
         except Exception:
             logger.error("Error finalizing engine:\n%s", traceback.format_exc())
         finally:
+            self.store.release_engine_lock()
             with self._lock:
                 if self._status.state != EngineState.ERROR:
                     self._status.state = (
@@ -957,8 +971,11 @@ class TradeEngine:
             self._ensure_protective_stop(now)
             if not order.is_terminal:
                 # Freeze the economic quantity after the first partial fill.
-                # The current fill is protected before canceling the remainder.
-                if order.status == "partially_filled":
+                # The current fill is protected before canceling the
+                # remainder.  Any open status qualifies (done_for_day,
+                # pending_review, ... can also carry fills); pending_cancel
+                # is already on its way out.
+                if order.status != "pending_cancel":
                     try:
                         if self._cancel_and_confirm(order):
                             order = self._refresh_order(order.client_order_id) or order
@@ -1097,7 +1114,7 @@ class TradeEngine:
         if order.filled_qty > 0 and bot_pos is not None:
             bot_pos = self._apply_sell_fill(bot_pos, order, "exit_accounted_filled_qty")
             if not order.is_terminal:
-                if order.status == "partially_filled":
+                if order.status != "pending_cancel":
                     try:
                         if self._cancel_and_confirm(order):
                             order = self._refresh_order(order.client_order_id) or order

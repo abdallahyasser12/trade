@@ -561,3 +561,40 @@ class TestConcurrency:
                 assert len(store.get_logs(limit=total, session_id=f"sess-{i}")) == n_rows
         finally:
             store.close()
+
+
+class TestEngineLock:
+    def test_second_store_cannot_take_the_engine_lock(self, tmp_path):
+        db = str(tmp_path / "locked.db")
+        s1 = StateStore(db)
+        s2 = StateStore(db)
+        try:
+            assert s1.acquire_engine_lock() is True
+            assert s2.acquire_engine_lock() is False  # cross-instance exclusion
+            s1.release_engine_lock()
+            assert s2.acquire_engine_lock() is True
+            s2.release_engine_lock()
+        finally:
+            s1.close()
+            s2.close()
+
+    def test_close_releases_the_engine_lock(self, tmp_path):
+        db = str(tmp_path / "locked.db")
+        s1 = StateStore(db)
+        assert s1.acquire_engine_lock() is True
+        s1.close()
+        s2 = StateStore(db)
+        try:
+            assert s2.acquire_engine_lock() is True
+        finally:
+            s2.close()
+
+    def test_release_is_idempotent(self, tmp_path):
+        s1 = StateStore(str(tmp_path / "locked.db"))
+        try:
+            s1.release_engine_lock()  # never acquired — must not raise
+            assert s1.acquire_engine_lock() is True
+            s1.release_engine_lock()
+            s1.release_engine_lock()
+        finally:
+            s1.close()
