@@ -99,6 +99,69 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return _wilder_average(tr, period)
 
 
+def adx(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """Wilder Average Directional Index (ADX), scaled from 0 to 100.
+
+    Directional movement, true range, DX, and ADX are all Wilder-smoothed
+    with SMA seeds.  The first usable ADX therefore appears only after both
+    smoothing stages have initialized; no shortened warmup is fabricated.
+    """
+    if period < 2:
+        raise ValueError("ADX period must be >= 2")
+    high = high.astype(float)
+    low = low.astype(float)
+    if len(high) == 0:
+        return pd.Series(np.nan, index=high.index, dtype=float)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=high.index,
+        dtype=float,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=high.index,
+        dtype=float,
+    )
+    plus_dm.iloc[0] = np.nan
+    minus_dm.iloc[0] = np.nan
+    smoothed_tr = _wilder_average(true_range(high, low, close), period)
+    plus_di = 100.0 * _wilder_average(plus_dm, period) / smoothed_tr
+    minus_di = 100.0 * _wilder_average(minus_dm, period) / smoothed_tr
+    # A fully initialized zero-range window is a valid no-trend state, not a
+    # missing value. Both directional indices and DX are exactly zero.
+    plus_di = plus_di.where(smoothed_tr != 0, 0.0).where(smoothed_tr.notna())
+    minus_di = minus_di.where(smoothed_tr != 0, 0.0).where(smoothed_tr.notna())
+    denominator = plus_di + minus_di
+    dx = 100.0 * (plus_di - minus_di).abs() / denominator
+    dx = dx.where(denominator != 0, 0.0)
+    dx = dx.where(denominator.notna())
+    return _wilder_average(dx, period)
+
+
+def efficiency_ratio(close: pd.Series, period: int = 20) -> pd.Series:
+    """Kaufman's causal price-efficiency ratio in the range [0, 1].
+
+    ``abs(net change) / sum(abs(one-bar changes))`` distinguishes a clean
+    directional move (near 1) from a noisy path (near 0).  A perfectly flat
+    initialized window is defined as 0 rather than NaN.
+    """
+    if period < 2:
+        raise ValueError("Efficiency-ratio period must be >= 2")
+    close = close.astype(float)
+    direction = (close - close.shift(period)).abs()
+    path = close.diff().abs().rolling(period, min_periods=period).sum()
+    ratio = direction / path
+    initialized = direction.notna() & path.notna()
+    return ratio.where(path > 0, 0.0).where(initialized).clip(lower=0.0, upper=1.0)
+
+
 def rolling_volume_average(volume: pd.Series, period: int = 20) -> pd.Series:
     """Rolling mean of volume.  NaN until ``period`` observations exist."""
     if period < 1:
@@ -140,8 +203,9 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
     """Return a copy of ``df`` with all strategy indicator columns added.
 
     Input must contain columns: open, high, low, close, volume.
-    Added columns: short_ma, long_ma, rsi, atr, avg_volume, volume_ratio,
-    atr_percentile (NaN when the volatility filter is disabled or warming up).
+    Added columns: short_ma, long_ma, rsi, atr, adx, efficiency_ratio,
+    avg_volume, volume_ratio, and atr_percentile (NaN when the volatility
+    filter is disabled or warming up).
     """
     required = {"open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
@@ -153,6 +217,10 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
     out["long_ma"] = sma(out["close"], config.long_ma_period)
     out["rsi"] = rsi(out["close"], config.rsi_period)
     out["atr"] = atr(out["high"], out["low"], out["close"], config.atr_period)
+    out["adx"] = adx(out["high"], out["low"], out["close"], config.adx_period)
+    out["efficiency_ratio"] = efficiency_ratio(
+        out["close"], config.efficiency_period
+    )
     out["avg_volume"] = rolling_volume_average(out["volume"], config.volume_period)
     out["volume_ratio"] = volume_ratio(out["volume"], config.volume_period)
     if config.enable_volatility_filter:

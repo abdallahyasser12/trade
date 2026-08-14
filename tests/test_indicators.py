@@ -13,9 +13,11 @@ import pytest
 
 from config import StrategyConfig
 from indicators import (
+    adx,
     atr,
     atr_percentile,
     compute_indicators,
+    efficiency_ratio,
     rolling_volume_average,
     rsi,
     sma,
@@ -345,6 +347,7 @@ def test_atr_percentile_invalid_lookback_raises():
 # ---------------------------------------------------------------------------
 
 INDICATOR_COLUMNS = {
+    "adx",
     "short_ma",
     "long_ma",
     "rsi",
@@ -352,6 +355,7 @@ INDICATOR_COLUMNS = {
     "avg_volume",
     "volume_ratio",
     "atr_percentile",
+    "efficiency_ratio",
 }
 
 
@@ -406,6 +410,8 @@ def test_compute_indicators_columns_match_direct_calls():
         "long_ma": sma(df["close"], cfg.long_ma_period),
         "rsi": rsi(df["close"], cfg.rsi_period),
         "atr": atr_direct,
+        "adx": adx(df["high"], df["low"], df["close"], cfg.adx_period),
+        "efficiency_ratio": efficiency_ratio(df["close"], cfg.efficiency_period),
         "avg_volume": rolling_volume_average(df["volume"], cfg.volume_period),
         "volume_ratio": volume_ratio(df["volume"], cfg.volume_period),
         "atr_percentile": atr_percentile(atr_direct, cfg.atr_percentile_lookback),
@@ -435,3 +441,47 @@ def test_compute_indicators_does_not_mutate_input():
     original = df.copy(deep=True)
     compute_indicators(df, _small_config())
     pd.testing.assert_frame_equal(df, original)
+
+
+# ---------------------------------------------------------------------------
+# Trend-quality indicators
+# ---------------------------------------------------------------------------
+
+
+def test_efficiency_ratio_hand_computed_clean_and_noisy_paths():
+    clean = efficiency_ratio(_series([1, 2, 3, 4, 5]), period=4)
+    noisy = efficiency_ratio(_series([1, 2, 1, 2, 1]), period=4)
+    assert clean.iloc[-1] == pytest.approx(1.0)
+    assert noisy.iloc[-1] == pytest.approx(0.0)
+    assert clean.iloc[:4].isna().all()
+
+
+def test_efficiency_ratio_flat_initialized_window_is_zero():
+    out = efficiency_ratio(_series([10.0] * 8), period=4)
+    assert out.iloc[:4].isna().all()
+    assert (out.iloc[4:] == 0.0).all()
+
+
+def test_adx_strict_uptrend_converges_to_100_after_two_stage_warmup():
+    close = _series(np.arange(100.0, 140.0))
+    high = close + 1.0
+    low = close - 1.0
+    out = adx(high, low, close, period=5)
+    assert out.first_valid_index() == close.index[9]
+    assert np.allclose(out.dropna().to_numpy(), 100.0)
+
+
+def test_adx_empty_input_is_empty_and_invalid_period_rejected():
+    empty = pd.Series(dtype=float, index=pd.DatetimeIndex([], tz="UTC"))
+    assert adx(empty, empty, empty, period=5).empty
+    with pytest.raises(ValueError):
+        adx(_series([1, 2, 3]), _series([1, 2, 3]), _series([1, 2, 3]), period=1)
+
+
+def test_adx_flat_initialized_market_is_zero_not_nan():
+    flat = _series([100.0] * 10)
+
+    out = adx(flat, flat, flat, period=3)
+
+    assert out.iloc[:5].isna().all()
+    assert out.iloc[5:].eq(0.0).all()

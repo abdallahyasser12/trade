@@ -100,6 +100,8 @@ def run_backtest(
     strategy_config: StrategyConfig,
     risk_config: RiskConfig,
     backtest_config: BacktestConfig,
+    market_data: Optional[pd.DataFrame] = None,
+    active_start: Optional[pd.Timestamp] = None,
 ) -> BacktestResult:
     """Simulate the strategy over ``price_data`` (completed OHLCV bars).
 
@@ -138,6 +140,14 @@ def run_backtest(
     if not bool((price_valid & coherent).all()):
         raise ValueError("price_data contains invalid or internally inconsistent OHLCV bars")
 
+    if active_start is not None:
+        active_start = pd.Timestamp(active_start)
+        if active_start.tzinfo is None:
+            raise ValueError("active_start must be timezone-aware")
+        active_start = active_start.tz_convert(price_data.index.tz)
+        if int((price_data.index >= active_start).sum()) < 2:
+            raise ValueError("active_start leaves fewer than two executable bars")
+
     warmup = strategy.required_bars()
     if price_data is None or len(price_data) < warmup + 2:
         raise ValueError(
@@ -161,12 +171,17 @@ def run_backtest(
     entry_time = None
     entry_reason = ""
     stop_price: Optional[float] = None
+    initial_stop_price: Optional[float] = None
+    highest_close: Optional[float] = None
+    stop_exit_reason = "atr_stop"
 
     pending_entry: Optional[dict] = None  # signal context awaiting next-bar open
     pending_exit: Optional[str] = None  # exit reason awaiting next-bar open
 
     trades: list[TradeRecord] = []
     equity_values: list[float] = []
+    equity_timestamps: list[pd.Timestamp] = []
+    peak_equity = backtest_config.initial_capital
 
     day_start_equity: Optional[float] = None
     current_day = None
@@ -174,6 +189,7 @@ def run_backtest(
 
     def close_position(exit_time, exit_px: float, reason: str) -> None:
         nonlocal cash, position_qty, entry_price, entry_time, stop_price, entry_reason
+        nonlocal initial_stop_price, highest_close, stop_exit_reason
         proceeds = position_qty * exit_px - commission
         cash += proceeds
         pnl = (exit_px - entry_price) * position_qty - 2 * commission
@@ -198,11 +214,16 @@ def run_backtest(
         entry_time = None
         entry_reason = ""
         stop_price = None
+        initial_stop_price = None
+        highest_close = None
+        stop_exit_reason = "atr_stop"
 
     timestamps = df.index
     for i in range(len(df)):
         bar = df.iloc[i]
         ts = timestamps[i]
+        if active_start is not None and ts < active_start:
+            continue
         bar_day = ts.date()
         entered_this_bar = False
 
@@ -242,6 +263,9 @@ def run_backtest(
                     entry_time = ts
                     entry_reason = pending_entry["reason"]
                     stop_price = candidate_stop
+                    initial_stop_price = candidate_stop
+                    highest_close = fill_px
+                    stop_exit_reason = "atr_stop"
                     entered_this_bar = True
         pending_entry = None
 
@@ -258,11 +282,13 @@ def run_backtest(
                 stop_fill = min(stop_price, open_px)
             if stop_fill is not None:
                 exit_px = stop_fill * (1.0 - slippage)
-                close_position(ts, exit_px, "atr_stop")
+                close_position(ts, exit_px, stop_exit_reason)
 
         # --- mark to market ----------------------------------------------
         equity = cash + position_qty * float(bar["close"])
         equity_values.append(equity)
+        equity_timestamps.append(ts)
+        peak_equity = max(peak_equity, equity)
 
         # --- daily loss circuit breaker (same rule as live) --------------
         if not day_halted and day_start_equity and risk.check_daily_loss_limit(
@@ -270,10 +296,51 @@ def run_backtest(
         ):
             day_halted = True
 
+        # Tighten the stop only after this bar has fully completed.  The new
+        # level is therefore eligible from the next bar onward and is never
+        # tested retroactively against this bar's low.
+        if (
+            position_qty > 0
+            and strategy_config.enable_trailing_stop
+            and stop_price is not None
+            and initial_stop_price is not None
+        ):
+            close_px = float(bar["close"])
+            highest_close = max(float(highest_close or entry_price), close_px)
+            atr_now = float(bar["atr"])
+            try:
+                ratcheted = risk.calculate_ratchet_stop(
+                    entry_price=entry_price,
+                    initial_stop_price=initial_stop_price,
+                    current_stop_price=stop_price,
+                    highest_close=highest_close,
+                    atr_value=atr_now,
+                    trailing_atr_multiplier=strategy_config.trailing_atr_multiplier,
+                    enable_break_even=strategy_config.enable_break_even_stop,
+                    break_even_trigger_r=strategy_config.break_even_trigger_r,
+                )
+            except ValueError:
+                ratcheted = stop_price
+            if ratcheted > stop_price:
+                stop_price = ratcheted
+                stop_exit_reason = (
+                    "break_even_stop"
+                    if strategy_config.enable_break_even_stop and stop_price >= entry_price
+                    else "trailing_atr_stop"
+                )
+                if close_px <= stop_price:
+                    pending_exit = "trailing_close_breach"
+
         # --- evaluate the strategy on this completed bar ------------------
         if i >= warmup - 1 and i < len(df) - 1:
             window = df.iloc[: i + 1]
-            decision = strategy.generate_signal(window)
+            if (
+                strategy_config.enable_market_regime_filter
+                or strategy_config.enable_relative_strength_filter
+            ):
+                decision = strategy.generate_signal(window, market_data=market_data)
+            else:
+                decision = strategy.generate_signal(window)
             if decision.action == BotAction.BUY and position_qty == 0 and not day_halted:
                 signal_price = float(decision.details.get("close") or bar["close"])
                 try:
@@ -282,11 +349,20 @@ def run_backtest(
                         float(decision.atr),
                         strategy_config.atr_multiplier,
                     )
+                    risk_scale = risk.calculate_risk_scale(
+                        starting_equity=backtest_config.initial_capital,
+                        current_equity=equity,
+                        peak_equity=peak_equity,
+                        atr_percentile=decision.atr_percentile,
+                    )
+                    decision.risk_scale = risk_scale
+                    decision.details["risk_scale"] = risk_scale
                     sizing = risk.calculate_position_size(
                         equity=equity,
                         buying_power=cash,
                         entry_price=signal_price,
                         stop_price=signal_stop,
+                        risk_scale=risk_scale,
                     )
                 except (TypeError, ValueError):
                     sizing = None
@@ -296,8 +372,19 @@ def run_backtest(
                         "reason": decision.reason,
                         "qty": sizing.qty,
                     }
-            elif decision.action == BotAction.EXIT and position_qty > 0:
-                pending_exit = "bearish_crossover"
+            elif (
+                decision.action == BotAction.EXIT
+                and position_qty > 0
+                and pending_exit is None
+            ):
+                pending_exit = decision.reason
+
+    if position_qty > 0 and backtest_config.liquidate_at_end:
+        last_ts = timestamps[-1]
+        exit_px = float(df.iloc[-1]["close"]) * (1.0 - slippage)
+        close_position(last_ts, exit_px, "final_liquidation")
+        if equity_values:
+            equity_values[-1] = cash
 
     if position_qty > 0:
         # The simulation ended still holding shares: record the open round
@@ -313,9 +400,9 @@ def run_backtest(
             )
         )
 
-    equity_curve = pd.Series(equity_values, index=timestamps, name="strategy")
+    equity_curve = pd.Series(equity_values, index=equity_timestamps, name="strategy")
 
-    close = df["close"].astype(float)
+    close = df.loc[equity_timestamps, "close"].astype(float)
     benchmark_curve = (
         backtest_config.initial_capital * close / float(close.iloc[0])
     ).rename("buy_and_hold")
@@ -349,6 +436,8 @@ def run_backtest(
         "bars_used": int(len(df)),
         "warmup_bars": warmup,
         "open_trade_at_end": len(open_trades),
+        "active_start": active_start.isoformat() if active_start is not None else None,
+        "liquidate_at_end": backtest_config.liquidate_at_end,
     }
 
     return BacktestResult(

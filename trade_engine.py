@@ -30,7 +30,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from broker import BrokerError, make_client_order_id
+from broker import BrokerError, make_client_order_id, normalize_sell_stop_price
 from config import (
     EngineConfig,
     INTRADAY_TIMEFRAMES,
@@ -124,6 +124,7 @@ class TradeEngine:
         self._stop_reason: Optional[StopReason] = None
         self._status = EngineStatus(state=EngineState.STOPPED)
         self._session_start_equity: Optional[float] = None
+        self._session_peak_equity: Optional[float] = None
         self._started_at: Optional[datetime] = None
         self._intended_stop_at: Optional[datetime] = None
         self._last_equity_snapshot: Optional[datetime] = None
@@ -244,6 +245,7 @@ class TradeEngine:
                 seconds=self.engine_config.max_runtime_seconds
             )
         self._session_start_equity = account.equity
+        self._session_peak_equity = account.equity
 
         config_json = json.dumps(
             {
@@ -594,6 +596,18 @@ class TradeEngine:
             self._persist_status()
             return
 
+        # Benchmark context is part of the economic decision.  Fetch and
+        # validate it before claiming the symbol bar in SQLite so a transient
+        # benchmark outage can retry this same bar safely on the next cycle.
+        market_bars = self._fetch_market_bars(now, bars)
+        if (
+            (self.strategy_config.enable_market_regime_filter
+             or self.strategy_config.enable_relative_strength_filter)
+            and market_bars is None
+        ):
+            self._persist_status()
+            return
+
         if self.store.is_bar_processed(self.symbol, self.timeframe, last_bar_ts):
             self._persist_status()
             return
@@ -603,7 +617,13 @@ class TradeEngine:
             self._persist_status()
             return
 
-        decision = self.strategy.generate_signal(bars)
+        if (
+            self.strategy_config.enable_market_regime_filter
+            or self.strategy_config.enable_relative_strength_filter
+        ):
+            decision = self.strategy.generate_signal(bars, market_data=market_bars)
+        else:
+            decision = self.strategy.generate_signal(bars)
         with self._lock:
             self._status.last_bar_time = last_bar_ts
             self._status.last_signal = decision
@@ -613,6 +633,10 @@ class TradeEngine:
             f"Signal on {last_bar_ts.isoformat()}: {decision.action.value} ({decision.reason})",
             context={"signal": decision.to_dict()},
         )
+
+        if self._update_trailing_stop(decision, last_bar_ts, now):
+            self._persist_status()
+            return
 
         if decision.action == BotAction.EXIT:
             self._handle_exit_signal(decision, last_bar_ts)
@@ -647,6 +671,10 @@ class TradeEngine:
                 self._status.warnings.remove(warn)
 
     def _maybe_snapshot_equity(self, now: datetime, account) -> None:
+        if self._session_peak_equity is None:
+            self._session_peak_equity = account.equity
+        else:
+            self._session_peak_equity = max(self._session_peak_equity, account.equity)
         if (
             self._last_equity_snapshot is None
             or now - self._last_equity_snapshot >= _EQUITY_SNAPSHOT_INTERVAL
@@ -731,7 +759,6 @@ class TradeEngine:
             return True
         bot_pos["qty"] = broker_qty
         bot_pos["stop_client_order_id"] = None
-        bot_pos["stop_price"] = None
         self.store.set_bot_position(self.symbol, bot_pos)
         self._log(
             "WARNING",
@@ -780,6 +807,23 @@ class TradeEngine:
     def _remaining_order_qty(order: OrderRecord) -> float:
         return max(0.0, float(order.requested_qty) - float(order.filled_qty))
 
+    @staticmethod
+    def _stop_prices_match(left: object, right: object) -> bool:
+        """Compare broker stop prices without trusting response payloads.
+
+        Malformed or non-finite stop data from an upstream response is never
+        allowed to crash reconciliation or be treated as an exact protective
+        order.  It is classified as mismatched and handled by the existing
+        cancel/confirm/re-arm path.
+        """
+        try:
+            return abs(
+                normalize_sell_stop_price(float(left))
+                - normalize_sell_stop_price(float(right))
+            ) <= 1e-9
+        except (BrokerError, TypeError, ValueError, OverflowError):
+            return False
+
     def _sync_entry_fill(self, pending: dict, order: OrderRecord, now: datetime) -> dict:
         """Persist cumulative entry fill truth, including partial fills."""
         bot_pos = self.store.get_bot_position(self.symbol)
@@ -807,15 +851,33 @@ class TradeEngine:
         else:
             bot_pos = {}
         signal = pending.get("signal")
+        entry_price = float(order.fill_price or 0.0)
+        atr_at_entry = pending.get("atr")
+        initial_stop = None
+        if entry_price > 0 and atr_at_entry:
+            try:
+                initial_stop = self.risk_manager.calculate_stop_price(
+                    entry_price,
+                    float(atr_at_entry),
+                    self.strategy_config.atr_multiplier,
+                )
+            except (ValueError, BrokerError):
+                initial_stop = None
         bot_pos.update(
             {
                 "qty": float(order.filled_qty),
                 "entry_price": order.fill_price,
-                "atr_at_entry": pending.get("atr"),
+                "atr_at_entry": atr_at_entry,
                 "entry_client_order_id": order.client_order_id,
                 "session_id": self.session_id,
                 "entry_time": (order.updated_at or now).isoformat(),
             }
+        )
+        if initial_stop is not None:
+            bot_pos["initial_stop_price"] = initial_stop
+            bot_pos["stop_price"] = initial_stop
+        bot_pos["highest_close"] = max(
+            float(bot_pos.get("highest_close") or entry_price), entry_price
         )
         bot_pos.setdefault("stop_price", None)
         bot_pos.setdefault("stop_client_order_id", None)
@@ -957,7 +1019,6 @@ class TradeEngine:
             if remaining > 1e-9:
                 bot_pos.pop("exit_accounted_filled_qty", None)
                 bot_pos["stop_client_order_id"] = None
-                bot_pos["stop_price"] = None
                 self._clear_exit_intent(bot_pos)
                 self.store.set_bot_position(self.symbol, bot_pos)
                 self._log(
@@ -1050,7 +1111,6 @@ class TradeEngine:
             if remaining > 1e-9:
                 bot_pos.pop("stop_accounted_filled_qty", None)
                 bot_pos["stop_client_order_id"] = None
-                bot_pos["stop_price"] = None
                 self.store.set_bot_position(self.symbol, bot_pos)
                 self._ensure_protective_stop(now)
             else:
@@ -1065,7 +1125,6 @@ class TradeEngine:
                 return
             # Stop ended without a fill (canceled/expired/rejected).
             bot_pos["stop_client_order_id"] = None
-            bot_pos["stop_price"] = None
             self.store.set_bot_position(self.symbol, bot_pos)
             if self._pending_exit is None and not bot_pos.get("exit_pending_reason"):
                 self._log(
@@ -1077,9 +1136,10 @@ class TradeEngine:
     def _ensure_protective_stop(self, now: datetime) -> None:
         """Create the ATR stop when a bot position has none working.
 
-        Stop price = actual fill price − ATR_at_entry × multiplier, fixed
-        from entry (no trailing).  Stop quantity always matches the bot
-        position quantity.
+        Initial stop = actual fill price − ATR_at_entry × multiplier.  When
+        enabled, completed-bar trailing/break-even logic may ratchet that
+        persisted price upward, never downward.  Stop quantity always matches
+        the bot position quantity.
 
         Duplicate-stop safety: the intended client id is persisted to the
         bot position BEFORE the submit, and any open bot stop already
@@ -1093,70 +1153,6 @@ class TradeEngine:
             return
         if bot_pos.get("exit_pending_reason"):
             return  # a strategy exit is being pursued; don't arm under it.
-        linked_stop_id = bot_pos.get("stop_client_order_id")
-        if linked_stop_id:
-            linked = self._refresh_order(linked_stop_id)
-            remaining = self._remaining_order_qty(linked) if linked is not None else 0.0
-            exact = (
-                linked is not None
-                and linked.is_open
-                and linked.side == "sell"
-                and abs(remaining - float(bot_pos.get("qty", 0))) <= 1e-9
-            )
-            if exact:
-                return
-            if linked is not None and linked.is_open:
-                try:
-                    if not self._cancel_and_confirm(linked):
-                        self._log("ERROR", "Mismatched protective stop cancel is not confirmed.")
-                        return
-                except BrokerError as exc:
-                    self._log("ERROR", f"Could not cancel mismatched protective stop: {exc}")
-                    return
-            bot_pos["stop_client_order_id"] = None
-            bot_pos["stop_price"] = None
-            self.store.set_bot_position(self.symbol, bot_pos)
-
-        # Adopt any bot stop already resting at the broker (e.g. a submit
-        # whose HTTP response was lost) rather than submitting a second one.
-        try:
-            open_orders = self.broker.list_open_orders(self.symbol)
-        except BrokerError as exc:
-            self._log("WARNING", f"Cannot verify open orders before arming stop: {exc}")
-            return
-        stop_orders = [o for o in open_orders if o.purpose == OrderPurpose.STOP.value]
-        exact_stop = None
-        for existing_order in stop_orders:
-            exact = (
-                existing_order.side == "sell"
-                and abs(
-                    self._remaining_order_qty(existing_order)
-                    - float(bot_pos.get("qty", 0))
-                )
-                <= 1e-9
-            )
-            if exact and exact_stop is None:
-                exact_stop = existing_order
-                continue
-            try:
-                if not self._cancel_and_confirm(existing_order):
-                    self._log("ERROR", "Unsafe duplicate/mismatched stop cancel unconfirmed.")
-                    return
-            except BrokerError as exc:
-                self._log("ERROR", f"Cannot cancel unsafe protective stop: {exc}")
-                return
-        if exact_stop is not None:
-            bot_pos["stop_client_order_id"] = exact_stop.client_order_id
-            if exact_stop.stop_price is not None:
-                bot_pos["stop_price"] = exact_stop.stop_price
-            self.store.set_bot_position(self.symbol, bot_pos)
-            self.store.record_order(exact_stop, self.session_id)
-            self._log(
-                "WARNING",
-                f"Adopted exact-quantity protective stop {exact_stop.client_order_id}.",
-            )
-            return
-
         entry_price = float(bot_pos.get("entry_price") or 0.0)
         atr_at_entry = bot_pos.get("atr_at_entry")
         stop_price = bot_pos.get("stop_price")
@@ -1190,6 +1186,81 @@ class TradeEngine:
             except ValueError as exc:
                 self._log("WARNING", f"Cannot compute protective stop: {exc}")
                 return
+        try:
+            normalized_stop = normalize_sell_stop_price(float(stop_price))
+        except BrokerError as exc:
+            self._log("WARNING", f"Cannot normalize protective stop: {exc}")
+            return
+        bot_pos["stop_price"] = stop_price
+        bot_pos.setdefault("initial_stop_price", stop_price)
+        bot_pos.setdefault("highest_close", entry_price)
+
+        linked_stop_id = bot_pos.get("stop_client_order_id")
+        if linked_stop_id:
+            linked = self._refresh_order(linked_stop_id)
+            remaining = self._remaining_order_qty(linked) if linked is not None else 0.0
+            exact = (
+                linked is not None
+                and linked.is_open
+                and linked.side == "sell"
+                and abs(remaining - float(bot_pos.get("qty", 0))) <= 1e-9
+                and linked.stop_price is not None
+                and self._stop_prices_match(linked.stop_price, normalized_stop)
+            )
+            if exact:
+                return
+            if linked is not None and linked.is_open:
+                try:
+                    if not self._cancel_and_confirm(linked):
+                        self._log("ERROR", "Mismatched protective stop cancel is not confirmed.")
+                        return
+                except BrokerError as exc:
+                    self._log("ERROR", f"Could not cancel mismatched protective stop: {exc}")
+                    return
+            bot_pos["stop_client_order_id"] = None
+            self.store.set_bot_position(self.symbol, bot_pos)
+
+        # Adopt any bot stop already resting at the broker (e.g. a submit
+        # whose HTTP response was lost) rather than submitting a second one.
+        try:
+            open_orders = self.broker.list_open_orders(self.symbol)
+        except BrokerError as exc:
+            self._log("WARNING", f"Cannot verify open orders before arming stop: {exc}")
+            return
+        stop_orders = [o for o in open_orders if o.purpose == OrderPurpose.STOP.value]
+        exact_stop = None
+        for existing_order in stop_orders:
+            exact = (
+                existing_order.side == "sell"
+                and abs(
+                    self._remaining_order_qty(existing_order)
+                    - float(bot_pos.get("qty", 0))
+                )
+                <= 1e-9
+                and existing_order.stop_price is not None
+                and self._stop_prices_match(existing_order.stop_price, normalized_stop)
+            )
+            if exact and exact_stop is None:
+                exact_stop = existing_order
+                continue
+            try:
+                if not self._cancel_and_confirm(existing_order):
+                    self._log("ERROR", "Unsafe duplicate/mismatched stop cancel unconfirmed.")
+                    return
+            except BrokerError as exc:
+                self._log("ERROR", f"Cannot cancel unsafe protective stop: {exc}")
+                return
+        if exact_stop is not None:
+            bot_pos["stop_client_order_id"] = exact_stop.client_order_id
+            if exact_stop.stop_price is not None:
+                bot_pos["stop_price"] = exact_stop.stop_price
+            self.store.set_bot_position(self.symbol, bot_pos)
+            self.store.record_order(exact_stop, self.session_id)
+            self._log(
+                "WARNING",
+                f"Adopted exact-quantity protective stop {exact_stop.client_order_id}.",
+            )
+            return
 
         qty = int(float(bot_pos["qty"]))
         stop_attempt = int(bot_pos.get("stop_attempts") or 0) + 1
@@ -1277,6 +1348,146 @@ class TradeEngine:
             return None
         return bars
 
+    def _fetch_market_bars(self, now: datetime, symbol_bars):
+        """Fetch causal benchmark context required by smart entry filters."""
+        cfg = self.strategy_config
+        if not (cfg.enable_market_regime_filter or cfg.enable_relative_strength_filter):
+            return None
+        if cfg.regime_symbol == self.symbol and cfg.regime_timeframe == self.timeframe:
+            return symbol_bars
+        lookback = cfg.regime_warmup_bars() + 5
+        try:
+            bars = self.data_feed.get_recent_bars(
+                cfg.regime_symbol,
+                cfg.regime_timeframe,
+                lookback_bars=lookback,
+                now=now,
+                tolerance_seconds=self.engine_config.bar_completion_tolerance_seconds,
+            )
+        except DataSubscriptionError as exc:
+            self._log("ERROR", str(exc), context={"reason": "regime_data_subscription"})
+            return None
+        except DataFeedError as exc:
+            self._log(
+                "WARNING",
+                f"Benchmark data fetch failed (will retry same bar): {exc}",
+                context={"reason": "regime_data_unavailable"},
+            )
+            return None
+        if bars is None or len(bars) < cfg.regime_warmup_bars():
+            self._log(
+                "WARNING",
+                f"Benchmark {cfg.regime_symbol} has insufficient completed history; "
+                "skipping the decision.",
+                context={"reason": "regime_data_insufficient"},
+            )
+            return None
+        last_ts = bars.index[-1].to_pydatetime()
+        if is_data_stale(
+            last_ts,
+            cfg.regime_timeframe,
+            now,
+            self.engine_config.staleness_bars,
+        ):
+            self._log(
+                "WARNING",
+                f"Benchmark data is stale (last completed bar {last_ts.isoformat()}); "
+                "skipping the decision.",
+                context={"reason": "regime_data_stale"},
+            )
+            return None
+        return bars
+
+    def _update_trailing_stop(
+        self,
+        decision: SignalDecision,
+        bar_ts: datetime,
+        now: datetime,
+    ) -> bool:
+        """Ratchet a bot position's stop from completed-bar information.
+
+        Returns True when the completed close is already at/below the newly
+        calculated level; in that case a durable strategy exit is initiated
+        instead of submitting an invalid above-market sell stop.
+        """
+        cfg = self.strategy_config
+        if not cfg.enable_trailing_stop:
+            return False
+        bot_pos = self.store.get_bot_position(self.symbol)
+        if (
+            bot_pos is None
+            or self._pending_exit is not None
+            or bot_pos.get("exit_pending_reason")
+        ):
+            return False
+        entry_price = float(bot_pos.get("entry_price") or 0.0)
+        current_stop = float(bot_pos.get("stop_price") or 0.0)
+        initial_stop = float(bot_pos.get("initial_stop_price") or current_stop)
+        close_price = float(decision.details.get("close") or 0.0)
+        atr_value = float(decision.atr or 0.0)
+        if min(entry_price, current_stop, initial_stop, close_price, atr_value) <= 0:
+            self._log(
+                "WARNING",
+                "Trailing stop skipped because entry/stop/close/ATR state is incomplete.",
+                context={"reason": "trailing_state_incomplete"},
+            )
+            return False
+        if close_price <= current_stop:
+            self._log(
+                "INFO",
+                f"Completed close {close_price:.4f} is at/below the working stop "
+                f"{current_stop:.4f}; reconciling through a safe strategy exit.",
+                context={"reason": "trailing_close_breach"},
+            )
+            self._initiate_exit("trailing_close_breach", bar_ts, signal=decision.to_dict())
+            return True
+        highest_close = max(float(bot_pos.get("highest_close") or entry_price), close_price)
+        try:
+            next_stop = self.risk_manager.calculate_ratchet_stop(
+                entry_price=entry_price,
+                initial_stop_price=initial_stop,
+                current_stop_price=current_stop,
+                highest_close=highest_close,
+                atr_value=atr_value,
+                trailing_atr_multiplier=cfg.trailing_atr_multiplier,
+                enable_break_even=cfg.enable_break_even_stop,
+                break_even_trigger_r=cfg.break_even_trigger_r,
+            )
+        except (ValueError, BrokerError) as exc:
+            self._log("WARNING", f"Trailing stop could not be updated: {exc}")
+            return False
+
+        bot_pos["highest_close"] = highest_close
+        bot_pos.setdefault("initial_stop_price", initial_stop)
+        if next_stop <= current_stop:
+            self.store.set_bot_position(self.symbol, bot_pos)
+            return False
+        if close_price <= next_stop:
+            self.store.set_bot_position(self.symbol, bot_pos)
+            self._log(
+                "INFO",
+                f"Completed close {close_price:.4f} breached the next trailing stop "
+                f"{next_stop:.4f}; initiating an exit.",
+                context={"reason": "trailing_close_breach"},
+            )
+            self._initiate_exit("trailing_close_breach", bar_ts, signal=decision.to_dict())
+            return True
+
+        bot_pos["stop_price"] = next_stop
+        self.store.set_bot_position(self.symbol, bot_pos)
+        self._log(
+            "INFO",
+            f"Protective stop ratcheted to {next_stop:.4f} from completed bar "
+            f"{bar_ts.isoformat()}.",
+            context={
+                "reason": "trailing_stop_ratchet",
+                "highest_close": highest_close,
+                "atr": atr_value,
+            },
+        )
+        self._ensure_protective_stop(now)
+        return False
+
     def _maybe_flatten_before_close(self, clock, now: datetime) -> None:
         """Optional flat-before-close: exit the bot position before the close."""
         if not self.engine_config.flat_before_close:
@@ -1305,7 +1516,7 @@ class TradeEngine:
         if self._pending_exit is not None:
             self._log("INFO", "EXIT signal while an exit is already pending — no action.")
             return
-        self._initiate_exit("bearish_crossover", bar_ts, signal=decision.to_dict())
+        self._initiate_exit(decision.reason, bar_ts, signal=decision.to_dict())
 
     def _initiate_exit(
         self, reason: str, bar_ts: datetime, signal: Optional[dict] = None
@@ -1485,11 +1696,21 @@ class TradeEngine:
             self._mark_entry_blocked(decision, "stop_not_computable")
             self._log("WARNING", f"BUY signal blocked: cannot compute a valid stop ({exc})")
             return
+        risk_scale = self.risk_manager.calculate_risk_scale(
+            starting_equity=float(self._session_start_equity or account.equity),
+            current_equity=account.equity,
+            peak_equity=float(self._session_peak_equity or account.equity),
+            atr_percentile=decision.atr_percentile,
+        )
+        decision.risk_scale = risk_scale
+        decision.details["risk_scale"] = risk_scale
+        self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
         sizing = self.risk_manager.calculate_position_size(
             equity=account.equity,
             buying_power=account.buying_power,
             entry_price=close_price,
             stop_price=stop_estimate,
+            risk_scale=risk_scale,
         )
         if not sizing.approved:
             self._mark_entry_blocked(decision, sizing.rejection_reason)
@@ -1534,7 +1755,8 @@ class TradeEngine:
         self._log(
             "INFO",
             f"Entry order submitted: buy {sizing.qty} {self.symbol} "
-            f"(risk ${sizing.risk_amount:,.2f}, est. stop {stop_estimate:.2f})",
+            f"(risk ${sizing.risk_amount:,.2f}, scale {risk_scale:.2f}, "
+            f"est. stop {stop_estimate:.2f})",
             context={"signal": decision.to_dict()},
         )
         self._quick_poll_order(client_id)

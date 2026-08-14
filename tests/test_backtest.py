@@ -28,6 +28,7 @@ import pytest
 import backtest as backtest_mod
 from backtest import MIN_SHARPE_OBSERVATIONS, compute_max_drawdown, compute_sharpe, run_backtest
 from config import BacktestConfig, RiskConfig, StrategyConfig, bars_per_year
+from models import BotAction, SignalDecision
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -456,3 +457,80 @@ def test_trade_return_percentage_is_net_of_both_commissions():
     trade = result.trades[0]
     invested = trade.entry_price * trade.qty + 7.5
     assert trade.return_pct == pytest.approx(trade.pnl / invested * 100.0)
+
+
+def test_forced_final_liquidation_closes_open_trade_at_last_close():
+    result = run(entry_only_frame(), bt=make_backtest_config(liquidate_at_end=True))
+    assert result.num_trades == 1
+    assert result.trades[-1].is_closed
+    assert result.trades[-1].exit_reason == "final_liquidation"
+    assert result.trades[-1].exit_price == pytest.approx(entry_only_frame()["close"].iloc[-1])
+    assert result.config_snapshot["open_trade_at_end"] == 0
+
+
+def test_active_start_uses_prior_bars_only_as_warmup_context():
+    df = entry_only_frame()
+    activation = df.index[3]
+    result = run_backtest(
+        df,
+        make_strategy_config(),
+        RiskConfig(),
+        make_backtest_config(),
+        active_start=activation,
+    )
+    assert result.equity_curve.index[0] == activation
+    assert result.benchmark_curve.iloc[0] == pytest.approx(100_000.0)
+    assert all(trade.entry_time >= activation for trade in result.trades)
+
+
+def test_trailing_stop_created_at_close_is_not_applied_retroactively(monkeypatch):
+    """The bar that raises the trail may have traded below the new level
+    earlier in that same bar; only the next bar may trigger that new stop."""
+    closes = [100, 99, 98, 99, 101, 110, 106, 106]
+    opens = [100, 99, 98, 99, 100, 101, 109, 106]
+    highs = [101, 100, 99, 100, 102, 111, 109, 107]
+    lows = [99, 98, 97, 98, 99, 100, 104, 105]
+    df = make_df(closes, opens, highs, lows)
+
+    def fixed_indicators(frame, _config):
+        out = frame.copy()
+        out["atr"] = 2.0
+        return out
+
+    def one_buy(self, window, market_data=None):
+        ts = window.index[-1].to_pydatetime()
+        if len(window) == 4:
+            return SignalDecision(
+                action=BotAction.BUY,
+                timestamp=ts,
+                reason="synthetic_buy",
+                atr=2.0,
+                atr_percentile=50.0,
+                details={"close": float(window["close"].iloc[-1])},
+            )
+        return SignalDecision(
+            action=BotAction.HOLD,
+            timestamp=ts,
+            reason="synthetic_hold",
+            atr=2.0,
+            atr_percentile=50.0,
+            details={"close": float(window["close"].iloc[-1])},
+        )
+
+    monkeypatch.setattr(backtest_mod, "compute_indicators", fixed_indicators)
+    monkeypatch.setattr(backtest_mod.TrendStrategy, "generate_signal", one_buy)
+    strategy = make_strategy_config(
+        enable_trailing_stop=True,
+        trailing_atr_multiplier=1.0,
+    )
+    result = run_backtest(
+        df,
+        strategy,
+        RiskConfig(max_position_pct=100.0),
+        make_backtest_config(),
+    )
+    closed = [trade for trade in result.trades if trade.is_closed]
+    assert len(closed) == 1
+    assert closed[0].exit_time == df.index[6]
+    assert closed[0].exit_price == pytest.approx(108.0)
+    assert closed[0].exit_reason == "trailing_atr_stop"
