@@ -334,8 +334,12 @@ class TradeEngine:
         client_id = pending_ctx.get("client_order_id")
         if not client_id:
             return False
+        # The pre-submit KV intent plus the broker's own record of the exact
+        # bot-namespace client id prove ownership.  The local orders row is
+        # NOT required: a crash between submit and record_order means the
+        # row never existed, and recovery must still work.
         row = self.store.get_order_by_client_id(client_id)
-        if row is None or row.purpose != OrderPurpose.ENTRY.value:
+        if row is not None and row.purpose != OrderPurpose.ENTRY.value:
             return False
         try:
             order = self.broker.get_order_by_client_id(client_id)
@@ -343,6 +347,7 @@ class TradeEngine:
             return False
         if (
             order is None
+            or order.purpose != OrderPurpose.ENTRY.value
             or order.side != "buy"
             or order.filled_qty <= 0
             or abs(order.filled_qty - broker_pos.qty) > 1e-9

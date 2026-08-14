@@ -1748,3 +1748,36 @@ def test_cancel_and_confirm_requires_terminal_state(tmp_path, monkeypatch):
     monkeypatch.setattr(h.broker, "get_order_by_client_id", eventually_canceled)
     assert h.engine._cancel_and_confirm(replace(record)) is True
     assert record.status == "canceled"
+
+
+def test_restart_adopts_entry_fill_even_when_crash_preceded_record_order(tmp_path):
+    """Crash window: pending-entry KV is persisted, the submit reached
+    Alpaca and filled, but the process died before record_order wrote the
+    local orders row.  Restart must still adopt the fill via the exact
+    pending client id and protect it — refusing to start would leave a
+    filled position permanently stopless."""
+    h = build_harness(tmp_path)
+    cid = make_client_order_id(
+        h.engine.session_id, OrderPurpose.ENTRY.value, NOW, symbol=SYMBOL
+    )
+    h.broker.orders[cid] = OrderRecord(
+        broker_order_id="crash-entry", client_order_id=cid, symbol=SYMBOL,
+        purpose="entry", side="buy", requested_qty=10.0, filled_qty=10.0,
+        status="filled", fill_price=100.0, submitted_at=NOW, updated_at=NOW,
+    )
+    h.broker.positions[SYMBOL] = BrokerPosition(SYMBOL, 10.0, 100.0, 100.0, 1_000.0, 0.0, 0.0)
+    h.store.set_kv(
+        trade_engine.PENDING_ENTRY_KEY_PREFIX + SYMBOL,
+        json.dumps({"client_order_id": cid, "atr": 2.0, "signal": {"reason": "crash"}}),
+    )
+    # NOTE: no h.store.record_order(...) — that is the crash window.
+
+    h.engine._startup()
+
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["qty"] == pytest.approx(10.0)
+    assert len([t for t in h.store.get_trades() if t["action"] == "BUY"]) == 1
+
+    h.engine.run_iteration()
+    stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(stops) == 1 and stops[0].requested_qty == pytest.approx(10.0)
