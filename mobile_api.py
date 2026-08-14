@@ -1,12 +1,14 @@
-"""Authenticated read-only API for the native Trade mobile companion.
+"""Authenticated API for the standalone Trade mobile app.
 
-This service intentionally exposes persisted dashboard state, recent activity,
-and equity history without duplicating order-entry or live-unlock logic.
-Trading controls remain in the existing Streamlit application.
+Trading stays on the server. The phone can be suspended or closed without
+stopping the Streamlit/engine process. This service exposes durable dashboard
+state and registers Expo push tokens for server-side fill/safety notifications.
+It intentionally does not add a second order-entry or live-unlock path.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
@@ -14,9 +16,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from config import APP_NAME, DEFAULT_DB_PATH
 from crypto_engine import (
@@ -24,15 +27,26 @@ from crypto_engine import (
     CRYPTO_KILL_SWITCH_KEY,
     CRYPTO_LAST_SIGNALS_KEY,
 )
+from mobile_push import (
+    MobilePushNotifier,
+    get_push_tokens,
+    register_push_token,
+    unregister_push_token,
+)
 from state_store import StateStore
 from trade_engine import ENGINE_STATUS_KEY, KILL_SWITCH_KEY, LAST_SIGNAL_KEY
 
 
-API_VERSION = "1"
+API_VERSION = "2"
 MIN_TOKEN_LENGTH = 32
 DEFAULT_MAX_EQUITY_POINTS = 500
 
 _bearer = HTTPBearer(auto_error=False)
+
+
+class PushRegistration(BaseModel):
+    token: str
+    platform: str = "ios"
 
 
 def _json_value(raw: Optional[str]) -> Any:
@@ -69,16 +83,25 @@ def _configured_token(explicit: Optional[str]) -> str:
     return token
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def create_mobile_api(
     *,
     store: Optional[StateStore] = None,
     token: Optional[str] = None,
     dashboard_url: Optional[str] = None,
+    enable_push_notifier: Optional[bool] = None,
 ) -> FastAPI:
     """Build the mobile API with injectable persistence/auth for tests.
 
     If ``store`` is omitted the service owns a StateStore instance and closes it
     on shutdown. If no API token is configured, protected endpoints fail closed.
+    The optional push observer reads durable state only and never calls Alpaca.
     """
 
     configured_token = _configured_token(token)
@@ -91,12 +114,30 @@ def create_mobile_api(
         if dashboard_url is not None
         else os.environ.get("MOBILE_DASHBOARD_URL", "").strip()
     )
+    push_enabled = (
+        _env_bool("MOBILE_PUSH_ENABLED", True)
+        if enable_push_notifier is None
+        else enable_push_notifier
+    )
+    push_interval = float(os.environ.get("MOBILE_PUSH_POLL_SECONDS", "10"))
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        notifier: Optional[MobilePushNotifier] = None
+        task: Optional[asyncio.Task] = None
+        if push_enabled:
+            notifier = MobilePushNotifier(resolved_store, push_interval)
+            task = asyncio.create_task(notifier.run(), name="mobile-push-notifier")
         try:
             yield
         finally:
+            if notifier is not None:
+                notifier.stop()
+            if task is not None:
+                try:
+                    await asyncio.wait_for(task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    task.cancel()
             if owns_store:
                 resolved_store.close()
 
@@ -111,6 +152,7 @@ def create_mobile_api(
     app.state.store = resolved_store
     app.state.mobile_api_token = configured_token
     app.state.dashboard_url = resolved_dashboard_url
+    app.state.push_enabled = push_enabled
 
     origins = _allowed_origins_from_env()
     if origins:
@@ -118,7 +160,7 @@ def create_mobile_api(
             CORSMiddleware,
             allow_origins=origins,
             allow_credentials=False,
-            allow_methods=["GET"],
+            allow_methods=["GET", "POST", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
 
@@ -154,6 +196,7 @@ def create_mobile_api(
             "ok": True,
             "service": "trade-mobile-api",
             "version": API_VERSION,
+            "server_background_runtime": True,
         }
 
     @app.get("/v1/overview", dependencies=[auth])
@@ -178,6 +221,8 @@ def create_mobile_api(
                 "monitoring": True,
                 "recent_activity": True,
                 "equity_history": True,
+                "push_notifications": app.state.push_enabled,
+                "server_background_runtime": True,
                 "trading_commands": False,
             },
         }
@@ -217,6 +262,36 @@ def create_mobile_api(
             "session_id": latest["session_id"],
             "items": _serializable(selected),
             "count": len(selected),
+        }
+
+    @app.post("/v1/devices/push", dependencies=[auth])
+    async def add_push_device(payload: PushRegistration) -> dict[str, Any]:
+        if payload.platform.lower() != "ios":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="This release registers iOS push devices only.",
+            )
+        try:
+            tokens = register_push_token(app.state.store, payload.token)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+        return {"registered": True, "device_count": len(tokens)}
+
+    @app.delete("/v1/devices/push", dependencies=[auth])
+    async def remove_push_device(
+        token_value: Annotated[str, Body(embed=True, alias="token")],
+    ) -> dict[str, Any]:
+        tokens = unregister_push_token(app.state.store, token_value)
+        return {"registered": False, "device_count": len(tokens)}
+
+    @app.get("/v1/devices/push", dependencies=[auth])
+    async def push_device_status() -> dict[str, Any]:
+        return {
+            "enabled": app.state.push_enabled,
+            "device_count": len(get_push_tokens(app.state.store)),
         }
 
     return app
