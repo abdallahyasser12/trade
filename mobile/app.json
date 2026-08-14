@@ -1,13 +1,15 @@
 {
   "expo": {
-    "name": "Trade Companion",
+    "name": "Trade",
     "slug": "trade-companion",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
+    "scheme": "tradecompanion",
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.abdallahyasser.tradecompanion",
+      "buildNumber": "1",
       "config": {
         "usesNonExemptEncryption": false
       }
@@ -16,7 +18,14 @@
       "package": "com.abdallahyasser.tradecompanion"
     },
     "plugins": [
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-background-task",
+      [
+        "expo-notifications",
+        {
+          "enableBackgroundRemoteNotifications": false
+        }
+      ]
     ]
   }
 }

@@ -15,6 +15,7 @@ from crypto_engine import (
     CRYPTO_LAST_SIGNALS_KEY,
 )
 from mobile_api import create_mobile_api
+from mobile_push import get_push_tokens
 from state_store import StateStore
 from trade_engine import ENGINE_STATUS_KEY, KILL_SWITCH_KEY, LAST_SIGNAL_KEY
 
@@ -37,6 +38,7 @@ def client(store):
         store=store,
         token=TOKEN,
         dashboard_url="https://dashboard.example.test",
+        enable_push_notifier=False,
     )
     with TestClient(application) as test_client:
         yield test_client
@@ -52,7 +54,8 @@ def test_health_is_public_and_contains_no_trading_state(client):
     assert response.json() == {
         "ok": True,
         "service": "trade-mobile-api",
-        "version": "1",
+        "version": "2",
+        "server_background_runtime": True,
     }
 
 
@@ -125,6 +128,7 @@ def test_overview_uses_persisted_engine_state_only(client, store):
     assert body["stock"]["kill_switch"]["reason"] == "TEST_STOCK_LOCK"
     assert body["crypto"]["kill_switch"]["armed"] is True
     assert body["dashboard_url"] == "https://dashboard.example.test"
+    assert body["capabilities"]["server_background_runtime"] is True
     assert body["capabilities"]["trading_commands"] is False
 
 
@@ -182,3 +186,52 @@ def test_equity_returns_latest_session_window(client, store):
     assert body["count"] == 3
     assert body["items"][0]["equity"] == 100_200
     assert body["items"][-1]["equity"] == 100_400
+
+
+def test_push_registration_is_authenticated_bounded_and_revocable(client, store):
+    push_token = "ExpoPushToken[" + ("a" * 40) + "]"
+
+    denied = client.post(
+        "/v1/devices/push",
+        json={"token": push_token, "platform": "ios"},
+    )
+    assert denied.status_code == 401
+
+    response = client.post(
+        "/v1/devices/push",
+        headers=_auth(),
+        json={"token": push_token, "platform": "ios"},
+    )
+    assert response.status_code == 200
+    assert response.json()["registered"] is True
+    assert get_push_tokens(store) == [push_token]
+
+    response = client.get("/v1/devices/push", headers=_auth())
+    assert response.status_code == 200
+    assert response.json()["device_count"] == 1
+
+    response = client.request(
+        "DELETE",
+        "/v1/devices/push",
+        headers={**_auth(), "Content-Type": "application/json"},
+        json={"token": push_token},
+    )
+    assert response.status_code == 200
+    assert response.json()["registered"] is False
+    assert get_push_tokens(store) == []
+
+
+def test_push_registration_rejects_non_ios_and_malformed_tokens(client):
+    bad_platform = client.post(
+        "/v1/devices/push",
+        headers=_auth(),
+        json={"token": "ExpoPushToken[" + ("a" * 40) + "]", "platform": "android"},
+    )
+    assert bad_platform.status_code == 422
+
+    bad_token = client.post(
+        "/v1/devices/push",
+        headers=_auth(),
+        json={"token": "not-a-push-token", "platform": "ios"},
+    )
+    assert bad_token.status_code == 422

@@ -1,0 +1,11 @@
+{$TRADE_DOMAIN} {
+    encode zstd gzip
+
+    handle_path /api/* {
+        reverse_proxy mobile-api:8000
+    }
+
+    handle {
+        reverse_proxy dashboard:8501
+    }
+}
