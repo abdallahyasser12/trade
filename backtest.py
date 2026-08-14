@@ -252,6 +252,20 @@ def run_backtest(
             elif decision.action == BotAction.EXIT and position_qty > 0:
                 pending_exit = "bearish_crossover"
 
+    if position_qty > 0:
+        # The simulation ended still holding shares: record the open round
+        # trip (exit fields None) so the trade list matches the equity curve.
+        # It is excluded from num_trades/win_rate, which count closed trades.
+        trades.append(
+            TradeRecord(
+                symbol=strategy_config.symbol,
+                qty=position_qty,
+                entry_time=entry_time,
+                entry_price=entry_price,
+                entry_reason=entry_reason,
+            )
+        )
+
     equity_curve = pd.Series(equity_values, index=timestamps, name="strategy")
 
     close = df["close"].astype(float)
