@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Trade Companion",
+    "slug": "trade-companion",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.abdallahyasser.tradecompanion",
+      "config": {
+        "usesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.abdallahyasser.tradecompanion"
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}
