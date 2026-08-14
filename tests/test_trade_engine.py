@@ -1583,3 +1583,166 @@ def test_running_engine_owns_immutable_configuration_snapshot(tmp_path):
     assert h.engine.strategy.config.symbol == original_symbol
     assert h.engine.risk_manager.config.risk_per_trade_pct == original_risk
     assert h.engine.engine_config.close_buffer_minutes == 30
+
+
+# ---------------------------------------------------------------------------
+# Third-audit regressions: coverage holes found by mutation testing, plus a
+# newly discovered pending-entry/position-truth race.
+# ---------------------------------------------------------------------------
+
+
+def test_position_visible_before_entry_order_reports_fill_is_not_fatal(tmp_path):
+    """A market entry can show up as a broker position before the order
+    object reports the fill.  With a live pending-entry intent the engine
+    must defer to order reconciliation (and then protect the fill), never
+    fatal-halt with an unprotected position."""
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    cid = make_client_order_id(
+        h.engine.session_id, OrderPurpose.ENTRY.value, NOW, symbol=SYMBOL
+    )
+    order = OrderRecord(
+        broker_order_id="race-entry", client_order_id=cid, symbol=SYMBOL,
+        purpose="entry", side="buy", requested_qty=10.0, filled_qty=0.0,
+        status="accepted", submitted_at=NOW, updated_at=NOW,
+    )
+    h.broker.orders[cid] = order
+    h.store.record_order(order, h.engine.session_id)
+    context = {"client_order_id": cid, "atr": 2.0, "signal": {"reason": "race"}}
+    h.store.set_kv(trade_engine.PENDING_ENTRY_KEY_PREFIX + SYMBOL, json.dumps(context))
+    h.engine._pending_entry = context
+    h.broker.positions[SYMBOL] = BrokerPosition(SYMBOL, 10.0, 100.0, 100.0, 1_000.0, 0.0, 0.0)
+
+    h.engine.run_iteration()
+
+    assert h.engine.status.state != EngineState.ERROR
+    assert h.engine._stop_reason is None
+
+    # Broker truth catches up; the next cycle adopts and protects the fill.
+    order.filled_qty = 10.0
+    order.status = "filled"
+    order.fill_price = 100.0
+    h.engine.run_iteration()
+
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["qty"] == pytest.approx(10.0)
+    stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(stops) == 1 and stops[0].requested_qty == pytest.approx(10.0)
+    assert len([t for t in h.store.get_trades() if t["action"] == "BUY"]) == 1
+
+
+def test_foreign_position_without_pending_entry_still_fatals(tmp_path):
+    """The in-flight-entry deferral must not weaken the ownership boundary:
+    a position with no pending entry intent remains a fatal halt."""
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    h.broker.positions[SYMBOL] = BrokerPosition(SYMBOL, 5.0, 90.0, 90.0, 450.0, 0.0, 0.0)
+
+    h.engine.run_iteration()
+
+    assert h.engine.status.state == EngineState.ERROR
+    assert h.engine._stop_reason == StopReason.FATAL_ERROR
+    assert h.store.get_bot_position(SYMBOL) is None
+
+
+def test_linked_stop_with_wrong_quantity_is_resized_to_position(tmp_path):
+    """_ensure_protective_stop must verify the linked stop's remaining
+    quantity against the position instead of blindly trusting the link
+    (mutation 'ensure-stop-blind-trust' survived the prior suite)."""
+    h = build_harness(tmp_path, market_open=False)
+    preset_bot_position(h, qty=70, stop_price=96.0)
+    # Replace the exact 70-share stop with a 40-share stop under the link.
+    small_cid = inject_resting_order(
+        h, OrderPurpose.STOP.value, qty=40, stop_price=96.0,
+        bar_ts=h.now.now - timedelta(days=3),
+    )
+    pos = h.store.get_bot_position(SYMBOL)
+    old_cid = pos["stop_client_order_id"]
+    del h.broker.orders[old_cid]
+    pos["stop_client_order_id"] = small_cid
+    h.store.set_bot_position(SYMBOL, pos)
+    h.engine._startup()
+
+    h.engine.run_iteration()
+
+    assert h.broker.orders[small_cid].status == "canceled"
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(70.0)
+
+
+def test_duplicate_resting_stops_collapse_to_one_exact_stop(tmp_path):
+    """Two resting bot sell stops (e.g. a lost-response resubmit race) must
+    collapse to exactly one stop of exactly the position quantity — two
+    resting sells could otherwise oversell the account short."""
+    h = build_harness(tmp_path, market_open=False)
+    preset_bot_position(h, qty=70, stop_price=96.0)
+    pos = h.store.get_bot_position(SYMBOL)
+    exact_cid = pos["stop_client_order_id"]
+    dup_cid = inject_resting_order(
+        h, OrderPurpose.STOP.value, qty=40, stop_price=95.0,
+        bar_ts=h.now.now - timedelta(days=3),
+    )
+    pos["stop_client_order_id"] = None
+    pos["stop_price"] = None
+    h.store.set_bot_position(SYMBOL, pos)
+    h.engine._startup()
+
+    h.engine.run_iteration()
+
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(70.0)
+    assert h.broker.orders[dup_cid].status == "canceled"
+    assert h.store.get_bot_position(SYMBOL)["stop_client_order_id"] == exact_cid
+
+
+def test_startup_refuses_to_clear_position_when_orphan_stop_cancel_fails(tmp_path, monkeypatch):
+    """If the broker position vanished but the leftover bot sell stop cannot
+    be confirmed canceled, startup must refuse to proceed (a resting sell
+    with no position could fill short).  Local ownership is preserved for
+    the retry (mutation 'orphan-stop-ignore-failure' survived the suite)."""
+    h = build_harness(tmp_path)
+    stop_cid = preset_bot_position(h, qty=10)
+    del h.broker.positions[SYMBOL]
+
+    def failing_cancel(broker_order_id: str):
+        raise BrokerError("simulated cancel outage")
+
+    monkeypatch.setattr(h.broker, "cancel_order", failing_cancel)
+    with pytest.raises(BrokerError, match="could not be confirmed canceled"):
+        h.engine._startup()
+
+    assert h.store.get_bot_position(SYMBOL) is not None
+    assert h.broker.orders[stop_cid].is_open
+
+
+def test_cancel_and_confirm_requires_terminal_state(tmp_path, monkeypatch):
+    """_cancel_and_confirm must poll until the order can no longer fill;
+    a cancel request alone (pending_cancel) is not confirmation (mutation
+    'cancel-without-confirm' survived the suite)."""
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    cid = inject_resting_order(h, OrderPurpose.STOP.value, qty=10, stop_price=96.0)
+    record = h.broker.orders[cid]
+
+    def async_cancel(broker_order_id: str):
+        assert broker_order_id == record.broker_order_id
+        record.status = "pending_cancel"  # request accepted, not yet dead
+
+    monkeypatch.setattr(h.broker, "cancel_order", async_cancel)
+    assert h.engine._cancel_and_confirm(replace(record)) is False
+
+    refreshes = {"n": 0}
+    original_get = h.broker.get_order_by_client_id
+
+    def eventually_canceled(client_order_id: str):
+        refreshes["n"] += 1
+        if refreshes["n"] >= 2:
+            record.status = "canceled"
+        return original_get(client_order_id)
+
+    record.status = "new"
+    monkeypatch.setattr(h.broker, "get_order_by_client_id", eventually_canceled)
+    assert h.engine._cancel_and_confirm(replace(record)) is True
+    assert record.status == "canceled"

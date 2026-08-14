@@ -456,3 +456,59 @@ def test_trade_return_percentage_is_net_of_both_commissions():
     trade = result.trades[0]
     invested = trade.entry_price * trade.qty + 7.5
     assert trade.return_pct == pytest.approx(trade.pnl / invested * 100.0)
+
+
+def test_daily_loss_baseline_is_previous_close_so_overnight_gap_halts_the_day():
+    """Third-audit regression: the day's loss baseline must be captured
+    BEFORE the day's first bar is marked/filled.  An overnight gap that
+    stops out the position for >max_daily_loss_pct must halt new entries
+    for that day.  With the pre-audit ordering (baseline taken from the
+    first bar's post-move equity) the loss is invisible to the circuit
+    breaker and the later same-day BUY is taken."""
+    scfg = make_strategy_config(timeframe="15Min")
+    rcfg = RiskConfig(
+        risk_per_trade_pct=10.0,
+        max_position_pct=90.0,
+        max_daily_loss_pct=5.0,
+        min_shares=1,
+        min_position_value=100.0,
+    )
+    # Day 1: canonical entry pattern (fill on bar 5 @ 97.75, stop 86.25).
+    # Day 2 bar 6 gaps open to 80 (through the stop -> ~15% session loss),
+    # then bars 7-10 re-run the crossover pattern 20 points lower, so a
+    # second confirmed BUY signal fires on bar 10 (fill would be bar 11).
+    closes = [100.0, 97.0, 94.0, 91.0, 97.5, 98.0, 80.0, 77.0, 74.0, 71.0, 77.5, 78.0]
+    opens = [100.0, 97.5, 94.5, 91.5, 96.75, 97.75, 80.0, 77.5, 74.5, 71.5, 76.75, 77.75]
+    highs = [c + 1.0 for c in closes]
+    lows = [c - 1.0 for c in closes]
+    lows[6] = 79.0
+    index = pd.DatetimeIndex(
+        list(pd.date_range("2024-01-02 15:00", periods=6, freq="15min", tz="UTC"))
+        + list(pd.date_range("2024-01-03 15:00", periods=6, freq="15min", tz="UTC"))
+    )
+    df = pd.DataFrame(
+        {
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1_000_000.0] * 12,
+        },
+        index=index,
+    )
+
+    halted = run_backtest(df, scfg, rcfg, make_backtest_config())
+    assert [t.exit_reason for t in halted.trades] == ["atr_stop"]
+    assert len(halted.trades) == 1  # day-2 re-entry blocked by the halt
+
+    # Sanity: with the loss limit out of reach the same data DOES re-enter,
+    # proving the halt (not the signal) is what blocks the second trade.
+    permissive = RiskConfig(
+        risk_per_trade_pct=10.0,
+        max_position_pct=90.0,
+        max_daily_loss_pct=50.0,
+        min_shares=1,
+        min_position_value=100.0,
+    )
+    unhalted = run_backtest(df, scfg, permissive, make_backtest_config())
+    assert len(unhalted.trades) == 2

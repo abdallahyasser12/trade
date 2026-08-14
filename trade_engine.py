@@ -682,6 +682,19 @@ class TradeEngine:
         if broker_pos is None and bot_pos is None:
             return True
         if broker_pos is not None and bot_pos is None:
+            if self._pending_entry is not None or self.store.get_kv(
+                PENDING_ENTRY_KEY_PREFIX + self.symbol
+            ):
+                # An entry order is still in flight: its fill can become
+                # visible as a position before the order object reports it.
+                # Defer to order reconciliation next cycle instead of
+                # declaring the position foreign; no economic action now.
+                self._log(
+                    "INFO",
+                    "Broker position appeared while the bot entry order is in "
+                    "flight — waiting for order reconciliation to adopt the fill.",
+                )
+                return False
             self._fail_fatal(
                 f"Broker now holds {broker_pos.qty:g} {self.symbol} without bot ownership; "
                 "session halted for manual reconciliation."
