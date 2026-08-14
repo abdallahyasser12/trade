@@ -23,6 +23,11 @@ The implemented stock design is documented in
 boundary, execution model, and acceptance gates are documented in
 [`CRYPTO_TRADING_PLAN.md`](CRYPTO_TRADING_PLAN.md).
 
+To run this on an iPhone with an always-on backend, follow
+[`GET_THE_APP.md`](GET_THE_APP.md): `scripts/deploy_backend.sh` starts and verifies
+the server side, and the **Build production iOS app** workflow publishes a signed
+install link once an Expo and an Apple Developer account are linked.
+
 ## Installation
 
 Requirements:
@@ -312,6 +317,9 @@ fingerprints. Broker error messages are sanitized. The application uses no `eval
 | `data_feed.py` / `crypto_data_feed.py` | Completed bars, staleness, retries, crypto quotes. |
 | `state_store.py` | SQLite sessions, bars, orders, fills, equity, logs, positions. |
 | `models.py` / `crypto_models.py` | Typed boundary structures. |
+| `mobile_api.py` / `mobile_push.py` | Read-only mobile API and server-side push observer. |
+| `scripts/deploy_backend.sh` | One-command production stack bring-up and app connection details. |
+| `scripts/verify_backend.sh` | External reachability and authentication check for the mobile API. |
 
 ## Troubleshooting
 
