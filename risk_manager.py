@@ -34,11 +34,11 @@ class RiskManager:
         stop <= 0 means the ATR distance exceeds the entry price and the
         trade must not be taken.
         """
-        if entry_price <= 0:
+        if not math.isfinite(entry_price) or entry_price <= 0:
             raise ValueError(f"Entry price must be positive, got {entry_price}")
-        if atr_value <= 0:
+        if not math.isfinite(atr_value) or atr_value <= 0:
             raise ValueError(f"ATR must be positive, got {atr_value}")
-        if atr_multiplier <= 0:
+        if not math.isfinite(atr_multiplier) or atr_multiplier <= 0:
             raise ValueError(f"ATR multiplier must be positive, got {atr_multiplier}")
         stop = entry_price - atr_value * atr_multiplier
         if stop <= 0:
@@ -76,13 +76,13 @@ class RiskManager:
                 rejection_reason=reason,
             )
 
-        if equity <= 0:
+        if not math.isfinite(equity) or equity <= 0:
             return rejected("non_positive_equity")
-        if entry_price <= 0:
+        if not math.isfinite(entry_price) or entry_price <= 0:
             return rejected("non_positive_entry_price")
-        if stop_price <= 0 or stop_price >= entry_price:
+        if not math.isfinite(stop_price) or stop_price <= 0 or stop_price >= entry_price:
             return rejected("invalid_stop_price")
-        if buying_power <= 0:
+        if not math.isfinite(buying_power) or buying_power <= 0:
             return rejected("no_buying_power")
 
         risk_per_share = entry_price - stop_price

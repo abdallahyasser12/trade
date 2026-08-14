@@ -7,6 +7,8 @@ This module never performs network requests.
 from __future__ import annotations
 
 import os
+import math
+import hashlib
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import date, timedelta
@@ -146,6 +148,12 @@ class AlpacaCredentials:
             return "****"
         return f"{self.api_key[:4]}…{'*' * 4}"
 
+    @property
+    def fingerprint(self) -> str:
+        """Non-reversible cache key that changes when either credential changes."""
+        material = f"{self.api_key}\0{self.secret_key}".encode("utf-8")
+        return hashlib.sha256(material).hexdigest()[:16]
+
     def __repr__(self) -> str:  # never leak secrets through repr
         return f"AlpacaCredentials(api_key={self.masked_key!r}, secret_key='****')"
 
@@ -185,6 +193,16 @@ class StrategyConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
+        finite_fields = {
+            "RSI overbought": self.rsi_overbought,
+            "RSI oversold": self.rsi_oversold,
+            "ATR multiplier": self.atr_multiplier,
+            "minimum volume ratio": self.min_volume_ratio,
+            "maximum ATR percentile": self.max_atr_percentile,
+        }
+        for label, value in finite_fields.items():
+            if not math.isfinite(value):
+                errors.append(f"{label} must be finite.")
         symbol_error = validate_symbol(self.symbol)
         if symbol_error:
             errors.append(symbol_error)
@@ -255,6 +273,14 @@ class RiskConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
+        for label, value in {
+            "Risk per trade": self.risk_per_trade_pct,
+            "Maximum position size": self.max_position_pct,
+            "Maximum session loss": self.max_daily_loss_pct,
+            "Minimum position value": self.min_position_value,
+        }.items():
+            if not math.isfinite(value):
+                errors.append(f"{label} must be finite.")
         if self.risk_per_trade_pct <= 0:
             errors.append("Risk per trade must be greater than 0%.")
         if self.risk_per_trade_pct > 10:
@@ -295,6 +321,18 @@ class EngineConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
+        for label, value in {
+            "Polling interval": self.poll_interval_seconds,
+            "Run duration": self.max_runtime_seconds,
+        }.items():
+            if value is not None and not math.isfinite(value):
+                errors.append(f"{label} must be finite.")
+        for label, value in {
+            "Bar completion tolerance": self.bar_completion_tolerance_seconds,
+            "Clock skew threshold": self.clock_skew_threshold_seconds,
+        }.items():
+            if not math.isfinite(value):
+                errors.append(f"{label} must be finite.")
         if self.poll_interval_seconds is not None and self.poll_interval_seconds < 5:
             errors.append("Polling interval must be at least 5 seconds.")
         if self.max_runtime_seconds is not None and self.max_runtime_seconds <= 0:
@@ -339,6 +377,14 @@ class BacktestConfig:
         if not isinstance(self.start_date, date) or not isinstance(self.end_date, date):
             errors.append("Start and end dates must be valid dates.")
             return errors
+        for label, value in {
+            "Starting capital": self.initial_capital,
+            "Slippage": self.slippage_bps,
+            "Commission": self.commission_per_trade,
+            "Risk-free rate": self.risk_free_rate,
+        }.items():
+            if not math.isfinite(value):
+                errors.append(f"{label} must be finite.")
         if self.end_date <= self.start_date:
             errors.append("End date must be after start date.")
         if self.initial_capital <= 0:

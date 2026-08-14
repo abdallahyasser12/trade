@@ -63,7 +63,12 @@ class OrderPurpose(str, Enum):
 
 
 # Order statuses the engine treats as terminal (no further fills possible).
-TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
+# ``done_for_day`` and ``calculated`` are deliberately not terminal: a GTC
+# order completed for the current day can resume on the next trading day.
+# A replaced order cannot receive new fills under its original order id.
+TERMINAL_ORDER_STATUSES = frozenset(
+    {"filled", "canceled", "expired", "rejected", "replaced"}
+)
 
 # Order statuses that mean the order is still working at the broker.
 OPEN_ORDER_STATUSES = frozenset(
@@ -80,7 +85,7 @@ OPEN_ORDER_STATUSES = frozenset(
         "calculated",
         "stopped",
         "suspended",
-        "replaced",
+        "done_for_day",
     }
 )
 

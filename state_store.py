@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS orders (
 
 CREATE TABLE IF NOT EXISTS trades (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key       TEXT,
     session_id      TEXT,
     symbol          TEXT NOT NULL,
     action          TEXT NOT NULL,
@@ -141,6 +142,15 @@ class StateStore:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
             self._conn.executescript(_SCHEMA)
+            trade_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
+            }
+            if "event_key" not in trade_columns:
+                self._conn.execute("ALTER TABLE trades ADD COLUMN event_key TEXT")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_event_key "
+                "ON trades (event_key) WHERE event_key IS NOT NULL"
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -150,9 +160,13 @@ class StateStore:
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Run one statement inside the lock and commit."""
         with self._lock:
-            cur = self._conn.execute(sql, params)
-            self._conn.commit()
-            return cur
+            try:
+                cur = self._conn.execute(sql, params)
+                self._conn.commit()
+                return cur
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -371,11 +385,15 @@ class StateStore:
         reason: str,
         signal_snapshot: Optional[dict[str, Any]],
         timestamp: Optional[datetime] = None,
-    ) -> None:
-        self._execute(
-            "INSERT INTO trades (session_id, symbol, action, qty, fill_price,"
-            " realized_pnl, reason, signal_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        event_key: Optional[str] = None,
+    ) -> bool:
+        """Record one fill event, idempotently when ``event_key`` is supplied."""
+        cursor = self._execute(
+            "INSERT OR IGNORE INTO trades (event_key, session_id, symbol, action, qty, fill_price,"
+            " realized_pnl, reason, signal_json, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                event_key,
                 session_id,
                 symbol,
                 action,
@@ -387,6 +405,7 @@ class StateStore:
                 _to_iso(timestamp or _utc_now()),
             ),
         )
+        return cursor.rowcount == 1
 
     def get_trades(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
         if session_id:

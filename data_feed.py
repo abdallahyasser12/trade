@@ -10,6 +10,7 @@ in the response is complete", because it frequently is not.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -84,7 +85,7 @@ def with_retries(
     max_attempts: int = 3,
     base_delay: float = 1.0,
     on_rate_limit: Optional[Callable[[float], None]] = None,
-    sleep_fn: Callable[[float], None] = time.sleep,
+    sleep_fn: Callable[[float], object] = time.sleep,
 ) -> Any:
     """Run ``fn`` with bounded exponential backoff on transient failures.
 
@@ -115,7 +116,8 @@ def with_retries(
                     on_rate_limit(delay)
                 logger.warning("Alpaca rate limit hit (429); backing off %.1fs", delay)
                 if attempt < max_attempts:
-                    sleep_fn(delay)
+                    if sleep_fn(delay):
+                        raise DataFeedError("Data request interrupted while backing off.") from exc
                     continue
                 raise DataFeedError(
                     "Alpaca rate limit (429) persisted after retries; consider a longer "
@@ -132,7 +134,8 @@ def with_retries(
                     exc,
                     delay,
                 )
-                sleep_fn(delay)
+                if sleep_fn(delay):
+                    raise DataFeedError("Data request interrupted while backing off.") from exc
     raise DataFeedError(f"Data request failed after {max_attempts} attempts: {last_exc}") from last_exc
 
 
@@ -234,10 +237,18 @@ def normalize_bars_df(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     out = out.sort_index()
     out = out[~out.index.duplicated(keep="last")]
 
+    finite = pd.DataFrame(
+        {column: out[column].map(math.isfinite) for column in out.columns},
+        index=out.index,
+    ).all(axis=1)
     valid = (
         out[["open", "high", "low", "close"]].gt(0).all(axis=1)
         & out["volume"].ge(0)
         & out.notna().all(axis=1)
+        & finite
+        & out["high"].ge(out[["open", "close"]].max(axis=1))
+        & out["low"].le(out[["open", "close"]].min(axis=1))
+        & out["high"].ge(out["low"])
     )
     dropped = int((~valid).sum())
     if dropped:
@@ -269,6 +280,11 @@ class AlpacaDataFeed:
         self.feed = feed
         self._client = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
         self._rate_limit_events = 0
+        self._interrupt_event = None
+
+    def set_interrupt_event(self, event) -> None:
+        """Use the engine stop event for interruptible retry backoff."""
+        self._interrupt_event = event
 
     @property
     def rate_limit_events(self) -> int:
@@ -309,7 +325,12 @@ class AlpacaDataFeed:
             bars = self._client.get_stock_bars(request)
             return bars.df
 
-        raw = with_retries(_fetch, on_rate_limit=self._note_rate_limit)
+        sleep_fn = self._interrupt_event.wait if self._interrupt_event is not None else time.sleep
+        raw = with_retries(
+            _fetch,
+            on_rate_limit=self._note_rate_limit,
+            sleep_fn=sleep_fn,
+        )
         return normalize_bars_df(raw, symbol)
 
     def get_recent_bars(

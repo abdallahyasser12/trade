@@ -268,6 +268,19 @@ class TestOrders:
 
 
 class TestTrades:
+    def test_event_key_makes_fill_recording_idempotent(self, store):
+        first = store.record_trade(
+            "sess-1", "AAPL", "BUY", 10, 190.0, None, "fill", None,
+            timestamp=T0, event_key="fill:client-1:buy",
+        )
+        duplicate = store.record_trade(
+            "sess-1", "AAPL", "BUY", 10, 190.0, None, "fill", None,
+            timestamp=T0, event_key="fill:client-1:buy",
+        )
+        assert first is True
+        assert duplicate is False
+        assert len(store.get_trades()) == 1
+
     def test_signal_snapshot_round_trips_through_signal_json(self, store):
         snapshot = {
             "action": "BUY",
@@ -492,6 +505,14 @@ class TestRestartPersistence:
             assert s2.get_bot_position("AAPL") == pos
         finally:
             s2.close()
+
+
+def test_failed_statement_rolls_back_and_connection_remains_usable(store):
+    store.create_session("duplicate", "AAPL", "1Day", T0, None, 100_000.0)
+    with pytest.raises(Exception):
+        store.create_session("duplicate", "MSFT", "1Day", T0, None, 100_000.0)
+    store.log("info", "connection still usable")
+    assert store.get_logs()[0]["message"] == "connection still usable"
 
 
 # ----------------------------------------------------------------------

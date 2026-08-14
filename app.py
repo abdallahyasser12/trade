@@ -100,8 +100,12 @@ def get_connection_check(api_key_fingerprint: str) -> dict:
         }
     except BrokerError as exc:
         return {"ok": False, "error": str(exc), "account": None}
-    except Exception as exc:  # pragma: no cover — defensive UI boundary
-        return {"ok": False, "error": f"Unexpected error: {exc}", "account": None}
+    except Exception:  # pragma: no cover — defensive UI boundary
+        return {
+            "ok": False,
+            "error": "Unexpected paper-account verification error.",
+            "account": None,
+        }
 
 
 def make_broker() -> AlpacaPaperBroker:
@@ -713,9 +717,16 @@ def render_live_status(store: StateStore) -> None:
     hb_dt = datetime.fromisoformat(heartbeat) if heartbeat else None
     s4.metric("Last heartbeat", fmt_ts(hb_dt))
 
-    if state == "RUNNING" and hb_dt is not None and (now - hb_dt).total_seconds() > 120:
+    timeframe = status_dict.get("timeframe") or "1Day"
+    heartbeat_limit = max(120.0, 2.0 * cfg.default_poll_interval(timeframe) + 30.0)
+    if (
+        state == "RUNNING"
+        and hb_dt is not None
+        and (now - hb_dt).total_seconds() > heartbeat_limit
+    ):
         st.warning(
-            "Engine heartbeat is stale (no update for over 2 minutes) — the bot may be "
+            f"Engine heartbeat is stale (no update for over {heartbeat_limit / 60:.1f} "
+            "minutes) — the bot may be "
             "stuck or the process may have been restarted. Treat the status below as "
             "out of date."
         )
@@ -1011,7 +1022,7 @@ def render_missing_credentials_box() -> None:
 def main() -> None:
     store = get_store()
     creds = get_credentials()
-    conn = get_connection_check(creds.masked_key)
+    conn = get_connection_check(creds.fingerprint)
 
     st.title("📈 Trend Bot — Alpaca Paper Trading")
     st.caption(

@@ -355,14 +355,8 @@ class TestWinRate:
         as an open TradeRecord (exit fields None) and be counted in the
         ``open_trade_at_end`` snapshot field.
 
-        KNOWN PRODUCTION BUG (backtest.py, run_backtest): the still-open
-        position is never appended to ``trades`` after the bar loop, so the
-        open round trip vanishes from the result and ``open_trade_at_end``
-        is always 0 — even though the equity curve provably includes the
-        position's mark-to-market value.  models.TradeRecord is explicitly
-        documented as "One completed (or still-open) round-trip trade" and
-        has Optional exit fields / ``is_closed`` for exactly this case.
-        This test asserts the correct behavior and fails until fixed."""
+        models.TradeRecord has optional exit fields for this case; the open
+        trade remains excluded from completed-trade statistics."""
         df = entry_only_frame()
         result = run(df)
         assert len(result.trades) == 1
@@ -393,6 +387,18 @@ class TestWinRate:
 
 
 class TestValidation:
+    @pytest.mark.parametrize("mutation", ["reverse", "duplicate", "infinite"])
+    def test_rejects_non_normalized_price_frames(self, mutation):
+        df = entry_only_frame()
+        if mutation == "reverse":
+            df = df.iloc[::-1]
+        elif mutation == "duplicate":
+            df = pd.concat([df, df.iloc[[-1]]])
+        else:
+            df.loc[df.index[3], "high"] = float("inf")
+        with pytest.raises(ValueError):
+            run(df)
+
     def test_insufficient_history_raises(self):
         """warmup_bars() is 4 and run_backtest needs warmup + 2 bars, so a
         5-bar frame must be rejected."""
@@ -428,3 +434,25 @@ class TestDeterminism:
         """The module exposes the observation floor the UI relies on."""
         assert MIN_SHARPE_OBSERVATIONS == 20
         assert backtest_mod.SMALL_SAMPLE_TRADE_THRESHOLD == 30
+
+
+def test_backtest_sizes_at_signal_time_like_live_even_when_next_open_gaps():
+    df = entry_only_frame()
+    df.loc[df.index[ENTRY_BAR], ["open", "high", "low"]] = [120.0, 121.0, 97.0]
+    result = run(
+        df,
+        risk=RiskConfig(risk_per_trade_pct=10.0, max_position_pct=10.0),
+    )
+    # Signal close is 97.50, so live sends floor(10,000 / 97.50)=102
+    # shares. The backtest must retain that submitted quantity at N+1.
+    assert result.trades[0].qty == 102
+
+
+def test_trade_return_percentage_is_net_of_both_commissions():
+    result = run(
+        bearish_exit_frame(),
+        bt=make_backtest_config(commission_per_trade=7.5),
+    )
+    trade = result.trades[0]
+    invested = trade.entry_price * trade.qty + 7.5
+    assert trade.return_pct == pytest.approx(trade.pnl / invested * 100.0)

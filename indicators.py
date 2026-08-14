@@ -8,9 +8,8 @@ Conventions
 -----------
 * Inputs are pandas Series aligned on the bar index.
 * Warmup values (where the indicator is not yet fully initialized) are NaN.
-* RSI and ATR use Wilder smoothing, implemented as an exponential moving
-  average with ``alpha = 1/period, adjust=False``, which is the standard
-  recursive Wilder formulation.
+* RSI and ATR use Wilder smoothing, seeded with the simple mean of the first
+  full period and then updated recursively.
 """
 
 from __future__ import annotations
@@ -28,6 +27,30 @@ def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period, min_periods=period).mean()
 
 
+def _wilder_average(series: pd.Series, period: int) -> pd.Series:
+    """Canonical Wilder average with an SMA seed and recursive updates."""
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+    values = series.astype(float).to_numpy()
+    valid_positions = np.flatnonzero(~np.isnan(values))
+    if len(valid_positions) < period:
+        return result
+    seed_positions = valid_positions[:period]
+    seed_pos = int(seed_positions[-1])
+    previous = float(np.mean(values[seed_positions]))
+    result.iloc[seed_pos] = previous
+    for pos in range(seed_pos + 1, len(values)):
+        value = values[pos]
+        if np.isnan(value):
+            previous = np.nan
+        elif np.isnan(previous):
+            preceding = values[max(0, pos - period + 1) : pos + 1]
+            previous = float(np.mean(preceding)) if np.isfinite(preceding).all() else np.nan
+        else:
+            previous = (previous * (period - 1) + value) / period
+        result.iloc[pos] = previous
+    return result
+
+
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """Relative Strength Index with Wilder smoothing.
 
@@ -41,9 +64,8 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
-    # Wilder smoothing == EMA with alpha = 1/period, seeded from the data.
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_gain = _wilder_average(gain, period)
+    avg_loss = _wilder_average(loss, period)
     rs = avg_gain / avg_loss
     out = 100.0 - 100.0 / (1.0 + rs)
     # Where avg_loss == 0 the ratio is inf -> RSI 100; both zero -> flat -> 50.
@@ -74,7 +96,7 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     if period < 1:
         raise ValueError("ATR period must be >= 1")
     tr = true_range(high, low, close)
-    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    return _wilder_average(tr, period)
 
 
 def rolling_volume_average(volume: pd.Series, period: int = 20) -> pd.Series:

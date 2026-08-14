@@ -20,9 +20,9 @@ Execution model (documented, tested):
   each count once).
 * The backtest models a cash account: buying power == cash, whole shares.
 * Daily loss protection uses the same RiskManager rule as live trading,
-  with the baseline reset to the first equity reading of each UTC
-  calendar day; once breached, new entries are blocked for the rest of
-  that day (exits and stops still run).
+  with the baseline reset to the previous close equity at the start of
+  each UTC calendar day; once breached, new entries are blocked for the
+  rest of that day (exits and stops still run).
 """
 
 from __future__ import annotations
@@ -115,6 +115,29 @@ def run_backtest(
     if config_errors:
         raise ValueError("Invalid backtest configuration: " + "; ".join(config_errors))
 
+    required_columns = {"open", "high", "low", "close", "volume"}
+    if not isinstance(price_data, pd.DataFrame):
+        raise ValueError("price_data must be a pandas DataFrame")
+    missing = required_columns.difference(price_data.columns)
+    if missing:
+        raise ValueError(f"price_data is missing columns: {sorted(missing)}")
+    if not isinstance(price_data.index, pd.DatetimeIndex) or price_data.index.tz is None:
+        raise ValueError("price_data must have a timezone-aware DatetimeIndex")
+    if not price_data.index.is_monotonic_increasing or price_data.index.has_duplicates:
+        raise ValueError("price_data must be chronological and contain no duplicate timestamps")
+    numeric = price_data[list(required_columns)].astype(float)
+    if not numeric.map(math.isfinite).all(axis=None):
+        raise ValueError("price_data contains NaN or infinite OHLCV values")
+    price_valid = numeric[["open", "high", "low", "close"]].gt(0).all(axis=1)
+    coherent = (
+        numeric["volume"].ge(0)
+        & numeric["high"].ge(numeric[["open", "close"]].max(axis=1))
+        & numeric["low"].le(numeric[["open", "close"]].min(axis=1))
+        & numeric["high"].ge(numeric["low"])
+    )
+    if not bool((price_valid & coherent).all()):
+        raise ValueError("price_data contains invalid or internally inconsistent OHLCV bars")
+
     warmup = strategy.required_bars()
     if price_data is None or len(price_data) < warmup + 2:
         raise ValueError(
@@ -154,7 +177,8 @@ def run_backtest(
         proceeds = position_qty * exit_px - commission
         cash += proceeds
         pnl = (exit_px - entry_price) * position_qty - 2 * commission
-        ret = (exit_px / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+        invested = entry_price * position_qty + commission
+        ret = pnl / invested * 100.0 if invested > 0 else 0.0
         trades.append(
             TradeRecord(
                 symbol=strategy_config.symbol,
@@ -182,6 +206,16 @@ def run_backtest(
         bar_day = ts.date()
         entered_this_bar = False
 
+        # Establish the new day's loss baseline before any fills or marks on
+        # this bar.  Using the first bar's post-move equity would hide an
+        # overnight/first-bar loss from the circuit breaker.
+        if current_day != bar_day:
+            current_day = bar_day
+            day_start_equity = (
+                equity_values[-1] if equity_values else backtest_config.initial_capital
+            )
+            day_halted = False
+
         # --- execute actions scheduled on the previous completed bar ------
         if pending_exit is not None and position_qty > 0:
             exit_px = float(bar["open"]) * (1.0 - slippage)
@@ -199,23 +233,16 @@ def run_backtest(
             except ValueError:
                 candidate_stop = None
             if candidate_stop is not None:
-                equity_now = cash  # flat here, so equity == cash
-                sizing = risk.calculate_position_size(
-                    equity=equity_now,
-                    buying_power=cash,
-                    entry_price=fill_px,
-                    stop_price=candidate_stop,
-                )
-                if sizing.approved:
-                    cost = sizing.qty * fill_px + commission
-                    if cost <= cash:
-                        cash -= cost
-                        position_qty = sizing.qty
-                        entry_price = fill_px
-                        entry_time = ts
-                        entry_reason = pending_entry["reason"]
-                        stop_price = candidate_stop
-                        entered_this_bar = True
+                qty = int(pending_entry["qty"])
+                cost = qty * fill_px + commission
+                if qty > 0 and cost <= cash:
+                    cash -= cost
+                    position_qty = qty
+                    entry_price = fill_px
+                    entry_time = ts
+                    entry_reason = pending_entry["reason"]
+                    stop_price = candidate_stop
+                    entered_this_bar = True
         pending_entry = None
 
         # --- protective stop check on this bar ---------------------------
@@ -238,10 +265,6 @@ def run_backtest(
         equity_values.append(equity)
 
         # --- daily loss circuit breaker (same rule as live) --------------
-        if current_day != bar_day:
-            current_day = bar_day
-            day_start_equity = equity
-            day_halted = False
         if not day_halted and day_start_equity and risk.check_daily_loss_limit(
             day_start_equity, equity
         ):
@@ -252,7 +275,27 @@ def run_backtest(
             window = df.iloc[: i + 1]
             decision = strategy.generate_signal(window)
             if decision.action == BotAction.BUY and position_qty == 0 and not day_halted:
-                pending_entry = {"atr": decision.atr, "reason": decision.reason}
+                signal_price = float(decision.details.get("close") or bar["close"])
+                try:
+                    signal_stop = risk.calculate_stop_price(
+                        signal_price,
+                        float(decision.atr),
+                        strategy_config.atr_multiplier,
+                    )
+                    sizing = risk.calculate_position_size(
+                        equity=equity,
+                        buying_power=cash,
+                        entry_price=signal_price,
+                        stop_price=signal_stop,
+                    )
+                except (TypeError, ValueError):
+                    sizing = None
+                if sizing is not None and sizing.approved:
+                    pending_entry = {
+                        "atr": decision.atr,
+                        "reason": decision.reason,
+                        "qty": sizing.qty,
+                    }
             elif decision.action == BotAction.EXIT and position_qty > 0:
                 pending_exit = "bearish_crossover"
 
