@@ -67,16 +67,25 @@ function easProjectId(): string | null {
   return extra?.eas?.projectId ?? null;
 }
 
+function notificationsAllowed(
+  permission: Notifications.NotificationPermissionsStatus,
+): boolean {
+  return (
+    permission.granted ||
+    permission.ios?.status === Notifications.IosAuthorizationStatus.PROVISIONAL
+  );
+}
+
 async function registerPushToken(settings: MobileSettings): Promise<void> {
   if (!Device.isDevice) {
     return;
   }
 
   let permission = await Notifications.getPermissionsAsync();
-  if (!permission.granted) {
+  if (!notificationsAllowed(permission)) {
     permission = await Notifications.requestPermissionsAsync();
   }
-  if (!permission.granted) {
+  if (!notificationsAllowed(permission)) {
     return;
   }
 
