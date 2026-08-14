@@ -1651,7 +1651,10 @@ def test_linked_stop_with_wrong_quantity_is_resized_to_position(tmp_path):
     (mutation 'ensure-stop-blind-trust' survived the prior suite)."""
     h = build_harness(tmp_path, market_open=False)
     preset_bot_position(h, qty=70, stop_price=96.0)
-    # Replace the exact 70-share stop with a 40-share stop under the link.
+    h.engine._startup()
+    # AFTER startup, the link degrades to a 40-share stop (e.g. an
+    # unconfirmed cancel during a partial-fill resize left the old order):
+    # only the runtime linked-stop verification can catch this.
     small_cid = inject_resting_order(
         h, OrderPurpose.STOP.value, qty=40, stop_price=96.0,
         bar_ts=h.now.now - timedelta(days=3),
@@ -1661,7 +1664,6 @@ def test_linked_stop_with_wrong_quantity_is_resized_to_position(tmp_path):
     del h.broker.orders[old_cid]
     pos["stop_client_order_id"] = small_cid
     h.store.set_bot_position(SYMBOL, pos)
-    h.engine._startup()
 
     h.engine.run_iteration()
 
