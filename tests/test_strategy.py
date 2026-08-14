@@ -60,6 +60,8 @@ BASE_ROW = dict(
     avg_volume=1_000.0,
     volume_ratio=1.5,
     atr_percentile=50.0,
+    adx=30.0,
+    efficiency_ratio=0.50,
 )
 
 
@@ -215,6 +217,122 @@ class TestEntryFilters:
         assert decision.filters["volatility"] is True
         assert "rsi" in decision.reason
 
+
+class TestRobustTrendFilters:
+    @staticmethod
+    def _smart_config(**overrides):
+        params = dict(
+            enable_rsi_floor=True,
+            rsi_entry_floor=45.0,
+            enable_adx_filter=True,
+            adx_period=2,
+            min_adx=20.0,
+            enable_efficiency_filter=True,
+            efficiency_period=3,
+            min_efficiency_ratio=0.2,
+            enable_market_regime_filter=True,
+            regime_symbol="MKT",
+            regime_timeframe="1Day",
+            regime_ma_period=3,
+            regime_slope_period=1,
+        )
+        params.update(overrides)
+        return make_config(**params)
+
+    @staticmethod
+    def _market(closes, end="2024-01-05"):
+        index = pd.date_range(end=end, periods=len(closes), freq="D", tz="UTC")
+        return pd.DataFrame({"close": closes}, index=index)
+
+    def test_all_robust_filters_pass_on_clean_bullish_regime(self):
+        strategy = TrendStrategy(self._smart_config())
+        frame = bullish_frame(n_rows=strategy.required_bars())
+        market = self._market([90, 91, 92, 93, 94, 95])
+        decision = strategy.generate_signal(frame, market_data=market)
+
+        assert decision.action == BotAction.BUY
+        assert decision.filters["adx"] is True
+        assert decision.filters["efficiency"] is True
+        assert decision.filters["market_regime"] is True
+        assert decision.market_regime_bullish is True
+
+    def test_weak_adx_blocks_otherwise_valid_crossover(self):
+        strategy = TrendStrategy(self._smart_config())
+        frame = bullish_frame(
+            n_rows=strategy.required_bars(), last_extra={"adx": 19.99}
+        )
+        market = self._market([90, 91, 92, 93, 94, 95])
+        decision = strategy.generate_signal(frame, market_data=market)
+
+        assert decision.action == BotAction.HOLD
+        assert decision.filters["adx"] is False
+        assert "adx" in decision.reason
+
+    def test_missing_benchmark_fails_closed(self):
+        strategy = TrendStrategy(self._smart_config())
+        frame = bullish_frame(n_rows=strategy.required_bars())
+        decision = strategy.generate_signal(frame, market_data=None)
+        assert decision.action == BotAction.HOLD
+        assert decision.reason == "market_context_unavailable"
+        assert decision.details["detail"] == "benchmark_bars_missing"
+
+    def test_new_bearish_market_regime_transition_exits(self):
+        strategy = TrendStrategy(self._smart_config())
+        frame = make_frame(
+            strategy.required_bars(),
+            prev_row={"short_ma": 10.5, "long_ma": 10.0},
+            last_row={"short_ma": 10.6, "long_ma": 10.0},
+        )
+        market = self._market([90, 91, 92, 93, 94, 80])
+        decision = strategy.generate_signal(frame, market_data=market)
+        assert decision.action == BotAction.EXIT
+        assert decision.reason == "market_regime_break"
+
+    def test_future_benchmark_bar_cannot_change_current_decision(self):
+        strategy = TrendStrategy(self._smart_config())
+        frame = bullish_frame(n_rows=strategy.required_bars())
+        available = self._market([90, 91, 92, 93, 94, 95])
+        future = pd.DataFrame(
+            {"close": [1.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-07", tz="UTC")]),
+        )
+        with_future = pd.concat([available, future])
+        first = strategy.generate_signal(frame, market_data=available)
+        second = strategy.generate_signal(frame, market_data=with_future)
+        assert second.action == first.action == BotAction.BUY
+        assert second.regime_close == first.regime_close
+
+    def test_equal_timeframe_benchmark_bar_is_visible_after_signal_bar_closes(self):
+        strategy = TrendStrategy(self._smart_config())
+        frame = bullish_frame(n_rows=strategy.required_bars())
+        market = self._market([90, 91, 92, 93, 94, 80], end="2024-01-06")
+
+        decision = strategy.generate_signal(frame, market_data=market)
+
+        assert decision.action == BotAction.EXIT
+        assert decision.reason == "market_regime_break"
+        assert decision.regime_close == 80.0
+
+    def test_relative_strength_requires_timestamp_aligned_benchmark_bars(self):
+        strategy = TrendStrategy(
+            self._smart_config(
+                enable_market_regime_filter=False,
+                enable_relative_strength_filter=True,
+                relative_strength_period=2,
+            )
+        )
+        frame = bullish_frame(n_rows=strategy.required_bars())
+        market = pd.DataFrame(
+            {"close": [90, 91, 92, 93, 94]},
+            index=frame.index[:-1],
+        )
+
+        decision = strategy.generate_signal(frame, market_data=market)
+
+        assert decision.action == BotAction.HOLD
+        assert decision.reason == "market_context_unavailable"
+        assert decision.details["detail"] == "relative_strength_bars_not_aligned"
+
     def test_low_volume_ratio_blocks_entry(self):
         """volume_ratio below the minimum blocks an otherwise-valid BUY."""
         cfg = make_config()
@@ -273,6 +391,14 @@ class TestWarmup:
             "volume": False,
             "volatility": False,
         }
+
+    def test_zero_atr_is_invalid_and_never_emits_buy(self):
+        strategy = TrendStrategy(make_config())
+        decision = strategy.generate_signal(bullish_frame(last_extra={"atr": 0.0}))
+
+        assert decision.action == BotAction.HOLD
+        assert decision.reason == "invalid_indicator_values"
+        assert decision.details["detail"] == "indicator_out_of_range"
 
     def test_hold_on_empty_frame(self):
         strategy = TrendStrategy(make_config())

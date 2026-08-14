@@ -9,9 +9,11 @@ from __future__ import annotations
 import os
 import math
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import date, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,7 +23,7 @@ from dotenv import load_dotenv
 # Application constants
 # ---------------------------------------------------------------------------
 
-APP_NAME = "Trend Bot (Paper)"
+APP_NAME = "Trend & Crypto Bot"
 CLIENT_ORDER_PREFIX = "trendbot"
 DEFAULT_DB_PATH = str(Path("data") / "trading_bot.db")
 
@@ -61,6 +63,33 @@ _POLL_INTERVAL_SECONDS: dict[str, float] = {
 SUPPORTED_DATA_FEEDS = ("iex", "sip")
 
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+
+
+class AccountMode(str, Enum):
+    """Alpaca trading environment selected for a frozen engine session."""
+
+    PAPER = "paper"
+    LIVE = "live"
+
+
+def _environment_flag(name: str, default: bool = False) -> bool:
+    """Parse a strict boolean environment flag.
+
+    Only conventional explicit true values enable a dangerous capability;
+    typos and arbitrary non-empty strings remain disabled.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def live_trading_enabled(dotenv_path: Optional[str] = None) -> bool:
+    """Whether this process is allowed to expose the live-account unlock."""
+
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+    return _environment_flag("ENABLE_LIVE_TRADING", default=False)
 
 
 def timeframe_to_alpaca(timeframe: str):
@@ -127,7 +156,7 @@ def validate_symbol(symbol: str) -> Optional[str]:
 
 @dataclass
 class AlpacaCredentials:
-    """Alpaca paper API credentials loaded from the environment.
+    """Alpaca credentials for exactly one account environment.
 
     The secret is never logged, persisted, or rendered — only
     ``masked_key`` may appear in the UI.
@@ -135,6 +164,7 @@ class AlpacaCredentials:
 
     api_key: str = ""
     secret_key: str = ""
+    account_mode: AccountMode = AccountMode.PAPER
 
     @property
     def is_configured(self) -> bool:
@@ -151,19 +181,50 @@ class AlpacaCredentials:
     @property
     def fingerprint(self) -> str:
         """Non-reversible cache key that changes when either credential changes."""
-        material = f"{self.api_key}\0{self.secret_key}".encode("utf-8")
+        material = (
+            f"{self.account_mode.value}\0{self.api_key}\0{self.secret_key}"
+        ).encode("utf-8")
         return hashlib.sha256(material).hexdigest()[:16]
 
     def __repr__(self) -> str:  # never leak secrets through repr
-        return f"AlpacaCredentials(api_key={self.masked_key!r}, secret_key='****')"
+        return (
+            "AlpacaCredentials("
+            f"account_mode={self.account_mode.value!r}, "
+            f"api_key={self.masked_key!r}, secret_key='****')"
+        )
 
 
-def load_credentials(dotenv_path: Optional[str] = None) -> AlpacaCredentials:
-    """Load Alpaca paper credentials from .env / environment variables."""
+def load_credentials(
+    dotenv_path: Optional[str] = None,
+    account_mode: AccountMode | str = AccountMode.PAPER,
+) -> AlpacaCredentials:
+    """Load credentials for one explicit Alpaca environment.
+
+    Paper mode prefers the namespaced paper variables and retains the legacy
+    variables for backwards compatibility. Live mode *only* reads the separate
+    live variables; paper credentials can never be silently promoted.
+    """
+
     load_dotenv(dotenv_path=dotenv_path, override=False)
+    mode = AccountMode(account_mode)
+    if mode is AccountMode.LIVE:
+        key_name = "ALPACA_LIVE_API_KEY"
+        secret_name = "ALPACA_LIVE_SECRET_KEY"
+        api_key = os.environ.get(key_name, "").strip()
+        secret_key = os.environ.get(secret_name, "").strip()
+    else:
+        api_key = (
+            os.environ.get("ALPACA_PAPER_API_KEY", "").strip()
+            or os.environ.get("ALPACA_API_KEY", "").strip()
+        )
+        secret_key = (
+            os.environ.get("ALPACA_PAPER_SECRET_KEY", "").strip()
+            or os.environ.get("ALPACA_SECRET_KEY", "").strip()
+        )
     return AlpacaCredentials(
-        api_key=os.environ.get("ALPACA_API_KEY", "").strip(),
-        secret_key=os.environ.get("ALPACA_SECRET_KEY", "").strip(),
+        api_key=api_key,
+        secret_key=secret_key,
+        account_mode=mode,
     )
 
 
@@ -190,6 +251,30 @@ class StrategyConfig:
     enable_volatility_filter: bool = True
     atr_percentile_lookback: int = 100
     max_atr_percentile: float = 90.0
+    # Optional production-quality filters.  They default off at the typed
+    # configuration layer for backwards compatibility; the Streamlit UI's
+    # "Robust trend" preset enables them explicitly.
+    enable_rsi_floor: bool = False
+    rsi_entry_floor: float = 45.0
+    enable_adx_filter: bool = False
+    adx_period: int = 14
+    min_adx: float = 20.0
+    enable_efficiency_filter: bool = False
+    efficiency_period: int = 20
+    min_efficiency_ratio: float = 0.20
+    enable_market_regime_filter: bool = False
+    regime_symbol: str = "SPY"
+    regime_timeframe: str = "1Day"
+    regime_ma_period: int = 200
+    regime_slope_period: int = 20
+    exit_on_regime_break: bool = True
+    enable_relative_strength_filter: bool = False
+    relative_strength_period: int = 63
+    min_relative_strength: float = 0.0
+    enable_trailing_stop: bool = False
+    trailing_atr_multiplier: float = 3.0
+    enable_break_even_stop: bool = False
+    break_even_trigger_r: float = 1.0
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -199,6 +284,12 @@ class StrategyConfig:
             "ATR multiplier": self.atr_multiplier,
             "minimum volume ratio": self.min_volume_ratio,
             "maximum ATR percentile": self.max_atr_percentile,
+            "RSI entry floor": self.rsi_entry_floor,
+            "minimum ADX": self.min_adx,
+            "minimum efficiency ratio": self.min_efficiency_ratio,
+            "minimum relative strength": self.min_relative_strength,
+            "trailing ATR multiplier": self.trailing_atr_multiplier,
+            "break-even trigger": self.break_even_trigger_r,
         }
         for label, value in finite_fields.items():
             if not math.isfinite(value):
@@ -222,6 +313,11 @@ class StrategyConfig:
             errors.append("RSI oversold threshold must be between 0 and 100.")
         if self.rsi_oversold >= self.rsi_overbought:
             errors.append("RSI oversold threshold must be below the overbought threshold.")
+        if self.enable_rsi_floor:
+            if not (0.0 <= self.rsi_entry_floor < 100.0):
+                errors.append("RSI entry floor must be between 0 and 100.")
+            if self.rsi_entry_floor >= self.rsi_overbought:
+                errors.append("RSI entry floor must be below the overbought threshold.")
         if self.atr_period < 2:
             errors.append("ATR period must be at least 2.")
         if self.atr_multiplier <= 0:
@@ -235,6 +331,40 @@ class StrategyConfig:
                 errors.append("ATR percentile lookback must be at least 10 bars.")
             if not (0.0 < self.max_atr_percentile <= 100.0):
                 errors.append("Maximum ATR percentile must be between 0 and 100.")
+        if self.adx_period < 2:
+            errors.append("ADX period must be at least 2.")
+        if self.enable_adx_filter:
+            if not (0.0 <= self.min_adx <= 100.0):
+                errors.append("Minimum ADX must be between 0 and 100.")
+        if self.efficiency_period < 2:
+            errors.append("Efficiency-ratio period must be at least 2.")
+        if self.enable_efficiency_filter:
+            if not (0.0 <= self.min_efficiency_ratio <= 1.0):
+                errors.append("Minimum efficiency ratio must be between 0 and 1.")
+        regime_symbol_error = validate_symbol(self.regime_symbol)
+        if self.enable_market_regime_filter or self.enable_relative_strength_filter:
+            if regime_symbol_error:
+                errors.append("Regime symbol: " + regime_symbol_error)
+            if self.regime_timeframe not in TIMEFRAMES:
+                errors.append(f"Regime timeframe must be one of {TIMEFRAMES}.")
+        if self.enable_market_regime_filter:
+            if self.regime_ma_period < 2:
+                errors.append("Regime MA period must be at least 2.")
+            if self.regime_slope_period < 1:
+                errors.append("Regime slope period must be at least 1.")
+        if self.enable_relative_strength_filter:
+            if self.relative_strength_period < 2:
+                errors.append("Relative-strength period must be at least 2.")
+            if self.regime_timeframe != self.timeframe:
+                errors.append(
+                    "Relative strength requires the regime and strategy timeframes to match."
+                )
+            if not (-1.0 <= self.min_relative_strength <= 10.0):
+                errors.append("Minimum relative strength must be between -1 and 10.")
+        if self.enable_trailing_stop and self.trailing_atr_multiplier <= 0:
+            errors.append("Trailing ATR multiplier must be greater than 0.")
+        if self.enable_break_even_stop and self.break_even_trigger_r <= 0:
+            errors.append("Break-even trigger must be greater than 0R.")
         return errors
 
     def warmup_bars(self) -> int:
@@ -253,9 +383,34 @@ class StrategyConfig:
             self.atr_period + 1,  # TR needs the previous close
             self.volume_period,
             atr_chain,
+            (self.adx_period * 2 + 1) if self.enable_adx_filter else 0,
+            (self.efficiency_period + 1) if self.enable_efficiency_filter else 0,
+            (self.relative_strength_period + 1)
+            if self.enable_relative_strength_filter
+            else 0,
+            self.regime_warmup_bars()
+            if (
+                (self.enable_market_regime_filter or self.enable_relative_strength_filter)
+                and self.regime_symbol == self.symbol
+                and self.regime_timeframe == self.timeframe
+            )
+            else 0,
         )
         # +1 because crossover detection needs the previous bar's MAs too.
         return longest + 1
+
+    def regime_warmup_bars(self) -> int:
+        """Completed benchmark bars required by market-context filters."""
+        if not (self.enable_market_regime_filter or self.enable_relative_strength_filter):
+            return 0
+        return max(
+            self.regime_ma_period + self.regime_slope_period + 1
+            if self.enable_market_regime_filter
+            else 0,
+            self.relative_strength_period + 1
+            if self.enable_relative_strength_filter
+            else 0,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -270,6 +425,10 @@ class RiskConfig:
     max_daily_loss_pct: float = 3.0
     min_position_value: float = 100.0
     min_shares: int = 1
+    enable_adaptive_risk: bool = False
+    min_risk_scale: float = 0.25
+    drawdown_risk_reduction_start_pct: float = 1.0
+    volatility_target_percentile: float = 50.0
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -278,6 +437,9 @@ class RiskConfig:
             "Maximum position size": self.max_position_pct,
             "Maximum session loss": self.max_daily_loss_pct,
             "Minimum position value": self.min_position_value,
+            "Minimum adaptive risk scale": self.min_risk_scale,
+            "Drawdown risk-reduction threshold": self.drawdown_risk_reduction_start_pct,
+            "Volatility target percentile": self.volatility_target_percentile,
         }.items():
             if not math.isfinite(value):
                 errors.append(f"{label} must be finite.")
@@ -297,6 +459,17 @@ class RiskConfig:
             errors.append("Minimum position value cannot be negative.")
         if self.min_shares < 1:
             errors.append("Minimum shares must be at least 1 (whole shares only).")
+        if not (0.0 < self.min_risk_scale <= 1.0):
+            errors.append("Minimum adaptive risk scale must be in (0, 1].")
+        if self.enable_adaptive_risk:
+            if self.drawdown_risk_reduction_start_pct < 0:
+                errors.append("Drawdown risk-reduction threshold cannot be negative.")
+            if self.drawdown_risk_reduction_start_pct >= self.max_daily_loss_pct:
+                errors.append(
+                    "Drawdown risk-reduction threshold must be below the maximum session loss."
+                )
+            if not (0.0 < self.volatility_target_percentile <= 100.0):
+                errors.append("Volatility target percentile must be between 0 and 100.")
         return errors
 
     def to_dict(self) -> dict[str, Any]:
@@ -371,6 +544,7 @@ class BacktestConfig:
     commission_per_trade: float = 0.0
     risk_free_rate: float = 0.0
     adjustment: str = "split"
+    liquidate_at_end: bool = False
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -404,3 +578,34 @@ class BacktestConfig:
         d["start_date"] = self.start_date.isoformat()
         d["end_date"] = self.end_date.isoformat()
         return d
+
+
+def result_context_fingerprint(
+    strategy: StrategyConfig,
+    risk: RiskConfig,
+    backtest: BacktestConfig,
+    *,
+    data_feed: str,
+    experiment: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return a non-secret identity for a displayed simulation result.
+
+    Streamlit retains session state across reruns. Binding a result to this
+    fingerprint prevents an old backtest or walk-forward report from being
+    shown under newly edited controls. Credentials are intentionally absent;
+    callers must not place secrets in ``experiment``.
+    """
+    payload = {
+        "strategy": strategy.to_dict(),
+        "risk": risk.to_dict(),
+        "backtest": backtest.to_dict(),
+        "data_feed": data_feed,
+        "experiment": experiment or {},
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

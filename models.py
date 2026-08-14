@@ -116,6 +116,13 @@ class SignalDecision:
     average_volume: Optional[float] = None
     volume_ratio: Optional[float] = None
     atr_percentile: Optional[float] = None
+    adx: Optional[float] = None
+    efficiency_ratio: Optional[float] = None
+    market_regime_bullish: Optional[bool] = None
+    regime_close: Optional[float] = None
+    regime_ma: Optional[float] = None
+    relative_strength: Optional[float] = None
+    risk_scale: Optional[float] = None
     filters: dict[str, bool] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -230,6 +237,7 @@ class OrderRecord:
     status: str
     fill_price: Optional[float] = None
     stop_price: Optional[float] = None
+    limit_price: Optional[float] = None
     submitted_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -303,10 +311,26 @@ class AssetInfo:
     active: bool
     fractionable: bool
     asset_class: str
+    min_order_size: Optional[float] = None
+    min_trade_increment: Optional[float] = None
+    price_increment: Optional[float] = None
+    marginable: bool = False
+    shortable: bool = False
 
     @property
     def is_supported(self) -> bool:
         return self.tradable and self.active and self.asset_class == "us_equity"
+
+    @property
+    def is_supported_crypto(self) -> bool:
+        return (
+            self.tradable
+            and self.active
+            and self.fractionable
+            and self.asset_class == "crypto"
+            and not self.marginable
+            and not self.shortable
+        )
 
 
 @dataclass
