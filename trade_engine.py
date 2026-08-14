@@ -310,6 +310,7 @@ class TradeEngine:
                     "The broker position is gone but its protective stop could not be "
                     "confirmed canceled. Resolve that bot order manually before restart."
                 )
+            bot_pos = self._book_pending_sell_fills(bot_pos, self.now_fn())
             self.store.clear_bot_position(self.symbol)
         elif broker_pos is not None and bot_pos is not None:
             local_qty = float(bot_pos.get("qty", 0))
@@ -410,6 +411,46 @@ class TradeEngine:
             "will be armed.",
         )
         return True
+
+    def _book_pending_sell_fills(self, bot_pos: dict, now: datetime) -> dict:
+        """Book fills on the bot's own pending sell orders (strategy exit
+        and protective stop) — idempotent via event keys.  Called before a
+        vanished position's local record is cleared so realized trades are
+        never lost from the ledger (e.g. crash between the fill and
+        record_trade)."""
+        for id_key, reason, accounted_key in (
+            (
+                "exit_client_order_id",
+                bot_pos.get("exit_pending_reason") or "exit",
+                "exit_accounted_filled_qty",
+            ),
+            ("stop_client_order_id", "atr_stop_triggered", "stop_accounted_filled_qty"),
+        ):
+            cid = bot_pos.get(id_key)
+            if not cid:
+                continue
+            try:
+                order = self.broker.get_order_by_client_id(cid)
+            except BrokerError:
+                continue
+            if order is None or order.side != "sell" or order.filled_qty <= 0:
+                continue
+            bot_pos = self._apply_sell_fill(bot_pos, order, accounted_key)
+            entry_price = float(bot_pos.get("entry_price") or 0.0)
+            pnl = (float(order.fill_price or 0.0) - entry_price) * order.filled_qty
+            self.store.record_trade(
+                self.session_id,
+                self.symbol,
+                action="SELL",
+                qty=order.filled_qty,
+                fill_price=order.fill_price,
+                realized_pnl=pnl,
+                reason=reason,
+                signal_snapshot=None,
+                timestamp=now,
+                event_key=f"fill:{order.client_order_id}:sell",
+            )
+        return bot_pos
 
     def _unbooked_pending_sell_qty(self, bot_pos: dict) -> float:
         """Filled-but-unaccounted quantity on the bot's own pending sell
@@ -755,11 +796,9 @@ class TradeEngine:
                     "canceled; manual reconciliation required."
                 )
                 return False
-            # If the position vanished BECAUSE the stop filled, book that
-            # trade before dropping the local record.
-            stop_id = bot_pos.get("stop_client_order_id")
-            if stop_id:
-                bot_pos = self._book_unlinked_stop_fill(bot_pos, stop_id, now)
+            # If the position vanished BECAUSE a bot sell order filled
+            # (stop or exit), book those trades before dropping the record.
+            bot_pos = self._book_pending_sell_fills(bot_pos, now)
             self.store.clear_bot_position(self.symbol)
             self.store.delete_kv(POSITION_SNAPSHOT_KEY_PREFIX + self.symbol)
             self._log("WARNING", "Broker position vanished; cleared reconciled local state.")

@@ -1925,3 +1925,37 @@ def test_startup_raises_when_mismatched_stop_cancel_cannot_be_confirmed(tmp_path
     monkeypatch.setattr(h.broker, "cancel_order", cancel_never_lands)
     with pytest.raises(BrokerError, match="could not be canceled"):
         h.engine._startup()
+
+
+def test_startup_books_exit_fill_that_closed_the_position_before_crash(tmp_path):
+    """Crash window: an exit sell fully filled (position gone at the
+    broker) but the process died before record_trade committed.  Startup
+    reconciliation must book the realized SELL before clearing the local
+    record — otherwise the trade vanishes from the P&L ledger forever."""
+    h = build_harness(tmp_path)
+    preset_bot_position(h, qty=10, entry_price=100.0)
+    pos = h.store.get_bot_position(SYMBOL)
+    stop_cid = pos["stop_client_order_id"]
+    h.broker.orders[stop_cid].status = "canceled"
+    exit_cid = make_client_order_id(h.engine.session_id, "exit", NOW, symbol=SYMBOL)
+    h.broker.orders[exit_cid] = OrderRecord(
+        "crash-exit", exit_cid, SYMBOL, "exit", "sell", 10.0, 10.0,
+        "filled", 105.0, submitted_at=NOW, updated_at=NOW,
+    )
+    pos.update(
+        stop_client_order_id=None,
+        stop_price=None,
+        exit_client_order_id=exit_cid,
+        exit_pending_reason="bearish_crossover",
+    )
+    h.store.set_bot_position(SYMBOL, pos)
+    del h.broker.positions[SYMBOL]
+    assert h.store.get_trades() == []
+
+    h.engine._startup()
+
+    sells = [t for t in h.store.get_trades() if t["action"] == "SELL"]
+    assert len(sells) == 1
+    assert sells[0]["qty"] == pytest.approx(10.0)
+    assert sells[0]["realized_pnl"] == pytest.approx((105.0 - 100.0) * 10.0)
+    assert h.store.get_bot_position(SYMBOL) is None

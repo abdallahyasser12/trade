@@ -435,3 +435,30 @@ def test_compute_indicators_does_not_mutate_input():
     original = df.copy(deep=True)
     compute_indicators(df, _small_config())
     pd.testing.assert_frame_equal(df, original)
+
+
+def test_atr_matches_manual_wilder_recursion():
+    """ATR-specific Wilder check (the RSI test alone would not catch an
+    ATR-only regression to the EMA form): TR row 0 is NaN by documented
+    convention, the seed is the SMA of TR rows 1..period at row `period`,
+    then the recursive update follows."""
+    period = 3
+    rng = np.random.default_rng(11)
+    close = _series(100.0 + np.cumsum(rng.normal(0.0, 1.5, 40)))
+    high = close + np.abs(rng.normal(1.0, 0.4, 40))
+    low = close - np.abs(rng.normal(1.0, 0.4, 40))
+
+    out = atr(high, low, close, period)
+
+    c = close.to_numpy(); h = high.to_numpy(); l = low.to_numpy()
+    tr = np.full(len(c), np.nan)
+    for i in range(1, len(c)):
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+    expected = np.full(len(c), np.nan)
+    seed = float(np.mean(tr[1 : period + 1]))
+    expected[period] = seed
+    prev = seed
+    for i in range(period + 1, len(c)):
+        prev = (prev * (period - 1) + tr[i]) / period
+        expected[i] = prev
+    assert np.allclose(out.to_numpy(), expected, equal_nan=True)

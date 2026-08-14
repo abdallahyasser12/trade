@@ -585,3 +585,24 @@ class TestWithRetries:
         """Callers catching DataFeedError must also catch the subscription
         variant."""
         assert issubclass(DataSubscriptionError, DataFeedError)
+
+
+def test_retry_after_header_is_honored_but_bounded():
+    """A server-supplied Retry-After must never stall the engine's safety
+    loop for an unbounded time (the reconcilers run on the same thread)."""
+    from data_feed import MAX_RETRY_AFTER_SECONDS
+
+    class FakeResponse:
+        headers = {"Retry-After": "3600"}
+
+    class RateLimited(Exception):
+        status_code = 429
+
+    exc = RateLimited()
+    exc.response = FakeResponse()
+    sleeper = SleepRecorder()
+    with pytest.raises(DataFeedError):
+        with_retries(lambda: (_ for _ in ()).throw(exc), sleep_fn=sleeper)
+    assert sleeper.delays
+    assert all(d <= MAX_RETRY_AFTER_SECONDS for d in sleeper.delays)
+    assert sleeper.delays[0] == MAX_RETRY_AFTER_SECONDS

@@ -140,7 +140,10 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            # FULL, not NORMAL: the engine's crash-safety design requires
+            # the pending-order intent written BEFORE each broker submit to
+            # actually be on disk if power is lost right after the submit.
+            self._conn.execute("PRAGMA synchronous=FULL;")
             self._conn.executescript(_SCHEMA)
             trade_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
@@ -248,14 +251,18 @@ class StateStore:
         sessions, so an engine restart can never act on the same bar twice.
         """
         with self._lock:
-            cur = self._conn.execute(
-                "INSERT OR IGNORE INTO processed_bars"
-                " (symbol, timeframe, bar_timestamp, session_id, processed_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (symbol, timeframe, _to_iso(bar_timestamp), session_id, _to_iso(_utc_now())),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+            try:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO processed_bars"
+                    " (symbol, timeframe, bar_timestamp, session_id, processed_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (symbol, timeframe, _to_iso(bar_timestamp), session_id, _to_iso(_utc_now())),
+                )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def is_bar_processed(self, symbol: str, timeframe: str, bar_timestamp: datetime) -> bool:
         rows = self._query(
