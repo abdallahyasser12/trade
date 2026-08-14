@@ -1781,3 +1781,147 @@ def test_restart_adopts_entry_fill_even_when_crash_preceded_record_order(tmp_pat
     h.engine.run_iteration()
     stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
     assert len(stops) == 1 and stops[0].requested_qty == pytest.approx(10.0)
+
+
+def test_external_reduction_books_fill_raced_during_stop_cancel_and_never_oversizes(
+    tmp_path, monkeypatch
+):
+    """External reduction path: while the oversized stop is being canceled
+    it partially fills.  That fill must be booked (trade + quantity) and
+    the re-armed stop must match FRESH broker truth — an oversized re-arm
+    could sell shares that no longer exist and go short."""
+    h = build_harness(tmp_path, market_open=False)
+    stop_cid = preset_bot_position(h, qty=10)
+    h.engine._startup()
+    # Externally reduced: broker now holds 6 of the bot's 10.
+    h.broker.positions[SYMBOL].qty = 6.0
+    original_cancel = h.broker.cancel_order
+
+    def fill_two_then_cancel(broker_order_id: str):
+        stop = h.broker.orders[stop_cid]
+        if broker_order_id == stop.broker_order_id:
+            stop.filled_qty = 2.0
+            stop.fill_price = 96.0
+            h.broker._apply_fill(SYMBOL, 2.0, "sell", 96.0)  # broker: 4 left
+        original_cancel(broker_order_id)
+
+    monkeypatch.setattr(h.broker, "cancel_order", fill_two_then_cancel)
+    h.engine.run_iteration()
+
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["qty"] == pytest.approx(4.0)
+    sells = [t for t in h.store.get_trades() if t["action"] == "SELL"]
+    assert len(sells) == 1 and sells[0]["qty"] == pytest.approx(2.0)
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(4.0)
+    broker_qty = h.broker.get_position(SYMBOL).qty
+    assert all(o.requested_qty <= broker_qty + 1e-9 for o in open_stops)
+
+
+def test_exit_fill_with_no_local_position_releases_intent_and_books_trade(tmp_path):
+    """A pending exit whose position record was reconciled away must not
+    deadlock _pending_exit (which blocks all future entries); the fill is
+    booked once, idempotently."""
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    cid = make_client_order_id(h.engine.session_id, "exit", NOW, symbol=SYMBOL)
+    h.broker.orders[cid] = OrderRecord(
+        "ghost-exit", cid, SYMBOL, "exit", "sell", 10.0, 10.0,
+        "canceled", 98.0, submitted_at=NOW, updated_at=NOW,
+    )
+    h.engine._pending_exit = {"client_order_id": cid, "reason": "bearish_crossover"}
+    assert h.store.get_bot_position(SYMBOL) is None
+
+    h.engine._reconcile_exit_order(NOW)
+
+    assert h.engine._pending_exit is None
+    sells = [t for t in h.store.get_trades() if t["action"] == "SELL"]
+    assert len(sells) == 1 and sells[0]["qty"] == pytest.approx(10.0)
+    # Reprocessing the same order must not double-book (event-key idempotency).
+    h.engine._pending_exit = {"client_order_id": cid, "reason": "bearish_crossover"}
+    h.engine._reconcile_exit_order(NOW)
+    assert len([t for t in h.store.get_trades() if t["action"] == "SELL"]) == 1
+
+
+def test_startup_resumes_when_own_pending_exit_fill_explains_quantity_drift(tmp_path):
+    """An exit that partially filled while the process was down must not
+    brick startup as 'changed outside the bot': the bot's own pending sell
+    fills explain the difference, and the first cycle books them and
+    re-protects the remainder."""
+    h = build_harness(tmp_path, market_open=False)
+    preset_bot_position(h, qty=100)
+    pos = h.store.get_bot_position(SYMBOL)
+    stop_cid = pos["stop_client_order_id"]
+    h.broker.orders[stop_cid].status = "canceled"  # exit flow canceled it
+    exit_cid = make_client_order_id(h.engine.session_id, "exit", NOW, symbol=SYMBOL)
+    h.broker.orders[exit_cid] = OrderRecord(
+        "downtime-exit", exit_cid, SYMBOL, "exit", "sell", 100.0, 40.0,
+        "canceled", 99.0, submitted_at=NOW, updated_at=NOW,
+    )
+    pos.update(
+        stop_client_order_id=None,
+        stop_price=None,
+        exit_client_order_id=exit_cid,
+        exit_pending_reason="bearish_crossover",
+        exit_bar_epoch=int(NOW.timestamp()),
+        exit_attempts=1,
+    )
+    h.store.set_bot_position(SYMBOL, pos)
+    h.broker.positions[SYMBOL].qty = 60.0
+
+    h.engine._startup()  # must NOT raise
+    h.engine.run_iteration()
+
+    remaining = h.store.get_bot_position(SYMBOL)
+    assert remaining is not None and remaining["qty"] == pytest.approx(60.0)
+    sells = [t for t in h.store.get_trades() if t["action"] == "SELL"]
+    assert len(sells) == 1 and sells[0]["qty"] == pytest.approx(40.0)
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1 and open_stops[0].requested_qty == pytest.approx(60.0)
+
+
+def test_startup_refuses_while_kill_switch_is_armed(tmp_path):
+    """The unclean-stop kill switch must be enforced by the engine itself,
+    not only by the dashboard button gating."""
+    h = build_harness(tmp_path)
+    h.store.set_kv(trade_engine.KILL_SWITCH_KEY, json.dumps({"reason": "EMERGENCY_STOP"}))
+    with pytest.raises(BrokerError, match="kill switch"):
+        h.engine._startup()
+    h.store.delete_kv(trade_engine.KILL_SWITCH_KEY)
+    h.engine._startup()  # acknowledged -> starts
+
+
+def test_fractional_external_reduction_protects_floor_without_churn(tmp_path):
+    """A fractional external reduction (e.g. the user sold 5.5 shares
+    elsewhere) must settle on a whole-share stop for floor(qty) instead of
+    churning cancel/re-arm forever on an unmatchable fractional target."""
+    h = build_harness(tmp_path, market_open=False)
+    preset_bot_position(h, qty=10)
+    h.engine._startup()
+    h.broker.positions[SYMBOL].qty = 4.5
+
+    h.engine.run_iteration()
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1 and open_stops[0].requested_qty == pytest.approx(4.0)
+
+    cancels_before = len(h.broker.cancel_calls)
+    h.engine.run_iteration()  # second cycle must be stable
+    assert len(h.broker.cancel_calls) == cancels_before
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1 and open_stops[0].requested_qty == pytest.approx(4.0)
+
+
+def test_startup_raises_when_mismatched_stop_cancel_cannot_be_confirmed(tmp_path, monkeypatch):
+    """_adopt_open_orders must honor _cancel_and_confirm's verdict: an
+    unconfirmed cancel of a mismatched bot stop is unsafe to trade over."""
+    h = build_harness(tmp_path)
+    stop_cid = preset_bot_position(h, qty=10)
+    h.broker.orders[stop_cid].requested_qty = 100.0  # oversized vs position
+
+    def cancel_never_lands(broker_order_id: str):
+        h.broker.orders[stop_cid].status = "pending_cancel"
+
+    monkeypatch.setattr(h.broker, "cancel_order", cancel_never_lands)
+    with pytest.raises(BrokerError, match="could not be canceled"):
+        h.engine._startup()
