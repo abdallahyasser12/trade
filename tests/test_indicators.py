@@ -119,8 +119,7 @@ def test_rsi_hand_computed_mixed_case():
 
 
 def test_rsi_matches_manual_wilder_recursion():
-    """The implementation's ewm(alpha=1/period, adjust=False) must equal an
-    explicit Wilder loop: avg_t = avg_{t-1} + (x_t - avg_{t-1}) / period."""
+    """Wilder smoothing uses an SMA seed, then the recursive update."""
     period = 5
     rng = np.random.default_rng(7)
     close = _series(100.0 + np.cumsum(rng.normal(0.0, 1.0, 60)))
@@ -129,9 +128,14 @@ def test_rsi_matches_manual_wilder_recursion():
     deltas = np.diff(close.to_numpy())
     gains = np.clip(deltas, 0.0, None)
     losses = np.clip(-deltas, 0.0, None)
-    avg_gain, avg_loss = gains[0], losses[0]
+    avg_gain, avg_loss = gains[:period].mean(), losses[:period].mean()
     expected = np.full(len(close), np.nan)
-    for i in range(1, len(deltas)):
+    seed_row = period
+    if avg_loss == 0.0:
+        expected[seed_row] = 50.0 if avg_gain == 0.0 else 100.0
+    else:
+        expected[seed_row] = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    for i in range(period, len(deltas)):
         avg_gain += (gains[i] - avg_gain) / period
         avg_loss += (losses[i] - avg_loss) / period
         row = i + 1  # deltas[i] belongs to close row i+1

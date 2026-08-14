@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+import math
 from typing import Optional
 
 from config import CLIENT_ORDER_PREFIX
@@ -33,7 +35,11 @@ class BrokerError(Exception):
 
 
 def make_client_order_id(
-    session_id: str, purpose: str, bar_timestamp: datetime, symbol: str = ""
+    session_id: str,
+    purpose: str,
+    bar_timestamp: datetime,
+    symbol: str = "",
+    attempt: int = 1,
 ) -> str:
     """Deterministic, recognizable client order id.
 
@@ -45,8 +51,25 @@ def make_client_order_id(
     if bar_timestamp.tzinfo is None:
         bar_timestamp = bar_timestamp.replace(tzinfo=timezone.utc)
     epoch = int(bar_timestamp.timestamp())
+    if attempt < 1:
+        raise ValueError("attempt must be >= 1")
     middle = f"-{symbol}" if symbol else ""
-    return f"{CLIENT_ORDER_PREFIX}-{session_id[:8]}{middle}-{purpose}-{epoch}"
+    attempt_token = ""
+    value = attempt
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    while value:
+        value, remainder = divmod(value, len(alphabet))
+        attempt_token = alphabet[remainder] + attempt_token
+    retry = f"-a{attempt_token}" if attempt > 1 else ""
+    # Keep the total bounded even after many stop re-arms, while retaining
+    # a recognizable session namespace.
+    session_chars = max(4, 8 - max(0, len(attempt_token) - 1))
+    client_id = (
+        f"{CLIENT_ORDER_PREFIX}-{session_id[:session_chars]}{middle}{retry}-{purpose}-{epoch}"
+    )
+    if len(client_id) > 48:
+        raise ValueError("Generated client_order_id exceeds Alpaca's 48-character limit")
+    return client_id
 
 
 def is_bot_order_id(client_order_id: Optional[str]) -> bool:
@@ -61,6 +84,23 @@ def _float_or_none(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def normalize_sell_stop_price(stop_price: float) -> float:
+    """Normalize a protective sell stop to Alpaca's valid price increment.
+
+    Alpaca accepts at most two decimals at/above $1 and four decimals below
+    $1.  Rounding a sell stop upward is conservative for a long position and
+    avoids silently increasing the configured loss distance.
+    """
+    if not math.isfinite(stop_price) or stop_price <= 0:
+        raise BrokerError(f"Refusing to submit stop with price {stop_price}")
+    places = Decimal("0.01") if stop_price >= 1.0 else Decimal("0.0001")
+    try:
+        normalized = Decimal(str(stop_price)).quantize(places, rounding=ROUND_CEILING)
+    except InvalidOperation as exc:
+        raise BrokerError(f"Invalid protective stop price {stop_price}") from exc
+    return float(normalized)
 
 
 def order_to_record(order) -> OrderRecord:
@@ -112,7 +152,10 @@ class AlpacaPaperBroker:
         Raises BrokerError when any check fails; live execution must stay
         disabled in that case.
         """
-        base_url = str(getattr(self._client, "_base_url", ""))
+        raw_base_url = getattr(self._client, "_base_url", "")
+        # alpaca-py 0.44 stores this as a BaseURL enum whose ``str()`` is
+        # "BaseURL.TRADING_PAPER", not the endpoint value.
+        base_url = str(getattr(raw_base_url, "value", raw_base_url))
         if PAPER_HOST_FRAGMENT not in base_url:
             raise BrokerError(
                 "Trading client is not pointed at the Alpaca paper endpoint — refusing to trade."
@@ -230,10 +273,13 @@ class AlpacaPaperBroker:
         self._require_bot_id(client_order_id)
         if qty <= 0:
             raise BrokerError(f"Refusing to submit order with qty {qty}")
+        normalized_side = side.lower()
+        if normalized_side not in {"buy", "sell"}:
+            raise BrokerError(f"Unsupported order side {side!r}; expected 'buy' or 'sell'.")
         request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
-            side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
+            side=OrderSide.BUY if normalized_side == "buy" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
             client_order_id=client_order_id,
         )
@@ -253,14 +299,13 @@ class AlpacaPaperBroker:
         self._require_bot_id(client_order_id)
         if qty <= 0:
             raise BrokerError(f"Refusing to submit stop with qty {qty}")
-        if stop_price <= 0:
-            raise BrokerError(f"Refusing to submit stop with price {stop_price}")
+        normalized_stop = normalize_sell_stop_price(stop_price)
         request = StopOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
-            stop_price=round(stop_price, 2),
+            stop_price=normalized_stop,
             client_order_id=client_order_id,
         )
         try:
@@ -328,6 +373,8 @@ class AlpacaPaperBroker:
             raise BrokerError(
                 f"Client order id {client_order_id!r} is outside the bot namespace."
             )
+        if len(client_order_id) > 48:
+            raise BrokerError("Client order id exceeds Alpaca's 48-character limit.")
 
 
 def _sanitized_broker_message(exc: Exception) -> str:

@@ -98,20 +98,27 @@ class TradeEngine:
     ):
         self.broker = broker
         self.data_feed = data_feed
-        self.strategy = strategy
-        self.risk_manager = risk_manager
+        # Own deep-copied collaborators/configs so later Streamlit reruns or
+        # caller-side mutation cannot alter a running session mid-flight.
+        self.strategy_config = copy.deepcopy(strategy_config)
+        self.risk_config = copy.deepcopy(risk_config)
+        self.engine_config = copy.deepcopy(engine_config)
+        self.strategy = copy.deepcopy(strategy)
+        self.risk_manager = copy.deepcopy(risk_manager)
+        self.strategy.config = self.strategy_config
+        self.risk_manager.config = self.risk_config
         self.store = state_store
-        self.strategy_config = strategy_config
-        self.risk_config = risk_config
-        self.engine_config = engine_config
         self.session_id = session_id or uuid.uuid4().hex
         self.now_fn = now_fn
 
-        self.symbol = strategy_config.symbol
-        self.timeframe = strategy_config.timeframe
-        self.poll_interval = engine_config.resolved_poll_interval(self.timeframe)
+        self.symbol = self.strategy_config.symbol
+        self.timeframe = self.strategy_config.timeframe
+        self.poll_interval = self.engine_config.resolved_poll_interval(self.timeframe)
 
         self._stop_event = threading.Event()
+        set_interrupt_event = getattr(self.data_feed, "set_interrupt_event", None)
+        if callable(set_interrupt_event):
+            set_interrupt_event(self._stop_event)
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
         self._stop_reason: Optional[StopReason] = None
@@ -204,7 +211,15 @@ class TradeEngine:
                     logger.error("Fatal engine error:\n%s", traceback.format_exc())
                     self._fail_fatal(f"Unexpected engine error: {exc}")
                     break
-                self._stop_event.wait(self.poll_interval)
+                # Fill/cancel reconciliation is safety-critical; do not leave
+                # a partially filled market order unattended for a full bar
+                # polling interval.
+                wait_seconds = (
+                    min(1.0, self.poll_interval)
+                    if self._pending_entry is not None or self._pending_exit is not None
+                    else self.poll_interval
+                )
+                self._stop_event.wait(wait_seconds)
         finally:
             self._finalize()
 
@@ -285,7 +300,11 @@ class TradeEngine:
                 "none — the position was closed outside a session (e.g. the protective "
                 "stop filled). Clearing local record; broker state wins.",
             )
-            self._cancel_orphan_stop(bot_pos)
+            if not self._cancel_orphan_stop(bot_pos):
+                raise BrokerError(
+                    "The broker position is gone but its protective stop could not be "
+                    "confirmed canceled. Resolve that bot order manually before restart."
+                )
             self.store.clear_bot_position(self.symbol)
         elif broker_pos is not None and bot_pos is not None:
             if abs(broker_pos.qty - float(bot_pos.get("qty", 0))) > 1e-9:
@@ -305,13 +324,6 @@ class TradeEngine:
         while the process was down (crash window between submit and fill
         handling).  The orders table plus the broker's order state prove
         ownership.  Returns True when the position was adopted."""
-        candidates = [
-            o
-            for o in self.store.get_orders(limit=50)
-            if o.get("symbol") == self.symbol
-            and o.get("purpose") == OrderPurpose.ENTRY.value
-            and o.get("side") == "buy"
-        ]
         pending_ctx: dict = {}
         raw_ctx = self.store.get_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
         if raw_ctx:
@@ -319,68 +331,91 @@ class TradeEngine:
                 pending_ctx = json.loads(raw_ctx)
             except json.JSONDecodeError:
                 pending_ctx = {}
-        for row in candidates:
-            try:
-                order = self.broker.get_order_by_client_id(row["client_order_id"])
-            except BrokerError:
-                continue
-            if order is None or order.filled_qty <= 0:
-                continue
-            if abs(order.filled_qty - broker_pos.qty) > 1e-9:
-                continue
-            self.store.record_order(order, self.session_id)
-            atr_at_entry = (
-                pending_ctx.get("atr")
-                if pending_ctx.get("client_order_id") == order.client_order_id
-                else None
-            )
-            self.store.set_bot_position(
-                self.symbol,
-                {
-                    "qty": order.filled_qty,
-                    "entry_price": order.fill_price,
-                    "atr_at_entry": atr_at_entry,
-                    "stop_price": None,
-                    "stop_client_order_id": None,
-                    "session_id": self.session_id,
-                    "entry_time": (order.updated_at or self.now_fn()).isoformat(),
-                },
-            )
+        client_id = pending_ctx.get("client_order_id")
+        if not client_id:
+            return False
+        row = self.store.get_order_by_client_id(client_id)
+        if row is None or row.purpose != OrderPurpose.ENTRY.value:
+            return False
+        try:
+            order = self.broker.get_order_by_client_id(client_id)
+        except BrokerError:
+            return False
+        if (
+            order is None
+            or order.side != "buy"
+            or order.filled_qty <= 0
+            or abs(order.filled_qty - broker_pos.qty) > 1e-9
+        ):
+            return False
+        self.store.record_order(order, self.session_id)
+        atr_at_entry = pending_ctx.get("atr")
+        self.store.set_bot_position(
+            self.symbol,
+            {
+                "qty": order.filled_qty,
+                "entry_price": order.fill_price or broker_pos.avg_entry_price,
+                "atr_at_entry": atr_at_entry,
+                "stop_price": None,
+                "stop_client_order_id": None,
+                "entry_client_order_id": order.client_order_id,
+                "session_id": self.session_id,
+                "entry_time": (order.updated_at or self.now_fn()).isoformat(),
+            },
+        )
+        if order.is_terminal:
             self.store.record_trade(
                 self.session_id,
                 self.symbol,
                 action="BUY",
                 qty=order.filled_qty,
-                fill_price=order.fill_price,
+                fill_price=order.fill_price or broker_pos.avg_entry_price,
                 realized_pnl=None,
                 reason="entry_fill_recovered_at_restart",
-                signal_snapshot=pending_ctx.get("signal")
-                if pending_ctx.get("client_order_id") == order.client_order_id
-                else None,
+                signal_snapshot=pending_ctx.get("signal"),
                 timestamp=self.now_fn(),
+                event_key=f"fill:{order.client_order_id}:buy",
             )
             self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
-            self._log(
-                "WARNING",
-                f"Reconciliation: adopted {order.filled_qty:g} {self.symbol} filled by "
-                f"bot entry order {order.client_order_id} while the engine was down. "
-                "A protective stop will be armed.",
-            )
-            return True
-        return False
+        else:
+            self._pending_entry = pending_ctx
+        self._log(
+            "WARNING",
+            f"Reconciliation: adopted {order.filled_qty:g} {self.symbol} filled by "
+            f"the exact pending bot entry {order.client_order_id}. A protective stop "
+            "will be armed.",
+        )
+        return True
 
-    def _cancel_orphan_stop(self, bot_pos: dict) -> None:
+    def _cancel_orphan_stop(self, bot_pos: dict) -> bool:
         """Cancel a bot stop order left behind after its position vanished."""
         stop_id = bot_pos.get("stop_client_order_id")
         if not stop_id:
-            return
+            return True
         try:
             order = self.broker.get_order_by_client_id(stop_id)
             if order is not None and order.is_open:
-                self.broker.cancel_order(order.broker_order_id)
-                self._log("INFO", f"Canceled orphan protective stop {stop_id}")
+                if not self._cancel_and_confirm(order):
+                    self._log("ERROR", f"Could not confirm cancellation of orphan stop {stop_id}")
+                    return False
+                self._log("INFO", f"Canceled and confirmed orphan protective stop {stop_id}")
+            return True
         except BrokerError as exc:
             self._log("WARNING", f"Could not cancel orphan stop {stop_id}: {exc}")
+            return False
+
+    def _cancel_and_confirm(self, order: OrderRecord) -> bool:
+        """Cancel one proven bot order and verify it no longer can fill."""
+        if order.is_terminal:
+            return True
+        self.broker.cancel_order(order.broker_order_id)
+        for attempt in range(6):
+            refreshed = self._refresh_order(order.client_order_id)
+            if refreshed is None or refreshed.is_terminal:
+                return True
+            if attempt < 5 and self._stop_event.wait(0.1):
+                return False
+        return False
 
     def _adopt_open_orders(self) -> None:
         """Adopt bot-owned open orders from a previous process so their
@@ -421,7 +456,14 @@ class TradeEngine:
                 # so _ensure_protective_stop never arms a SECOND stop (two
                 # resting sells could turn the account short).
                 bot_pos = self.store.get_bot_position(self.symbol)
-                if bot_pos is not None and not bot_pos.get("stop_client_order_id"):
+                remaining_qty = max(0.0, order.requested_qty - order.filled_qty)
+                exact = (
+                    bot_pos is not None
+                    and order.side == "sell"
+                    and abs(remaining_qty - float(bot_pos.get("qty", 0))) <= 1e-9
+                )
+                linked_id = bot_pos.get("stop_client_order_id") if bot_pos else None
+                if exact and (not linked_id or linked_id == order.client_order_id):
                     bot_pos["stop_client_order_id"] = order.client_order_id
                     if order.stop_price is not None:
                         bot_pos["stop_price"] = order.stop_price
@@ -429,6 +471,17 @@ class TradeEngine:
                     self._log(
                         "WARNING", f"Adopted resting protective stop {order.client_order_id}"
                     )
+                elif not exact or linked_id != order.client_order_id:
+                    try:
+                        self._cancel_and_confirm(order)
+                        self._log(
+                            "WARNING",
+                            f"Canceled mismatched or duplicate bot stop {order.client_order_id}",
+                        )
+                    except BrokerError as exc:
+                        raise BrokerError(
+                            f"Unsafe bot stop {order.client_order_id} could not be canceled: {exc}"
+                        ) from exc
 
     def _finalize(self) -> None:
         """Persist final state on the way out; never raises."""
@@ -500,13 +553,19 @@ class TradeEngine:
         account = self.broker.get_account()
         self._maybe_snapshot_equity(now, account)
 
-        if self._daily_loss_breached(account):
-            return
-
         self._reconcile_pending_orders(now)
+        if not self._reconcile_position_truth(now):
+            self._persist_status()
+            return
         self._retry_exit_intent(now)
         self._ensure_protective_stop(now)
         self._snapshot_position(now)
+
+        # Fills and stop protection are reconciled before the loss halt can
+        # terminate the loop.  A safety circuit breaker must never strand a
+        # fill that occurred since the previous cycle.
+        if self._daily_loss_breached(account):
+            return
 
         if not clock.is_open:
             self._persist_status()
@@ -616,6 +675,72 @@ class TradeEngine:
             return True
         return False
 
+    def _reconcile_position_truth(self, now: datetime) -> bool:
+        """Reconcile broker quantity drift before any new economic action."""
+        broker_pos = self.broker.get_position(self.symbol)
+        bot_pos = self.store.get_bot_position(self.symbol)
+        if broker_pos is None and bot_pos is None:
+            return True
+        if broker_pos is not None and bot_pos is None:
+            self._fail_fatal(
+                f"Broker now holds {broker_pos.qty:g} {self.symbol} without bot ownership; "
+                "session halted for manual reconciliation."
+            )
+            return False
+        if broker_pos is None and bot_pos is not None:
+            if not self._cancel_orphan_stop(bot_pos):
+                self._fail_fatal(
+                    "Broker position vanished and its bot sell stop could not be confirmed "
+                    "canceled; manual reconciliation required."
+                )
+                return False
+            self.store.clear_bot_position(self.symbol)
+            self.store.delete_kv(POSITION_SNAPSHOT_KEY_PREFIX + self.symbol)
+            self._log("WARNING", "Broker position vanished; cleared reconciled local state.")
+            return True
+
+        local_qty = float(bot_pos.get("qty", 0))
+        broker_qty = float(broker_pos.qty)
+        if abs(local_qty - broker_qty) <= 1e-9:
+            return True
+        if broker_qty > local_qty:
+            self._fail_fatal(
+                f"Broker quantity {broker_qty:g} exceeds bot-owned quantity {local_qty:g}; "
+                "session halted without adopting externally added shares."
+            )
+            return False
+
+        # A manual/external reduction makes the old stop oversized.  Cancel
+        # it first, then resize local ownership and re-arm an exact stop.
+        stop_id = bot_pos.get("stop_client_order_id")
+        if stop_id:
+            stop = self._refresh_order(stop_id)
+            if stop is not None and stop.is_open:
+                try:
+                    if not self._cancel_and_confirm(stop):
+                        raise BrokerError("cancel confirmation timed out")
+                except BrokerError as exc:
+                    self._log(
+                        "ERROR",
+                        f"Position was externally reduced but oversized stop cancellation "
+                        f"is unconfirmed: {exc}",
+                    )
+                    return False
+        if broker_qty <= 0:
+            self.store.clear_bot_position(self.symbol)
+            return True
+        bot_pos["qty"] = broker_qty
+        bot_pos["stop_client_order_id"] = None
+        bot_pos["stop_price"] = None
+        self.store.set_bot_position(self.symbol, bot_pos)
+        self._log(
+            "WARNING",
+            f"Broker truth reduced position from {local_qty:g} to {broker_qty:g}; "
+            "protective stop will be resized.",
+        )
+        self._ensure_protective_stop(now)
+        return True
+
     def _reconcile_pending_orders(self, now: datetime) -> None:
         """Confirm fills from broker state and act on transitions.
 
@@ -651,6 +776,57 @@ class TradeEngine:
                 self._status.last_order_status = f"{order.purpose}:{order.status}"
         return order
 
+    @staticmethod
+    def _remaining_order_qty(order: OrderRecord) -> float:
+        return max(0.0, float(order.requested_qty) - float(order.filled_qty))
+
+    def _sync_entry_fill(self, pending: dict, order: OrderRecord, now: datetime) -> dict:
+        """Persist cumulative entry fill truth, including partial fills."""
+        bot_pos = self.store.get_bot_position(self.symbol)
+        if bot_pos is not None:
+            owner_id = bot_pos.get("entry_client_order_id")
+            if owner_id and owner_id != order.client_order_id:
+                raise BrokerError(
+                    "A second entry fill conflicts with the bot-owned position; refusing adoption."
+                )
+            prior_qty = float(bot_pos.get("qty", 0))
+            if abs(prior_qty - order.filled_qty) > 1e-9 and bot_pos.get(
+                "stop_client_order_id"
+            ):
+                stop = self._refresh_order(bot_pos["stop_client_order_id"])
+                if stop is not None and stop.is_open:
+                    if not self._cancel_and_confirm(stop):
+                        self._log(
+                            "ERROR",
+                            "Entry received another partial fill but the old protective stop "
+                            "could not yet be canceled; reconciliation will retry immediately.",
+                        )
+                    else:
+                        bot_pos["stop_client_order_id"] = None
+                        bot_pos["stop_price"] = None
+        else:
+            bot_pos = {}
+        signal = pending.get("signal")
+        bot_pos.update(
+            {
+                "qty": float(order.filled_qty),
+                "entry_price": order.fill_price,
+                "atr_at_entry": pending.get("atr"),
+                "entry_client_order_id": order.client_order_id,
+                "session_id": self.session_id,
+                "entry_time": (order.updated_at or now).isoformat(),
+            }
+        )
+        bot_pos.setdefault("stop_price", None)
+        bot_pos.setdefault("stop_client_order_id", None)
+        self.store.set_bot_position(self.symbol, bot_pos)
+        self._log(
+            "INFO",
+            f"Entry fill reconciled: {order.filled_qty:g} {self.symbol} @ {order.fill_price}",
+            context={"signal": signal} if isinstance(signal, dict) else None,
+        )
+        return bot_pos
+
     def _reconcile_entry_order(self, now: datetime) -> None:
         pending = self._pending_entry
         order = self._refresh_order(pending["client_order_id"])
@@ -663,25 +839,28 @@ class TradeEngine:
             self._pending_entry = None
             self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
             return
-        if not order.is_terminal:
-            return  # still working (accepted / partially_filled) — wait.
-        self._pending_entry = None
-        self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
         if order.filled_qty > 0:
-            atr_at_entry = pending.get("atr")
             signal = pending.get("signal")
-            self.store.set_bot_position(
-                self.symbol,
-                {
-                    "qty": order.filled_qty,
-                    "entry_price": order.fill_price,
-                    "atr_at_entry": atr_at_entry,
-                    "stop_price": None,
-                    "stop_client_order_id": None,
-                    "session_id": self.session_id,
-                    "entry_time": (order.updated_at or now).isoformat(),
-                },
-            )
+            self._sync_entry_fill(pending, order, now)
+            self._ensure_protective_stop(now)
+            if not order.is_terminal:
+                # Freeze the economic quantity after the first partial fill.
+                # The current fill is protected before canceling the remainder.
+                if order.status == "partially_filled":
+                    try:
+                        if self._cancel_and_confirm(order):
+                            order = self._refresh_order(order.client_order_id) or order
+                    except BrokerError as exc:
+                        self._log(
+                            "WARNING",
+                            f"Could not cancel unfilled entry remainder yet: {exc}",
+                        )
+                if not order.is_terminal:
+                    return
+                # Capture any additional fill received while cancellation raced.
+                if order.filled_qty > 0:
+                    self._sync_entry_fill(pending, order, now)
+                    self._ensure_protective_stop(now)
             self.store.record_trade(
                 self.session_id,
                 self.symbol,
@@ -694,6 +873,7 @@ class TradeEngine:
                 else "entry_fill",
                 signal_snapshot=signal if isinstance(signal, dict) else None,
                 timestamp=now,
+                event_key=f"fill:{order.client_order_id}:buy",
             )
             status_word = "filled" if order.is_filled else f"partially filled ({order.status})"
             self._log(
@@ -702,11 +882,30 @@ class TradeEngine:
             )
             self._ensure_protective_stop(now)
         else:
+            if not order.is_terminal:
+                return
             self._log(
                 "WARNING",
                 f"Entry order {order.client_order_id} ended {order.status} with no fill.",
                 context={"order_status": order.status},
             )
+        # Clear the crash-recovery intent only after durable position/trade
+        # state has been written.
+        self._pending_entry = None
+        self.store.delete_kv(PENDING_ENTRY_KEY_PREFIX + self.symbol)
+
+    def _apply_sell_fill(
+        self, bot_pos: dict, order: OrderRecord, accounted_key: str
+    ) -> dict:
+        """Apply only the newly observed portion of a cumulative sell fill."""
+        accounted = float(bot_pos.get(accounted_key) or 0.0)
+        cumulative = max(accounted, float(order.filled_qty))
+        delta = cumulative - accounted
+        if delta > 0:
+            bot_pos["qty"] = max(0.0, float(bot_pos.get("qty", 0)) - delta)
+            bot_pos[accounted_key] = cumulative
+            self.store.set_bot_position(self.symbol, bot_pos)
+        return bot_pos
 
     def _reconcile_exit_order(self, now: datetime) -> None:
         pending = self._pending_exit
@@ -725,10 +924,21 @@ class TradeEngine:
                 bot_pos["exit_client_order_id"] = None
                 self.store.set_bot_position(self.symbol, bot_pos)
             return
-        if not order.is_terminal:
-            return
-        self._pending_exit = None
         if order.filled_qty > 0 and bot_pos is not None:
+            bot_pos = self._apply_sell_fill(bot_pos, order, "exit_accounted_filled_qty")
+            if not order.is_terminal:
+                if order.status == "partially_filled":
+                    try:
+                        if self._cancel_and_confirm(order):
+                            order = self._refresh_order(order.client_order_id) or order
+                            bot_pos = self._apply_sell_fill(
+                                bot_pos, order, "exit_accounted_filled_qty"
+                            )
+                    except BrokerError as exc:
+                        self._log("WARNING", f"Could not cancel partial exit remainder: {exc}")
+                if not order.is_terminal:
+                    return
+            self._pending_exit = None
             entry_price = float(bot_pos.get("entry_price") or 0.0)
             pnl = (float(order.fill_price or 0.0) - entry_price) * order.filled_qty
             self.store.record_trade(
@@ -741,10 +951,11 @@ class TradeEngine:
                 reason=pending.get("reason", "exit"),
                 signal_snapshot=None,
                 timestamp=now,
+                event_key=f"fill:{order.client_order_id}:sell",
             )
-            remaining = float(bot_pos.get("qty", 0)) - order.filled_qty
+            remaining = float(bot_pos.get("qty", 0))
             if remaining > 1e-9:
-                bot_pos["qty"] = remaining
+                bot_pos.pop("exit_accounted_filled_qty", None)
                 bot_pos["stop_client_order_id"] = None
                 bot_pos["stop_price"] = None
                 self._clear_exit_intent(bot_pos)
@@ -763,6 +974,9 @@ class TradeEngine:
                     f"(realized P&L ${pnl:,.2f})",
                 )
         elif order.filled_qty <= 0:
+            if not order.is_terminal:
+                return
+            self._pending_exit = None
             attempts = int(bot_pos.get("exit_attempts") or 0) if bot_pos else 0
             if bot_pos is not None:
                 bot_pos["exit_client_order_id"] = None
@@ -812,9 +1026,12 @@ class TradeEngine:
             self.store.set_bot_position(self.symbol, bot_pos)
             self._ensure_protective_stop(now)
             return
-        if not order.is_terminal:
-            return
         if order.filled_qty > 0:
+            bot_pos = self._apply_sell_fill(bot_pos, order, "stop_accounted_filled_qty")
+            if not order.is_terminal:
+                # The remainder of this same sell stop exactly protects the
+                # remaining shares; never stack another stop on a partial.
+                return
             entry_price = float(bot_pos.get("entry_price") or 0.0)
             pnl = (float(order.fill_price or 0.0) - entry_price) * order.filled_qty
             self.store.record_trade(
@@ -827,10 +1044,11 @@ class TradeEngine:
                 reason="atr_stop_triggered",
                 signal_snapshot=None,
                 timestamp=now,
+                event_key=f"fill:{order.client_order_id}:sell",
             )
-            remaining = float(bot_pos.get("qty", 0)) - order.filled_qty
+            remaining = float(bot_pos.get("qty", 0))
             if remaining > 1e-9:
-                bot_pos["qty"] = remaining
+                bot_pos.pop("stop_accounted_filled_qty", None)
                 bot_pos["stop_client_order_id"] = None
                 bot_pos["stop_price"] = None
                 self.store.set_bot_position(self.symbol, bot_pos)
@@ -843,6 +1061,8 @@ class TradeEngine:
                 f"@ {order.fill_price} (realized P&L ${pnl:,.2f})",
             )
         else:
+            if not order.is_terminal:
+                return
             # Stop ended without a fill (canceled/expired/rejected).
             bot_pos["stop_client_order_id"] = None
             bot_pos["stop_price"] = None
@@ -873,8 +1093,29 @@ class TradeEngine:
             return
         if bot_pos.get("exit_pending_reason"):
             return  # a strategy exit is being pursued; don't arm under it.
-        if bot_pos.get("stop_client_order_id"):
-            return
+        linked_stop_id = bot_pos.get("stop_client_order_id")
+        if linked_stop_id:
+            linked = self._refresh_order(linked_stop_id)
+            remaining = self._remaining_order_qty(linked) if linked is not None else 0.0
+            exact = (
+                linked is not None
+                and linked.is_open
+                and linked.side == "sell"
+                and abs(remaining - float(bot_pos.get("qty", 0))) <= 1e-9
+            )
+            if exact:
+                return
+            if linked is not None and linked.is_open:
+                try:
+                    if not self._cancel_and_confirm(linked):
+                        self._log("ERROR", "Mismatched protective stop cancel is not confirmed.")
+                        return
+                except BrokerError as exc:
+                    self._log("ERROR", f"Could not cancel mismatched protective stop: {exc}")
+                    return
+            bot_pos["stop_client_order_id"] = None
+            bot_pos["stop_price"] = None
+            self.store.set_bot_position(self.symbol, bot_pos)
 
         # Adopt any bot stop already resting at the broker (e.g. a submit
         # whose HTTP response was lost) rather than submitting a second one.
@@ -883,19 +1124,38 @@ class TradeEngine:
         except BrokerError as exc:
             self._log("WARNING", f"Cannot verify open orders before arming stop: {exc}")
             return
-        for existing_order in open_orders:
-            if existing_order.purpose == OrderPurpose.STOP.value:
-                bot_pos["stop_client_order_id"] = existing_order.client_order_id
-                if existing_order.stop_price is not None:
-                    bot_pos["stop_price"] = existing_order.stop_price
-                self.store.set_bot_position(self.symbol, bot_pos)
-                self.store.record_order(existing_order, self.session_id)
-                self._log(
-                    "WARNING",
-                    f"Adopted already-resting protective stop {existing_order.client_order_id} "
-                    "instead of submitting a duplicate.",
+        stop_orders = [o for o in open_orders if o.purpose == OrderPurpose.STOP.value]
+        exact_stop = None
+        for existing_order in stop_orders:
+            exact = (
+                existing_order.side == "sell"
+                and abs(
+                    self._remaining_order_qty(existing_order)
+                    - float(bot_pos.get("qty", 0))
                 )
+                <= 1e-9
+            )
+            if exact and exact_stop is None:
+                exact_stop = existing_order
+                continue
+            try:
+                if not self._cancel_and_confirm(existing_order):
+                    self._log("ERROR", "Unsafe duplicate/mismatched stop cancel unconfirmed.")
+                    return
+            except BrokerError as exc:
+                self._log("ERROR", f"Cannot cancel unsafe protective stop: {exc}")
                 return
+        if exact_stop is not None:
+            bot_pos["stop_client_order_id"] = exact_stop.client_order_id
+            if exact_stop.stop_price is not None:
+                bot_pos["stop_price"] = exact_stop.stop_price
+            self.store.set_bot_position(self.symbol, bot_pos)
+            self.store.record_order(exact_stop, self.session_id)
+            self._log(
+                "WARNING",
+                f"Adopted exact-quantity protective stop {exact_stop.client_order_id}.",
+            )
+            return
 
         entry_price = float(bot_pos.get("entry_price") or 0.0)
         atr_at_entry = bot_pos.get("atr_at_entry")
@@ -932,8 +1192,13 @@ class TradeEngine:
                 return
 
         qty = int(float(bot_pos["qty"]))
+        stop_attempt = int(bot_pos.get("stop_attempts") or 0) + 1
         client_id = make_client_order_id(
-            self.session_id, OrderPurpose.STOP.value, now, symbol=self.symbol
+            self.session_id,
+            OrderPurpose.STOP.value,
+            now,
+            symbol=self.symbol,
+            attempt=stop_attempt,
         )
         if self.store.get_order_by_client_id(client_id) is not None:
             return  # already created this cycle (idempotency guard)
@@ -942,6 +1207,7 @@ class TradeEngine:
         # instead of arming a second stop.
         bot_pos["stop_client_order_id"] = client_id
         bot_pos["stop_price"] = stop_price
+        bot_pos["stop_attempts"] = stop_attempt
         self.store.set_bot_position(self.symbol, bot_pos)
         try:
             order = self.broker.submit_stop_order(self.symbol, qty, stop_price, client_id)
@@ -1084,8 +1350,13 @@ class TradeEngine:
                 "WARNING",
                 "Exit requested but the broker shows no position — reconciling instead.",
             )
-            self._cancel_orphan_stop(bot_pos)
-            self.store.clear_bot_position(self.symbol)
+            if self._cancel_orphan_stop(bot_pos):
+                self.store.clear_bot_position(self.symbol)
+            else:
+                self._log(
+                    "ERROR",
+                    "Refusing to clear local ownership while an orphan sell stop may remain open.",
+                )
             return
 
         stop_id = bot_pos.get("stop_client_order_id")
@@ -1117,12 +1388,15 @@ class TradeEngine:
                     )
                     return
                 if refreshed is not None and refreshed.filled_qty > 0:
-                    # The stop filled while we were canceling — the
-                    # reconciler will book it; no exit order needed.
-                    self._log("INFO", "Stop filled during cancel; skipping exit order.")
-                    self._clear_exit_intent(bot_pos)
-                    self.store.set_bot_position(self.symbol, bot_pos)
-                    return
+                    # The stop filled while cancellation raced. Reconcile
+                    # that cumulative fill now. If shares remain, preserve
+                    # the strategy-exit intent and sell only broker truth.
+                    self._log("INFO", "Stop filled during cancel; reconciling before exit.")
+                    self._reconcile_stop_order(now)
+                    bot_pos = self.store.get_bot_position(self.symbol)
+                    broker_pos = self.broker.get_position(self.symbol)
+                    if bot_pos is None or broker_pos is None:
+                        return
             bot_pos["stop_client_order_id"] = None
             self.store.set_bot_position(self.symbol, bot_pos)
 
@@ -1130,8 +1404,13 @@ class TradeEngine:
         if qty <= 0:
             self._log("WARNING", "Exit requested but computed quantity is 0 — no action.")
             return
+        attempt = int(bot_pos.get("exit_attempts") or 0) + 1
         client_id = make_client_order_id(
-            self.session_id, OrderPurpose.EXIT.value, bar_ts, symbol=self.symbol
+            self.session_id,
+            OrderPurpose.EXIT.value,
+            bar_ts,
+            symbol=self.symbol,
+            attempt=attempt,
         )
         known = self.store.get_order_by_client_id(client_id)
         at_broker = self.broker.get_order_by_client_id(client_id) if known is None else None
@@ -1143,7 +1422,7 @@ class TradeEngine:
             return
         # Persist the order-id intent BEFORE submitting (lost-response safety).
         bot_pos["exit_client_order_id"] = client_id
-        bot_pos["exit_attempts"] = int(bot_pos.get("exit_attempts") or 0) + 1
+        bot_pos["exit_attempts"] = attempt
         self.store.set_bot_position(self.symbol, bot_pos)
         order = self.broker.submit_market_order(self.symbol, qty, "sell", client_id)
         self.store.record_order(order, self.session_id)

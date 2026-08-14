@@ -73,6 +73,29 @@ class TestCalculateStopPrice:
     @pytest.mark.parametrize(
         "entry,atr,mult",
         [
+            (float("nan"), 2.0, 2.0),
+            (100.0, float("inf"), 2.0),
+            (100.0, 2.0, float("nan")),
+        ],
+    )
+    def test_rejects_non_finite_stop_inputs(self, entry, atr, mult):
+        with pytest.raises(ValueError):
+            make_manager().calculate_stop_price(entry, atr, mult)
+
+
+    def test_position_size_rejects_non_finite_inputs_without_math_exceptions(self):
+        manager = make_manager()
+        for kwargs in (
+            dict(equity=float("nan"), buying_power=1_000, entry_price=10, stop_price=9),
+            dict(equity=1_000, buying_power=float("inf"), entry_price=10, stop_price=9),
+            dict(equity=1_000, buying_power=1_000, entry_price=float("nan"), stop_price=9),
+            dict(equity=1_000, buying_power=1_000, entry_price=10, stop_price=float("nan")),
+        ):
+            assert manager.calculate_position_size(**kwargs).approved is False
+
+    @pytest.mark.parametrize(
+        "entry,atr,mult",
+        [
             (0.0, 2.0, 2.0),
             (-100.0, 2.0, 2.0),
             (100.0, 0.0, 2.0),

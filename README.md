@@ -257,6 +257,15 @@ live tab shows the account's PDT flag and current day-trade count.
 - **Position ownership boundary:** the bot refuses to start if a position already exists
   in the configured symbol that it did not open. It only manages positions and orders it
   created (all its orders carry a `trendbot-` client-order-id prefix).
+- **Partial-fill containment:** after an entry partially fills, the filled quantity is
+  persisted and protected, the unfilled remainder is canceled, and any fill that races
+  with cancellation causes the stop to be replaced at the exact final quantity. Partial
+  exits and stop fills use cumulative-fill accounting so the bot never sells more than
+  broker-reported position truth.
+- **Exact stop ownership and quantity:** restart reconciliation adopts only a bot-owned
+  sell stop whose remaining quantity exactly matches the bot position. Duplicate,
+  wrong-side, or mismatched bot stops are canceled individually; unrelated orders are
+  never canceled.
 - **Entries blocked near the close:** by default, no new entries in the final 30 minutes
   of the regular session (configurable).
 - **Optional flat-before-close (off by default):** when off, positions are held overnight
@@ -268,8 +277,9 @@ live tab shows the account's PDT flag and current day-trade count.
 - **Stale-data guard:** if the newest completed bar is too old (default: 3 bar-lengths
   intraday), the bot skips the trading decision instead of acting on outdated prices.
 - Other engine invariants: each bar is processed at most once (persisted across
-  restarts), order IDs are deterministic so retries cannot duplicate orders, and fills
-  are always confirmed from broker state before any dependent action.
+  restarts), the same submission attempt has a deterministic order ID while a confirmed
+  terminal retry gets a distinct bounded ID, and fills are always confirmed from broker
+  state before any dependent action.
 
 ## Glossary
 

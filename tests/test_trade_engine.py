@@ -1328,3 +1328,258 @@ def test_missing_atr_at_entry_falls_back_to_latest_signal_atr(tmp_path):
     stops = submitted_by_purpose(h, OrderPurpose.STOP.value)
     assert len(stops) == 1
     assert stops[0].stop_price == pytest.approx(100.0 - 3.0 * h.strategy_cfg.atr_multiplier)
+
+
+# ---------------------------------------------------------------------------
+# Independent audit regressions: partial fills and broker-truth drift
+# ---------------------------------------------------------------------------
+
+
+def _inject_partial_entry(h: Harness, filled_qty: float = 40.0) -> OrderRecord:
+    cid = make_client_order_id(
+        h.engine.session_id, OrderPurpose.ENTRY.value, NOW, symbol=SYMBOL
+    )
+    order = OrderRecord(
+        broker_order_id="partial-entry",
+        client_order_id=cid,
+        symbol=SYMBOL,
+        purpose=OrderPurpose.ENTRY.value,
+        side="buy",
+        requested_qty=100.0,
+        filled_qty=filled_qty,
+        status="partially_filled",
+        fill_price=100.0,
+        stop_price=None,
+        submitted_at=NOW,
+        updated_at=NOW,
+    )
+    h.broker.orders[cid] = order
+    h.broker.positions[SYMBOL] = BrokerPosition(
+        symbol=SYMBOL, qty=filled_qty, avg_entry_price=100.0, current_price=100.0,
+        market_value=filled_qty * 100.0, unrealized_pl=0.0, unrealized_plpc=0.0,
+    )
+    h.store.record_order(order, h.engine.session_id)
+    context = {"client_order_id": cid, "atr": 2.0, "signal": {"reason": "audit"}}
+    h.store.set_kv(trade_engine.PENDING_ENTRY_KEY_PREFIX + SYMBOL, json.dumps(context))
+    h.engine._pending_entry = context
+    return order
+
+
+def test_partial_entry_is_recorded_protected_and_remainder_canceled(tmp_path):
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    entry = _inject_partial_entry(h)
+
+    h.engine._reconcile_entry_order(NOW)
+
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["qty"] == pytest.approx(40.0)
+    assert h.broker.orders[entry.client_order_id].status == "canceled"
+    stops = submitted_by_purpose(h, OrderPurpose.STOP.value)
+    assert len(stops) == 1
+    assert stops[0].requested_qty == pytest.approx(40.0)
+    assert len([t for t in h.store.get_trades() if t["action"] == "BUY"]) == 1
+
+
+def test_additional_fill_during_entry_cancel_resizes_stop_to_final_quantity(
+    tmp_path, monkeypatch
+):
+    h = build_harness(tmp_path)
+    h.engine._startup()
+    entry = _inject_partial_entry(h)
+    original_cancel = h.broker.cancel_order
+
+    def fill_then_cancel(broker_order_id: str):
+        record = next(
+            o for o in h.broker.orders.values() if o.broker_order_id == broker_order_id
+        )
+        if record.client_order_id == entry.client_order_id:
+            record.filled_qty = 70.0
+            h.broker.positions[SYMBOL].qty = 70.0
+            h.broker.positions[SYMBOL].market_value = 7_000.0
+        original_cancel(broker_order_id)
+
+    monkeypatch.setattr(h.broker, "cancel_order", fill_then_cancel)
+    h.engine._reconcile_entry_order(NOW)
+
+    assert h.store.get_bot_position(SYMBOL)["qty"] == pytest.approx(70.0)
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(70.0)
+
+
+def test_partial_exit_cancels_remainder_and_rearms_only_remaining_quantity(tmp_path):
+    h = build_harness(tmp_path)
+    stop_id = preset_bot_position(h, qty=100)
+    h.engine._startup()
+    h.broker.orders[stop_id].status = "canceled"
+    pos = h.store.get_bot_position(SYMBOL)
+    pos["stop_client_order_id"] = None
+    pos["stop_price"] = None
+
+    cid = make_client_order_id(h.engine.session_id, "exit", NOW, symbol=SYMBOL)
+    exit_order = OrderRecord(
+        "partial-exit", cid, SYMBOL, "exit", "sell", 100.0, 40.0,
+        "partially_filled", 99.0, submitted_at=NOW, updated_at=NOW,
+    )
+    h.broker.orders[cid] = exit_order
+    h.broker.positions[SYMBOL].qty = 60.0
+    h.broker.positions[SYMBOL].market_value = 5_940.0
+    pos.update(
+        exit_client_order_id=cid,
+        exit_pending_reason="bearish_crossover",
+        exit_bar_epoch=int(NOW.timestamp()),
+        exit_attempts=1,
+    )
+    h.store.set_bot_position(SYMBOL, pos)
+    h.engine._pending_exit = {"client_order_id": cid, "reason": "bearish_crossover"}
+
+    h.engine._reconcile_exit_order(NOW)
+
+    remaining = h.store.get_bot_position(SYMBOL)
+    assert remaining is not None and remaining["qty"] == pytest.approx(60.0)
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(60.0)
+
+
+def test_partial_stop_fill_keeps_one_exact_remaining_stop(tmp_path):
+    h = build_harness(tmp_path)
+    stop_id = preset_bot_position(h, qty=100)
+    h.engine._startup()
+    stop = h.broker.orders[stop_id]
+    stop.status = "partially_filled"
+    stop.filled_qty = 40.0
+    stop.fill_price = 96.0
+    h.broker.positions[SYMBOL].qty = 60.0
+
+    h.engine._reconcile_stop_order(NOW)
+
+    assert h.store.get_bot_position(SYMBOL)["qty"] == pytest.approx(60.0)
+    assert h.store.get_bot_position(SYMBOL)["stop_client_order_id"] == stop_id
+    assert len([o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]) == 1
+
+
+def test_stop_partial_fill_during_strategy_exit_sells_only_remaining_shares(
+    tmp_path, monkeypatch
+):
+    h = build_harness(tmp_path)
+    stop_id = preset_bot_position(h, qty=100)
+    h.engine._startup()
+    original_cancel = h.broker.cancel_order
+
+    def partial_fill_then_cancel(broker_order_id: str):
+        stop = h.broker.orders[stop_id]
+        if broker_order_id == stop.broker_order_id:
+            stop.filled_qty = 40.0
+            stop.fill_price = 96.0
+            h.broker._apply_fill(SYMBOL, 40.0, "sell", 96.0)
+        original_cancel(broker_order_id)
+
+    monkeypatch.setattr(h.broker, "cancel_order", partial_fill_then_cancel)
+    h.broker.fill_price = 95.0
+    h.engine._initiate_exit("bearish_crossover", NOW)
+
+    exits = submitted_by_purpose(h, OrderPurpose.EXIT.value)
+    assert len(exits) == 1 and exits[0].requested_qty == pytest.approx(60.0)
+    assert h.broker.get_position(SYMBOL) is None
+    assert h.store.get_bot_position(SYMBOL) is None
+    assert not [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+
+
+def test_rejected_exit_uses_new_bounded_retry_ids_then_rearms_stop(tmp_path):
+    h = build_harness(tmp_path)
+    preset_bot_position(h, qty=10)
+    h.engine._startup()
+    h.broker.reject_submits = True
+
+    h.engine._initiate_exit("bearish_crossover", NOW)
+    h.engine._retry_exit_intent(NOW)
+    h.engine._retry_exit_intent(NOW)
+
+    exits = submitted_by_purpose(h, OrderPurpose.EXIT.value)
+    assert len(exits) == 3
+    assert len({o.client_order_id for o in exits}) == 3
+    assert all(len(o.client_order_id) <= 48 for o in exits)
+    h.broker.reject_submits = False
+    h.engine._retry_exit_intent(NOW)
+    h.engine._reconcile_stop_order(NOW)
+    pos = h.store.get_bot_position(SYMBOL)
+    assert pos is not None and pos["exit_pending_reason"] is None
+    assert any(o.is_open and o.purpose == "stop" for o in h.broker.orders.values())
+
+
+def test_daily_loss_halt_reconciles_fill_and_stop_first(tmp_path):
+    h = build_harness(tmp_path, market_open=False)
+    h.engine._startup()
+    entry = _inject_partial_entry(h, filled_qty=40.0)
+    entry.status = "filled"
+    entry.requested_qty = 40.0
+    h.broker.orders[entry.client_order_id] = entry
+    h.broker.account = replace(h.broker.account, equity=97_000.0)
+
+    h.engine.run_iteration()
+
+    assert h.engine._stop_reason == StopReason.DAILY_LOSS_HALT
+    assert h.store.get_bot_position(SYMBOL)["qty"] == pytest.approx(40.0)
+    assert any(o.is_open and o.purpose == "stop" for o in h.broker.orders.values())
+
+
+def test_startup_cancels_oversized_stop_and_rearms_exact_quantity(tmp_path):
+    h = build_harness(tmp_path, market_open=False)
+    stop_id = preset_bot_position(h, qty=10)
+    h.broker.orders[stop_id].requested_qty = 100.0
+
+    h.engine._startup()
+    h.engine.run_iteration()
+
+    assert h.broker.orders[stop_id].status == "canceled"
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(10.0)
+
+
+def test_runtime_manual_reduction_resizes_oversized_stop(tmp_path):
+    h = build_harness(tmp_path, market_open=False)
+    old_stop = preset_bot_position(h, qty=10)
+    h.engine._startup()
+    h.broker.positions[SYMBOL].qty = 4.0
+
+    h.engine.run_iteration()
+
+    assert h.broker.orders[old_stop].status == "canceled"
+    assert h.store.get_bot_position(SYMBOL)["qty"] == pytest.approx(4.0)
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1 and open_stops[0].requested_qty == pytest.approx(4.0)
+
+
+def test_stale_historical_fill_without_exact_pending_intent_is_not_adopted(tmp_path):
+    h = build_harness(tmp_path)
+    old_cid = make_client_order_id("oldsession", "entry", NOW, symbol=SYMBOL)
+    old = OrderRecord(
+        "old", old_cid, SYMBOL, "entry", "buy", 5.0, 5.0, "filled", 90.0,
+        submitted_at=NOW, updated_at=NOW,
+    )
+    h.broker.orders[old_cid] = old
+    h.store.record_order(old, "old-session")
+    h.broker.positions[SYMBOL] = BrokerPosition(
+        SYMBOL, 5.0, 110.0, 110.0, 550.0, 0.0, 0.0
+    )
+
+    with pytest.raises(BrokerError, match="did not open"):
+        h.engine._startup()
+    assert h.store.get_bot_position(SYMBOL) is None
+
+
+def test_running_engine_owns_immutable_configuration_snapshot(tmp_path):
+    h = build_harness(tmp_path)
+    original_symbol = h.strategy_cfg.symbol
+    original_risk = h.risk_cfg.risk_per_trade_pct
+    h.strategy_cfg.symbol = "CHANGED"
+    h.risk_cfg.risk_per_trade_pct = 9.0
+    h.engine_cfg.close_buffer_minutes = 1
+
+    assert h.engine.symbol == original_symbol
+    assert h.engine.strategy.config.symbol == original_symbol
+    assert h.engine.risk_manager.config.risk_per_trade_pct == original_risk
+    assert h.engine.engine_config.close_buffer_minutes == 30

@@ -156,6 +156,19 @@ class TestNoRepeatedBuy:
         assert decision.bullish_crossover is False
         assert decision.filters["trend"] is False
 
+    def test_ten_bars_remaining_bullish_emit_no_repeated_buy(self):
+        strategy = TrendStrategy(make_config())
+        rows = [dict(BASE_ROW) for _ in range(15)]
+        rows[4].update(short_ma=9.5, long_ma=10.0)
+        for i in range(5, 15):
+            rows[i].update(short_ma=10.5 + i / 100.0, long_ma=10.0)
+        frame = pd.DataFrame(
+            rows,
+            index=pd.date_range("2024-01-01", periods=15, freq="D", tz="UTC"),
+        )
+        actions = [strategy.generate_signal(frame.iloc[:i]).action for i in range(6, 16)]
+        assert actions == [BotAction.BUY] + [BotAction.HOLD] * 9
+
 
 class TestBearishCrossover:
     def test_exit_on_bearish_crossover(self):

@@ -58,6 +58,19 @@ class SleepRecorder:
         self.delays.append(seconds)
 
 
+class InterruptingSleep(SleepRecorder):
+    def __call__(self, seconds: float) -> bool:
+        self.delays.append(seconds)
+        return True
+
+
+def test_retry_backoff_can_be_interrupted_by_engine_stop_event():
+    sleeper = InterruptingSleep()
+    with pytest.raises(DataFeedError, match="interrupted"):
+        with_retries(lambda: (_ for _ in ()).throw(RuntimeError("down")), sleep_fn=sleeper)
+    assert sleeper.delays == [1.0]
+
+
 def _utc(*args) -> datetime:
     return datetime(*args, tzinfo=timezone.utc)
 
@@ -295,14 +308,14 @@ class TestNormalizeBarsDf:
                 "open": [100.0, 101.0, 102.0],
                 "high": [100.5, 101.5, 102.5],
                 "low": [99.5, 100.5, 101.5],
-                "close": [100.2, 101.2, 202.2],
+                "close": [100.2, 101.2, 102.2],
                 "volume": [1000.0, 2000.0, 3000.0],
             },
             index=index,
         )
         out = normalize_bars_df(df, "AAPL")
         assert len(out) == 2
-        assert out.loc[t2, "close"] == 202.2
+        assert out.loc[t2, "close"] == 102.2
         assert out.loc[t2, "volume"] == 3000.0
 
     def test_rows_with_non_positive_prices_dropped(self):
@@ -313,6 +326,21 @@ class TestNormalizeBarsDf:
         out = normalize_bars_df(plain, "AAPL")
         assert len(out) == 2
         assert (out[["open", "high", "low", "close"]] > 0).all().all()
+
+    def test_non_finite_and_internally_inconsistent_bars_are_dropped(self):
+        idx = pd.date_range("2026-08-10", periods=3, freq="min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "open": [100.0, 100.0, 100.0],
+                "high": [101.0, float("inf"), 99.0],
+                "low": [99.0, 99.0, 98.0],
+                "close": [100.5, 100.0, 100.0],
+                "volume": [1_000.0, 1_000.0, 1_000.0],
+            },
+            index=idx,
+        )
+        out = normalize_bars_df(df, "AAPL")
+        assert list(out.index) == [idx[0]]
 
     def test_rows_with_nans_dropped(self):
         df = _alpaca_style_frame("AAPL", extra_columns=False)
