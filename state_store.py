@@ -141,7 +141,10 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            # FULL, not NORMAL: the engine's crash-safety design requires
+            # the pending-order intent written BEFORE each broker submit to
+            # actually be on disk if power is lost right after the submit.
+            self._conn.execute("PRAGMA synchronous=FULL;")
             self._conn.executescript(_SCHEMA)
             trade_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
@@ -161,7 +164,65 @@ class StateStore:
 
     def close(self) -> None:
         with self._lock:
+            self.release_engine_lock()
             self._conn.close()
+
+    # ------------------------------------------------------------------
+    # Cross-process engine lock
+    # ------------------------------------------------------------------
+    #
+    # Exactly one live trading engine may run against one state database,
+    # across ALL processes.  An OS advisory lock on a sibling lockfile is
+    # held from engine startup to engine finalize; a second engine (second
+    # `streamlit run`, or an orphan left by a dev auto-reload) fails to
+    # acquire it and refuses to trade.  The lock dies with the process, so
+    # a crash can never leave it stuck.
+
+    def acquire_engine_lock(self) -> bool:
+        """Take the exclusive cross-process engine lock.  Non-blocking;
+        returns True on success, False when another engine holds it."""
+        with self._lock:
+            if self.db_path == ":memory:":
+                return True  # private database; nothing to protect
+            if getattr(self, "_engine_lock_file", None) is not None:
+                return False  # this store's engine already holds it
+            lock_path = self.db_path + ".engine.lock"
+            handle = open(lock_path, "a+")
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except ImportError:  # pragma: no cover — Windows
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                handle.close()
+                return False
+            self._engine_lock_file = handle
+            return True
+
+    def release_engine_lock(self) -> None:
+        """Release the engine lock if this store holds it.  Idempotent."""
+        with self._lock:
+            handle = getattr(self, "_engine_lock_file", None)
+            if handle is None:
+                return
+            self._engine_lock_file = None
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except ImportError:  # pragma: no cover — Windows
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                handle.close()
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Run one statement inside the lock and commit."""
@@ -254,14 +315,18 @@ class StateStore:
         sessions, so an engine restart can never act on the same bar twice.
         """
         with self._lock:
-            cur = self._conn.execute(
-                "INSERT OR IGNORE INTO processed_bars"
-                " (symbol, timeframe, bar_timestamp, session_id, processed_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (symbol, timeframe, _to_iso(bar_timestamp), session_id, _to_iso(_utc_now())),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+            try:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO processed_bars"
+                    " (symbol, timeframe, bar_timestamp, session_id, processed_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (symbol, timeframe, _to_iso(bar_timestamp), session_id, _to_iso(_utc_now())),
+                )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def is_bar_processed(self, symbol: str, timeframe: str, bar_timestamp: datetime) -> bool:
         rows = self._query(

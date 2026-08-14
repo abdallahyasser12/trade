@@ -113,3 +113,15 @@ def test_order_status_classification_matches_alpaca_lifecycle(status, terminal, 
     order = OrderRecord("b", "c", "SPY", "entry", "buy", 1, 0, status)
     assert order.is_terminal is terminal
     assert order.is_open is open_
+
+
+def test_order_status_sets_cover_installed_sdk_exactly_and_disjointly():
+    """If a future alpaca-py adds or renames an OrderStatus member, the
+    engine's terminal/open classification must be revisited — this guard
+    fails loudly instead of silently misclassifying."""
+    from alpaca.trading.enums import OrderStatus
+    from models import OPEN_ORDER_STATUSES, TERMINAL_ORDER_STATUSES
+
+    members = {m.value for m in OrderStatus}
+    assert TERMINAL_ORDER_STATUSES | OPEN_ORDER_STATUSES == members
+    assert not (TERMINAL_ORDER_STATUSES & OPEN_ORDER_STATUSES)

@@ -122,6 +122,15 @@ The process-level `EngineController` permits at most one active background engin
 Streamlit reruns cannot create a second stock or crypto loop. Start is idempotent and
 polling/backoff waits are interruptible.
 
+Exclusion also holds **across processes**: stock-engine startup takes an OS-level lock
+on a sibling of the SQLite file and holds it until shutdown, so a second app instance —
+or an engine orphaned by a source reload — refuses to trade against the same state
+database. The lock dies with its process, so a crash can never leave it stuck.
+
+After an emergency stop, daily-loss halt, or fatal error the kill switch is enforced by
+the stock engine itself, not only by the dashboard's Start button: startup refuses until
+the unclean stop is acknowledged.
+
 ## Stock strategy and execution
 
 The stock workspace remains the audited deterministic system:

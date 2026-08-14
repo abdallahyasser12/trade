@@ -66,15 +66,21 @@ def is_permanent_error(exc: Exception) -> bool:
     return code in (400, 401, 403, 404, 422)
 
 
+# Longest single backoff the engine will honor from a Retry-After header.
+# The engine's safety loop (fill/stop reconciliation) runs on the same
+# thread, so an unbounded server-supplied delay must never stall it.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
 def _retry_after_seconds(exc: Exception) -> Optional[float]:
-    """Honor the Retry-After header on 429 responses when present."""
+    """Honor the Retry-After header on 429 responses when present, bounded."""
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) if response is not None else None
     if headers:
         value = headers.get("Retry-After") or headers.get("retry-after")
         if value:
             try:
-                return max(0.0, float(value))
+                return min(MAX_RETRY_AFTER_SECONDS, max(0.0, float(value)))
             except (TypeError, ValueError):
                 return None
     return None
