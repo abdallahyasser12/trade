@@ -1,0 +1,25 @@
+name: Build production iOS app
+
+on:
+  workflow_dispatch:
+
+jobs:
+  eas-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-audit --no-fund
+      - name: Verify Expo project
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: npx eas-cli@latest project:info --non-interactive
+      - name: Queue signed production iOS build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: npx eas-cli@latest build --platform ios --profile production --non-interactive --no-wait
