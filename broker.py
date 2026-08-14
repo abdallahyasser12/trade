@@ -1,10 +1,11 @@
-"""Alpaca PAPER trading operations, isolated behind one class.
+"""Alpaca trading operations isolated behind an environment-verified boundary.
 
 Safety properties enforced here, by construction:
 
-* The trading client is created with ``paper=True`` and no URL override,
-  and ``verify_paper_account`` additionally asserts the client's base URL
-  is Alpaca's paper endpoint.  There is no live-trading switch anywhere.
+* The trading client receives an explicit paper/live enum and no URL override.
+  ``verify_account`` requires exact equality with Alpaca's official endpoint.
+* Live construction is disabled unless the process-level live feature flag is
+  explicitly enabled. Separate live credentials are loaded by ``config``.
 * Every order the bot creates carries a ``trendbot-`` client_order_id
   namespace; the broker only ever lists/cancels orders in that namespace.
 * ``submit_order`` returning is never treated as a fill — callers must
@@ -18,16 +19,20 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import math
+import re
 from typing import Optional
 
-from config import CLIENT_ORDER_PREFIX
+from config import AccountMode, CLIENT_ORDER_PREFIX, live_trading_enabled
 from models import AccountInfo, AssetInfo, BrokerPosition, MarketClock, OrderRecord
 
 logger = logging.getLogger(__name__)
 
-PAPER_HOST_FRAGMENT = "paper-api.alpaca.markets"
+PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+LIVE_BASE_URL = "https://api.alpaca.markets"
+PAPER_HOST_FRAGMENT = "paper-api.alpaca.markets"  # backwards-compatible import
+_CLIENT_SYMBOL_RE = re.compile(r"[^A-Z0-9]")
 
 
 class BrokerError(Exception):
@@ -53,7 +58,8 @@ def make_client_order_id(
     epoch = int(bar_timestamp.timestamp())
     if attempt < 1:
         raise ValueError("attempt must be >= 1")
-    middle = f"-{symbol}" if symbol else ""
+    symbol_token = _CLIENT_SYMBOL_RE.sub("", symbol.upper())[:10]
+    middle = f"-{symbol_token}" if symbol_token else ""
     attempt_token = ""
     value = attempt
     alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -103,6 +109,27 @@ def normalize_sell_stop_price(stop_price: float) -> float:
     return float(normalized)
 
 
+def normalize_to_increment(value: float, increment: float, *, round_up: bool) -> float:
+    """Normalize a positive finite value to an asset's dynamic increment."""
+
+    if not math.isfinite(value) or value <= 0:
+        raise BrokerError(f"Value must be finite and positive; received {value!r}.")
+    if not math.isfinite(increment) or increment <= 0:
+        raise BrokerError(f"Increment must be finite and positive; received {increment!r}.")
+    try:
+        raw = Decimal(str(value))
+        step = Decimal(str(increment))
+        units = (raw / step).to_integral_value(
+            rounding=ROUND_CEILING if round_up else ROUND_FLOOR
+        )
+        normalized = units * step
+    except InvalidOperation as exc:
+        raise BrokerError("Could not normalize value to Alpaca asset increment.") from exc
+    if normalized <= 0:
+        raise BrokerError("Increment normalization produced a zero value.")
+    return float(normalized)
+
+
 def order_to_record(order) -> OrderRecord:
     """Convert an alpaca-py Order model to the internal OrderRecord."""
     client_id = order.client_order_id or ""
@@ -126,28 +153,58 @@ def order_to_record(order) -> OrderRecord:
         status=status,
         fill_price=_float_or_none(order.filled_avg_price),
         stop_price=_float_or_none(order.stop_price),
+        limit_price=_float_or_none(getattr(order, "limit_price", None)),
         submitted_at=order.submitted_at,
         updated_at=order.updated_at,
     )
 
 
-class AlpacaPaperBroker:
-    """All Alpaca trading-API access for the bot.  Paper-only by design."""
+class AlpacaBroker:
+    """Alpaca boundary for one immutable, verified account environment."""
 
-    def __init__(self, api_key: str, secret_key: str):
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        account_mode: AccountMode | str = AccountMode.PAPER,
+        *,
+        max_live_order_notional: float = 1_000.0,
+    ):
         from alpaca.trading.client import TradingClient
 
         if not api_key or not secret_key:
             raise BrokerError("Alpaca API key and secret key are required.")
-        # paper=True is hardcoded on purpose; there is no live mode.
-        self._client = TradingClient(api_key=api_key, secret_key=secret_key, paper=True)
+        self._account_mode = AccountMode(account_mode)
+        if self._account_mode is AccountMode.LIVE:
+            if not live_trading_enabled():
+                raise BrokerError(
+                    "Live trading is disabled. Set ENABLE_LIVE_TRADING=true and restart "
+                    "before constructing a live broker."
+                )
+        if (
+            not math.isfinite(max_live_order_notional)
+            or max_live_order_notional <= 0
+            or max_live_order_notional > 10_000
+        ):
+            raise BrokerError("Live order notional cap must be in (0, $10,000].")
+        self._max_live_order_notional = float(max_live_order_notional)
+        # No URL override is accepted anywhere in this boundary.
+        self._client = TradingClient(
+            api_key=api_key,
+            secret_key=secret_key,
+            paper=self._account_mode is AccountMode.PAPER,
+        )
+
+    @property
+    def account_mode(self) -> AccountMode:
+        return self._account_mode
 
     # ------------------------------------------------------------------
     # Account / environment
     # ------------------------------------------------------------------
 
-    def verify_paper_account(self) -> AccountInfo:
-        """Verify credentials, account health and the PAPER environment.
+    def verify_account(self) -> AccountInfo:
+        """Verify credentials, account health, and the exact SDK environment.
 
         Raises BrokerError when any check fails; live execution must stay
         disabled in that case.
@@ -156,9 +213,15 @@ class AlpacaPaperBroker:
         # alpaca-py 0.44 stores this as a BaseURL enum whose ``str()`` is
         # "BaseURL.TRADING_PAPER", not the endpoint value.
         base_url = str(getattr(raw_base_url, "value", raw_base_url))
-        if PAPER_HOST_FRAGMENT not in base_url:
+        expected = (
+            PAPER_BASE_URL
+            if self._account_mode is AccountMode.PAPER
+            else LIVE_BASE_URL
+        )
+        if base_url.rstrip("/") != expected:
             raise BrokerError(
-                "Trading client is not pointed at the Alpaca paper endpoint — refusing to trade."
+                f"Trading client endpoint is {base_url!r}, not the required {expected!r}; "
+                "refusing to trade."
             )
         try:
             account = self.get_account()
@@ -171,6 +234,13 @@ class AlpacaPaperBroker:
         if account.trading_blocked:
             raise BrokerError("Alpaca reports trading is blocked on this account.")
         return account
+
+    def verify_paper_account(self) -> AccountInfo:
+        """Backwards-compatible paper-only verification used by the stock engine."""
+
+        if self._account_mode is not AccountMode.PAPER:
+            raise BrokerError("Paper-account verification cannot run in live mode.")
+        return self.verify_account()
 
     def get_account(self) -> AccountInfo:
         try:
@@ -220,7 +290,30 @@ class AlpacaPaperBroker:
             active=(status == "active"),
             fractionable=bool(asset.fractionable),
             asset_class=asset_class,
+            min_order_size=_float_or_none(getattr(asset, "min_order_size", None)),
+            min_trade_increment=_float_or_none(
+                getattr(asset, "min_trade_increment", None)
+            ),
+            price_increment=_float_or_none(getattr(asset, "price_increment", None)),
+            marginable=bool(getattr(asset, "marginable", False)),
+            shortable=bool(getattr(asset, "shortable", False)),
         )
+
+    def verify_crypto_assets(self, symbols: list[str] | tuple[str, ...]) -> dict[str, AssetInfo]:
+        """Resolve and validate every configured long-only spot asset."""
+
+        verified: dict[str, AssetInfo] = {}
+        for symbol in symbols:
+            asset = self.get_asset(symbol)
+            if not asset.is_supported_crypto:
+                raise BrokerError(
+                    f"{symbol} is not an active, tradable, fractionable, non-marginable "
+                    "Alpaca crypto asset."
+                )
+            if not asset.min_order_size or not asset.min_trade_increment or not asset.price_increment:
+                raise BrokerError(f"{symbol} is missing Alpaca's dynamic crypto increments.")
+            verified[symbol] = asset
+        return verified
 
     # ------------------------------------------------------------------
     # Positions
@@ -271,6 +364,11 @@ class AlpacaPaperBroker:
         from alpaca.trading.requests import MarketOrderRequest
 
         self._require_bot_id(client_order_id)
+        if getattr(self, "_account_mode", AccountMode.PAPER) is AccountMode.LIVE:
+            raise BrokerError(
+                "Live equity orders are not enabled by this extension; use the "
+                "guarded crypto workspace or the audited stock paper engine."
+            )
         if qty <= 0:
             raise BrokerError(f"Refusing to submit order with qty {qty}")
         normalized_side = side.lower()
@@ -306,6 +404,114 @@ class AlpacaPaperBroker:
             side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
             stop_price=normalized_stop,
+            client_order_id=client_order_id,
+        )
+        try:
+            order = self._client.submit_order(request)
+        except Exception as exc:
+            raise BrokerError(_sanitized_broker_message(exc)) from exc
+        return order_to_record(order)
+
+    def submit_crypto_market_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        client_order_id: str,
+        *,
+        trade_increment: float,
+        min_order_size: float,
+        reference_price: Optional[float] = None,
+    ) -> OrderRecord:
+        """Submit a fractional GTC crypto market order after boundary checks.
+
+        Buy notional is rechecked here in live mode. Risk-reducing sell exits are
+        deliberately not blocked by an order-notional cap.
+        """
+
+        from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+        from alpaca.trading.requests import MarketOrderRequest
+        from crypto_config import validate_crypto_symbol
+
+        self._require_bot_id(client_order_id)
+        error = validate_crypto_symbol(symbol)
+        if error:
+            raise BrokerError(error)
+        normalized_side = side.lower()
+        if normalized_side not in {"buy", "sell"}:
+            raise BrokerError(f"Unsupported order side {side!r}; expected 'buy' or 'sell'.")
+        normalized_qty = normalize_to_increment(qty, trade_increment, round_up=False)
+        if normalized_qty + (trade_increment / 10.0) < min_order_size:
+            raise BrokerError(
+                f"Crypto quantity {normalized_qty} is below Alpaca minimum {min_order_size}."
+            )
+        mode = getattr(self, "_account_mode", AccountMode.PAPER)
+        if mode is AccountMode.LIVE and normalized_side == "buy":
+            if reference_price is None or not math.isfinite(reference_price) or reference_price <= 0:
+                raise BrokerError("A positive reference price is required for a live crypto buy.")
+            notional = normalized_qty * reference_price
+            cap = getattr(self, "_max_live_order_notional", 0.0)
+            if notional > cap + 1e-9:
+                raise BrokerError(
+                    f"Live crypto buy notional ${notional:,.2f} exceeds hard cap ${cap:,.2f}."
+                )
+        request = MarketOrderRequest(
+            symbol=symbol,
+            qty=normalized_qty,
+            side=OrderSide.BUY if normalized_side == "buy" else OrderSide.SELL,
+            type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC,
+            client_order_id=client_order_id,
+        )
+        try:
+            order = self._client.submit_order(request)
+        except Exception as exc:
+            raise BrokerError(_sanitized_broker_message(exc)) from exc
+        return order_to_record(order)
+
+    def submit_crypto_stop_limit_order(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        limit_price: float,
+        client_order_id: str,
+        *,
+        trade_increment: float,
+        min_order_size: float,
+        price_increment: float,
+    ) -> OrderRecord:
+        """Submit a fractional GTC protective SELL stop-limit for spot crypto."""
+
+        from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+        from alpaca.trading.requests import StopLimitOrderRequest
+        from crypto_config import validate_crypto_symbol
+
+        self._require_bot_id(client_order_id)
+        error = validate_crypto_symbol(symbol)
+        if error:
+            raise BrokerError(error)
+        normalized_qty = normalize_to_increment(qty, trade_increment, round_up=False)
+        if normalized_qty + (trade_increment / 10.0) < min_order_size:
+            raise BrokerError(
+                f"Protective quantity {normalized_qty} is below Alpaca minimum {min_order_size}."
+            )
+        normalized_stop = normalize_to_increment(stop_price, price_increment, round_up=True)
+        normalized_limit = normalize_to_increment(limit_price, price_increment, round_up=False)
+        if normalized_limit >= normalized_stop:
+            normalized_limit = normalize_to_increment(
+                normalized_stop - price_increment, price_increment, round_up=False
+            )
+        if normalized_limit <= 0 or normalized_limit >= normalized_stop:
+            raise BrokerError("Protective sell stop-limit requires 0 < limit price < stop price.")
+        request = StopLimitOrderRequest(
+            symbol=symbol,
+            qty=normalized_qty,
+            side=OrderSide.SELL,
+            type=OrderType.STOP_LIMIT,
+            time_in_force=TimeInForce.GTC,
+            stop_price=normalized_stop,
+            limit_price=normalized_limit,
             client_order_id=client_order_id,
         )
         try:
@@ -375,6 +581,31 @@ class AlpacaPaperBroker:
             )
         if len(client_order_id) > 48:
             raise BrokerError("Client order id exceeds Alpaca's 48-character limit.")
+
+
+class AlpacaPaperBroker(AlpacaBroker):
+    """Compatibility-safe paper broker used by the audited stock engine."""
+
+    def __init__(self, api_key: str, secret_key: str):
+        super().__init__(api_key, secret_key, AccountMode.PAPER)
+
+
+class AlpacaLiveBroker(AlpacaBroker):
+    """Explicitly gated live broker used only by the crypto workspace."""
+
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        *,
+        max_live_order_notional: float = 1_000.0,
+    ):
+        super().__init__(
+            api_key,
+            secret_key,
+            AccountMode.LIVE,
+            max_live_order_notional=max_live_order_notional,
+        )
 
 
 def _sanitized_broker_message(exc: Exception) -> str:

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from config import DEFAULT_DB_PATH
+from config import CLIENT_ORDER_PREFIX, DEFAULT_DB_PATH
 from models import OrderRecord
 
 _SCHEMA = """
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS orders (
     status          TEXT NOT NULL,
     fill_price      REAL,
     stop_price      REAL,
+    limit_price     REAL,
     submitted_at    TEXT,
     updated_at      TEXT
 );
@@ -150,6 +151,11 @@ class StateStore:
             }
             if "event_key" not in trade_columns:
                 self._conn.execute("ALTER TABLE trades ADD COLUMN event_key TEXT")
+            order_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(orders)").fetchall()
+            }
+            if "limit_price" not in order_columns:
+                self._conn.execute("ALTER TABLE orders ADD COLUMN limit_price REAL")
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_event_key "
                 "ON trades (event_key) WHERE event_key IS NOT NULL"
@@ -353,14 +359,16 @@ class StateStore:
         self._execute(
             "INSERT INTO orders (client_order_id, broker_order_id, session_id, symbol,"
             " purpose, side, requested_qty, filled_qty, status, fill_price, stop_price,"
-            " submitted_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " limit_price, submitted_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(client_order_id) DO UPDATE SET"
             " broker_order_id = excluded.broker_order_id,"
+            " requested_qty = excluded.requested_qty,"
             " filled_qty = excluded.filled_qty,"
             " status = excluded.status,"
             " fill_price = excluded.fill_price,"
             " stop_price = excluded.stop_price,"
+            " limit_price = excluded.limit_price,"
             " updated_at = excluded.updated_at",
             (
                 order.client_order_id,
@@ -374,6 +382,7 @@ class StateStore:
                 order.status,
                 order.fill_price,
                 order.stop_price,
+                order.limit_price,
                 _to_iso(order.submitted_at),
                 _to_iso(order.updated_at or _utc_now()),
             ),
@@ -382,13 +391,15 @@ class StateStore:
     def update_order(self, order: OrderRecord) -> None:
         self._execute(
             "UPDATE orders SET broker_order_id = ?, filled_qty = ?, status = ?,"
-            " fill_price = ?, stop_price = ?, updated_at = ? WHERE client_order_id = ?",
+            " fill_price = ?, stop_price = ?, limit_price = ?, updated_at = ?"
+            " WHERE client_order_id = ?",
             (
                 order.broker_order_id,
                 order.filled_qty,
                 order.status,
                 order.fill_price,
                 order.stop_price,
+                order.limit_price,
                 _to_iso(order.updated_at or _utc_now()),
                 order.client_order_id,
             ),
@@ -406,6 +417,7 @@ class StateStore:
             status=row["status"],
             fill_price=row["fill_price"],
             stop_price=row["stop_price"],
+            limit_price=row["limit_price"],
             submitted_at=_from_iso(row["submitted_at"]),
             updated_at=_from_iso(row["updated_at"]),
         )
@@ -434,6 +446,21 @@ class StateStore:
             "SELECT 1 FROM orders WHERE client_order_id = ?", (client_order_id,)
         )
         return bool(rows)
+
+    def bot_net_filled_qty(self, symbol: str) -> float:
+        """Net bot-owned broker fills for a symbol across the full database.
+
+        This is used only as an ownership proof during restart recovery. It is
+        intentionally not a substitute for the broker's current position quantity.
+        """
+
+        rows = self._query(
+            "SELECT COALESCE(SUM(CASE WHEN lower(side) = 'buy' THEN filled_qty "
+            "ELSE -filled_qty END), 0) AS net_qty FROM orders "
+            "WHERE symbol = ? AND client_order_id LIKE ?",
+            (symbol, f"{CLIENT_ORDER_PREFIX}-%"),
+        )
+        return float(rows[0]["net_qty"]) if rows else 0.0
 
     # ------------------------------------------------------------------
     # Trades (fill events)

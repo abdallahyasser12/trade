@@ -54,6 +54,7 @@ class RiskManager:
         buying_power: float,
         entry_price: float,
         stop_price: float,
+        risk_scale: float = 1.0,
     ) -> PositionSizeResult:
         """Size a long entry from risk budget, exposure cap and buying power.
 
@@ -84,9 +85,11 @@ class RiskManager:
             return rejected("invalid_stop_price")
         if not math.isfinite(buying_power) or buying_power <= 0:
             return rejected("no_buying_power")
+        if not math.isfinite(risk_scale) or not (0.0 < risk_scale <= 1.0):
+            return rejected("invalid_risk_scale")
 
         risk_per_share = entry_price - stop_price
-        risk_budget = equity * (cfg.risk_per_trade_pct / 100.0)
+        risk_budget = equity * (cfg.risk_per_trade_pct / 100.0) * risk_scale
         shares_by_risk = math.floor(risk_budget / risk_per_share)
 
         max_position_value = equity * (cfg.max_position_pct / 100.0)
@@ -114,6 +117,97 @@ class RiskManager:
             rejection_reason=None,
             **caps,
         )
+
+    def calculate_risk_scale(
+        self,
+        starting_equity: float,
+        current_equity: float,
+        peak_equity: float,
+        atr_percentile: float | None,
+    ) -> float:
+        """Return a conservative risk multiplier in ``[min_scale, 1]``.
+
+        The multiplier can only reduce the configured risk budget.  It is
+        reduced linearly after portfolio drawdown crosses the configured soft
+        threshold, and after ATR percentile exceeds the volatility target.
+        The harsher of the two controls wins; their product is deliberately
+        avoided because it can collapse sizing unpredictably.
+        """
+        cfg = self.config
+        if not cfg.enable_adaptive_risk:
+            return 1.0
+        values = (starting_equity, current_equity, peak_equity)
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            return cfg.min_risk_scale
+
+        reference_peak = max(starting_equity, peak_equity)
+        drawdown_pct = max(
+            0.0, (reference_peak - current_equity) / reference_peak * 100.0
+        )
+        soft = cfg.drawdown_risk_reduction_start_pct
+        hard = cfg.max_daily_loss_pct
+        if drawdown_pct <= soft:
+            drawdown_scale = 1.0
+        elif drawdown_pct >= hard:
+            drawdown_scale = cfg.min_risk_scale
+        else:
+            progress = (drawdown_pct - soft) / (hard - soft)
+            drawdown_scale = 1.0 - progress * (1.0 - cfg.min_risk_scale)
+
+        volatility_scale = 1.0
+        if atr_percentile is not None and math.isfinite(atr_percentile):
+            target = cfg.volatility_target_percentile
+            bounded = min(100.0, max(0.0, atr_percentile))
+            if bounded > target:
+                progress = (bounded - target) / max(1e-12, 100.0 - target)
+                volatility_scale = 1.0 - progress * (1.0 - cfg.min_risk_scale)
+
+        return max(
+            cfg.min_risk_scale,
+            min(1.0, drawdown_scale, volatility_scale),
+        )
+
+    def calculate_ratchet_stop(
+        self,
+        *,
+        entry_price: float,
+        initial_stop_price: float,
+        current_stop_price: float,
+        highest_close: float,
+        atr_value: float,
+        trailing_atr_multiplier: float,
+        enable_break_even: bool = False,
+        break_even_trigger_r: float = 1.0,
+    ) -> float:
+        """Return a long stop that may tighten but can never loosen.
+
+        The trailing candidate uses only completed-bar closes and the ATR on
+        that completed bar.  Break-even is activated only after the highest
+        completed close has advanced by the requested multiple of initial
+        risk.  The caller applies the returned stop to *future* execution;
+        it must never retroactively test it against the bar that created it.
+        """
+        for label, value in {
+            "entry_price": entry_price,
+            "initial_stop_price": initial_stop_price,
+            "current_stop_price": current_stop_price,
+            "highest_close": highest_close,
+            "atr_value": atr_value,
+            "trailing_atr_multiplier": trailing_atr_multiplier,
+            "break_even_trigger_r": break_even_trigger_r,
+        }.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{label} must be positive and finite")
+        if initial_stop_price >= entry_price:
+            raise ValueError("initial stop must be below entry price")
+
+        candidate = highest_close - atr_value * trailing_atr_multiplier
+        next_stop = max(initial_stop_price, current_stop_price, candidate)
+        if enable_break_even:
+            initial_risk = entry_price - initial_stop_price
+            if highest_close >= entry_price + initial_risk * break_even_trigger_r:
+                next_stop = max(next_stop, entry_price)
+        return next_stop
 
     def session_loss_pct(self, starting_equity: float, current_equity: float) -> float:
         """Loss since session start as a positive percentage (gain -> <= 0)."""

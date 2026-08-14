@@ -1,356 +1,340 @@
-# Trend Bot — Alpaca Paper Trading (Educational)
+# Trend & Crypto Bot — Alpaca
 
-A deterministic, long-only trading bot for **Alpaca PAPER trading**, with a Streamlit
-dashboard. It exists so you can experiment with a fixed, rule-based strategy — backtest it
-on historical data, then watch the exact same rules run against Alpaca's simulated paper
-market — without any real money involved.
+A deterministic, long-only trading research and execution application with a
+Streamlit dashboard, Alpaca `alpaca-py`, chronological backtests, walk-forward
+promotion gates, SQLite recovery state, and background engines.
 
-**Paper-only by design.** The broker client is created with `paper=True` and no URL
-override, and at startup it additionally verifies that it is pointed at
-`paper-api.alpaca.markets` before doing anything. There is no live-trading switch anywhere
-in the code. This is an educational tool for learning how a mechanical strategy behaves;
-it is not a product for trading real money.
+The repository contains two deliberately separate workspaces:
 
----
+- **US stocks:** the independently audited moving-average trend bot remains
+  **Alpaca paper-only**.
+- **Spot crypto:** a 24/7 multi-asset regime/breakout system defaults to paper and
+  exposes an explicitly gated live-account mode. Live mode uses real money and is
+  disabled in a normal installation.
 
-## Important Warning
+No strategy is guaranteed to make money. Historical or paper performance is not a
+forecast. Crypto can move sharply, liquidity can disappear, and Alpaca crypto
+stop-limit orders can remain unfilled through a gap. This software is not investment
+advice and is not described as live-money production-ready merely because live API
+access exists.
 
-- This project is **educational** and works **only** with Alpaca **paper** (simulated)
-  trading. No real money is ever at risk while using it as shipped.
-- **No strategy guarantees profit.** This one applies a handful of fixed mathematical
-  rules; it can and will lose (simulated) money in many market conditions.
-- **Historical performance does not predict future performance.** A backtest that looks
-  good over one period says nothing about the next period.
-- **Backtests differ materially from live trading.** Real markets involve slippage,
-  partial fills, liquidity gaps, data outages, and fees that a simulation only
-  approximates (see "Why paper and backtest results differ from real trading" below).
-- Do **not** adapt this code for live money unless you independently understand every
-  rule, every assumption, and every failure mode, and accept all of the risks yourself.
+The implemented stock design is documented in
+[`SMART_STRATEGY_PLAN.md`](SMART_STRATEGY_PLAN.md). The crypto architecture, safety
+boundary, execution model, and acceptance gates are documented in
+[`CRYPTO_TRADING_PLAN.md`](CRYPTO_TRADING_PLAN.md).
 
-## What this bot does NOT do
+## Installation
 
-- It does **not** predict the market. It reacts to past prices with fixed arithmetic.
-- It does **not** learn or adapt. The rules never change while it runs.
-- It knows **nothing** about news, earnings, fundamentals, or anything outside the
-  price/volume bars it downloads.
-- It applies exactly **four fixed mathematical rules** — a moving-average crossover, an
-  RSI entry filter, a volume confirmation, and an ATR-based volatility filter/stop — and
-  nothing else.
-- There is **no AI or machine learning anywhere** in this project.
+Requirements:
 
----
-
-## How the strategy works (in plain language)
-
-All decisions are made on **completed** price bars (never a bar that is still forming),
-for **one symbol at a time**, and the bot only ever goes **long** (buys shares hoping to
-sell them later; it never bets on prices falling).
-
-### 1. Moving averages detect a change in trend
-
-A moving average smooths price by averaging the last N closing prices (defaults: 20 bars
-for the "short" average, 50 for the "long" one). The entry trigger is a **new crossover**,
-not merely "short average is above long average":
-
-- **BUY signal:** on the previous bar `short MA <= long MA`, and on the current bar
-  `short MA > long MA`. The short average has just crossed above the long one.
-- **EXIT signal:** the mirror image — previous bar `short MA >= long MA`, current bar
-  `short MA < long MA`.
-
-Requiring a *new* cross means the bot buys at most once per trend change instead of
-buying again on every bar of an existing uptrend.
-
-### 2. RSI avoids chasing an overextended move (entry filter only)
-
-RSI (Relative Strength Index) scores recent momentum from 0 to 100. A crossover that
-happens after price has already surged tends to arrive "stretched", so the bot only takes
-a BUY signal when **RSI is below the overbought threshold (default 70)**. RSI is **only an
-entry filter — there is no RSI-based exit rule**. Positions are exited by the bearish
-crossover or the protective stop, never by RSI.
-
-### 3. Volume confirmation
-
-A crossover on unusually thin trading is treated as weaker evidence. An entry additionally
-requires the current bar's **volume >= its rolling average volume × a multiplier**
-(defaults: 20-bar average, multiplier 1.0). Note the free-tier data caveat below — IEX
-volume is only a fraction of total market volume.
-
-### 4. ATR measures volatility and sets the protective stop
-
-ATR (Average True Range) is the typical size of a bar's price movement — a volatility
-yardstick. It is used twice:
-
-- **Volatility filter (optional, on by default):** entries are skipped when the current
-  ATR sits above the 90th percentile of its own recent history — i.e. when the market is
-  unusually turbulent for this symbol.
-- **Protective stop:** immediately after an entry fills, the bot places a broker-side
-  stop-loss order at `stop = fill price − ATR × multiplier` (default multiplier 2.0).
-  The stop is **fixed from entry — it never trails** upward as price moves.
-
-### 5. Position sizing works backward from the stop distance
-
-The bot computes three independent share caps and takes the smallest:
-
-1. **Risk-budget shares:** `floor(equity × risk% ÷ (entry − stop))` — if the stop fills,
-   the loss is at most the configured percentage of equity (default 1%).
-2. **Exposure-cap shares:** `floor(equity × max position% ÷ entry price)` (default 20%).
-3. **Buying-power shares:** `floor(buying power ÷ entry price)`.
-
-Quantities are **whole shares only, always rounded down (floored), never up** — rounding
-up would silently increase risk just to force a trade. Fractional shares are deliberately
-not used, even for symbols that support them: whole-share floor arithmetic keeps sizing
-simple, auditable, and conservative. Entries that come out at 0 shares, below the minimum
-share count, or below the minimum position value are rejected rather than resized.
-
----
-
-## Requirements & setup
-
-- **Python 3.11 or newer**
-- A free Alpaca account with **paper trading** API keys
+- Python 3.11 or newer
+- Alpaca paper credentials for paper order execution
+- Separate Alpaca live credentials only if you deliberately enable crypto live mode
 
 ```bash
-# 1. Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate          # macOS / Linux
-# .venv\Scripts\activate           # Windows
-
-# 2. Install dependencies
+source .venv/bin/activate
 pip install -r requirements.txt
-
-# 3. Configure credentials
 cp .env.example .env
-# Edit .env and set ALPACA_API_KEY and ALPACA_SECRET_KEY
-# (use PAPER keys, from the Alpaca dashboard -> Paper Trading -> API Keys)
-
-# 4. Launch the dashboard
 streamlit run app.py
 ```
 
-Your browser opens the local dashboard automatically (typically at
-`http://localhost:8501`). Credentials stay in the local `.env` file; the app never
-displays or logs the secret key.
-
-Run the test suite with:
+Run verification with:
 
 ```bash
+python -m compileall .
 python -m pytest -q
 ```
 
-## Recommended workflow
+Do not commit `.env`, SQLite databases, API keys, virtual environments, or generated
+caches.
 
-1. **Configure** — on the *Configure & Backtest* tab, pick a symbol, timeframe, indicator
-   periods, and risk limits.
-2. **Backtest** — run a historical simulation over your chosen date range.
-3. **Inspect the drawdown and the trade list** — look at the worst peak-to-trough equity
-   drop and read through individual trades, not just the summary numbers.
-4. **Understand the assumptions** — expand the "Simulation assumptions" panel and read the
-   execution/backtest assumptions below until nothing surprises you.
-5. **Switch to the *Run Live (Paper)* tab.**
-6. **Confirm the PAPER TRADING banner** is visible — it is shown in the sidebar and on the
-   live tab.
-7. **Choose a short runtime first** (e.g. a fixed duration of one hour) rather than
-   "until I stop it".
-8. **Start the bot.**
-9. **Observe** — watch the latest signal panel (each filter shows PASS/FAIL), orders,
-   fills, and the session equity curve.
-10. **Stop safely** with the *Stop Bot* button; use *EMERGENCY STOP* only when you want
-    the engine terminated immediately.
+## Credentials and account modes
 
-Note: a session's configuration is **frozen at start** — to change parameters, stop the
-bot and start a new session.
+Paper keys use the namespaced variables below. The legacy paper names remain supported
+so existing installations continue to work:
 
----
+```dotenv
+ALPACA_PAPER_API_KEY=
+ALPACA_PAPER_SECRET_KEY=
 
-## Architecture
-
-```
-Streamlit UI -> Configuration -> TrendStrategy + RiskManager -> Backtest or TradeEngine ->
-AlpacaPaperBroker / AlpacaDataFeed -> SQLite StateStore -> Dashboard
+# Legacy paper aliases:
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
 ```
 
-`TrendStrategy` and `RiskManager` are the **same classes** in both the backtester and the
-live engine — a single implementation of the rules, with tests asserting decision parity.
-There is no separate "live version" of the strategy that could drift from what you
-backtested.
+Crypto live mode requires all three separate settings:
+
+```dotenv
+ENABLE_LIVE_TRADING=true
+ALPACA_LIVE_API_KEY=
+ALPACA_LIVE_SECRET_KEY=
+```
+
+Paper credentials are never used as live credentials. The broker accepts no URL
+override. Before Start, it compares the SDK's base URL for exact equality with either
+`https://paper-api.alpaca.markets` or `https://api.alpaca.markets`, then requires an
+ACTIVE, unblocked account.
+
+The Streamlit live switch is intentionally more than one click. It requires the
+deployment flag, separate keys, an inactive engine, a checked risk acknowledgement,
+the exact typed phrase `LIVE`, account verification, crypto asset verification, and
+hard live notional/exposure caps. The unlock exists only in the current Streamlit
+process and is cleared on mode change or restart. A red **LIVE ACCOUNT — REAL MONEY**
+banner is always rendered in that mode.
+
+## Recommended operating sequence
+
+1. Start in Paper mode.
+2. Configure a small USD crypto universe and realistic nonzero fees, spread, and
+   slippage.
+3. Run the causal portfolio backtest over enough history for indicator warmup.
+4. Inspect individual trades, drawdown, exposure time, fee burden, and the BTC
+   benchmark—not only total return.
+5. Run bounded chronological walk-forward research with at least three non-overlapping
+   test folds.
+6. Reject the configuration if any promotion gate fails.
+7. If every gate passes, freeze it and run supervised paper trading through different
+   market regimes. Compare observed fills and reconciliation behavior with simulation.
+8. Keep live mode disabled until independent review, operational monitoring, and a
+   personally acceptable loss budget are in place.
+
+Walk-forward PASS means only “eligible for controlled paper testing.” The application
+never copies a selected candidate into a running engine or unlocks live trading.
+
+## Runtime architecture
+
+```text
+Streamlit
+  |-- Stock configuration -> TrendStrategy + RiskManager
+  |                         -> Backtester OR paper TradeEngine
+  |                         -> AlpacaPaperBroker / StockDataFeed
+  |
+  `-- Crypto configuration + frozen AccountMode
+                            -> CryptoRegimeStrategy + CryptoRiskManager
+                            -> CryptoBacktester / WalkForward / CryptoTradeEngine
+                            -> AlpacaBroker / CryptoDataFeed
+
+All engines -> StateStore -> SQLite -> dashboard state/logs
+```
+
+The process-level `EngineController` permits at most one active background engine, so
+Streamlit reruns cannot create a second stock or crypto loop. Start is idempotent and
+polling/backoff waits are interruptible.
+
+Exclusion also holds **across processes**: stock-engine startup takes an OS-level lock
+on a sibling of the SQLite file and holds it until shutdown, so a second app instance —
+or an engine orphaned by a source reload — refuses to trade against the same state
+database. The lock dies with its process, so a crash can never leave it stuck.
+
+After an emergency stop, daily-loss halt, or fatal error the kill switch is enforced by
+the stock engine itself, not only by the dashboard's Start button: startup refuses until
+the unclean stop is acknowledged.
+
+## Stock strategy and execution
+
+The stock workspace remains the audited deterministic system:
+
+- A BUY needs a **fresh** crossover: previous short MA <= previous long MA and current
+  short MA > current long MA.
+- EXIT is the exact mirror: previous short MA >= previous long MA and current short MA
+  < current long MA.
+- RSI, volume, ATR percentile, ADX, Kaufman efficiency, broad-market regime, and
+  relative strength provide causal confirmation.
+- Risk sizing is the minimum of risk-at-stop, exposure, and buying-power shares.
+- Fills are reconciled before local position state becomes authoritative; partial fills
+  are protected at broker-reported quantity.
+- Stock decisions use completed regular-session bars and Alpaca's market clock. New
+  entries fail closed on market-status, stale-data, benchmark, or clock-skew errors.
+
+The stock trading client is always constructed with `paper=True`; the crypto account
+switch cannot redirect the stock engine to live money.
+
+## Crypto analyst model
+
+The crypto system is deterministic and long-only spot. It does not use leverage,
+shorting, martingale, grid averaging, averaging down, mutable online learning, an LLM,
+or news sentiment to place orders.
+
+For each configured USD pair it calculates, from completed bars only:
+
+- fast, slow, and BTC benchmark regime moving averages;
+- RSI with Wilder smoothing;
+- ATR with Wilder smoothing and a causal ATR percentile;
+- ADX with Wilder smoothing;
+- Kaufman path-efficiency ratio;
+- relative volume, momentum, and BTC-relative strength;
+- a prior-window Donchian high computed with `close.shift(1)`.
+
+A long entry requires a **new** breakout transition plus fast/slow trend, rising BTC
+regime, RSI band, ADX, efficiency, nonzero-volume confirmation, positive momentum,
+volatility, and relative-strength filters. Simultaneous candidates receive a stable
+cross-sectional score and symbol tie-break. Remaining in an uptrend alone does not emit
+BUY repeatedly.
+
+Held positions exit on fast-trend failure, benchmark-regime failure, or volatility
+stress. Initial stop arithmetic is based on the actual fill and signal-bar ATR. A
+completed-bar trailing stop can only tighten and first applies to a future bar.
+
+## Crypto portfolio risk
+
+Fractional sizing is floored to Alpaca's asset-specific `min_trade_increment` and must
+also meet the dynamic `min_order_size` and configured minimum notional. Quantity is the
+minimum allowed by:
+
+```text
+risk budget / (entry - stop)
+per-position exposure / entry
+remaining total portfolio exposure / entry
+cash and buying power / entry
+live order-notional cap / entry          # live buys only
+```
+
+Risk is scaled down as peak-equity drawdown or ATR percentile rises; it never scales
+above the configured base. Maximum concurrent positions and a trailing-return
+correlation gate reduce concentration. Missing correlation evidence fails closed.
+
+The session-loss latch triggers at the exact configured threshold and cannot silently
+reactivate if equity later rebounds. It blocks new entries while reconciliation,
+protective stops, and exits continue.
+
+## Crypto order lifecycle and recovery
+
+Alpaca supports crypto market, limit, and stop-limit orders with GTC/IOC time in force.
+This implementation uses fractional GTC market orders and GTC sell stop-limit protection.
+
+- Submitting an order is never treated as a fill.
+- Every order carries a deterministic, <=48-character `trendbot-` client ID containing
+  a sanitized symbol, purpose, session namespace, and bar/attempt identity.
+- If submission times out after broker acceptance, the engine queries that exact client
+  ID before doing anything else. Reprocessing the same bar reuses the same economic ID.
+- A GTC entry that remains incomplete beyond the configured timeout is canceled and
+  confirmed so it cannot fill long after the signal; any raced partial fill is then
+  reconciled and protected.
+- Broker-reported fill quantity and average price are authoritative. Incremental fill
+  events are persisted idempotently.
+- A partially filled BUY is protected at the filled broker quantity. If more shares
+  fill, the old bot-owned stop is canceled and confirmed before a correctly sized stop
+  replaces it.
+- Before a strategy market EXIT, the engine cancels and confirms its protective stop,
+  then re-reads position quantity. A stop fill racing with cancellation therefore
+  reduces or eliminates the exit instead of creating an oversized sell or short.
+- The bot lists/cancels only orders in its own `trendbot-` namespace and cancels them
+  individually. It never performs account-wide cancellation.
+
+A stop-limit can trigger but fail to execute if price moves below its limit. The 24/7
+watchdog records the first breach, waits the configured grace period, refreshes the
+order, cancels and confirms only that bot-owned stop, re-reads broker quantity, and
+submits one deterministic market exit for the remaining long quantity. That reduces
+risk but cannot guarantee a price or protect against an Alpaca/API/network outage.
+
+On restart, broker truth wins:
+
+- persisted position + matching broker position/stop is reconciled and retained;
+- a broker-flat symbol clears local position state and cancels an orphan bot stop;
+- a broker position without local state is adopted only when refreshed bot-owned fills
+  prove that exact net quantity;
+- an unexplained/manual position causes startup to fail rather than being traded;
+- a pending order is refreshed by its deterministic client ID before another economic
+  intent is considered.
+
+## Historical simulation
+
+Both stock and crypto backtests enforce the same causality rule:
+
+```text
+bar N closes
+-> indicators and signal use data <= N
+-> execution occurs no earlier than bar N+1 open
+```
+
+For a long stop `S`, if the next bar opens at or below `S`, the simulated fill is the
+adverse open after sell costs—not `S`. Otherwise an intrabar low touching `S` fills at
+`S` after sell costs. Trailing levels calculated after bar N cannot trigger against bar
+N's low.
+
+The crypto simulator models cash, fractional quantity, directional slippage, half-spread
+on each side, percentage taker fees, multiple open positions, and forced final
+liquidation. Equity is `cash + market value(open positions)` exactly once. Realized P&L
+subtracts entry and exit fees exactly once.
+
+The walk-forward protocol selects a bounded candidate grid using training data only,
+skips an embargo bar, evaluates non-overlapping test windows, compares the fixed
+baseline, and reruns with stressed costs. Promotion has independent gates for fold/trade
+count, positive-fold ratio, compounded and excess return, Sharpe, profit factor,
+drawdown, and stressed return. One score cannot hide a failed gate.
+
+## Persistence and security
+
+`StateStore` uses SQLite WAL mode, a shared connection guarded by an `RLock`, short
+transactions with rollback, timezone-aware ISO timestamps, and uniqueness constraints
+for processed bars, client order IDs, and fill event keys. Streamlit session state is
+never authoritative for positions or orders; the live unlock is intentionally the only
+ephemeral safety acknowledgement.
+
+API secrets are loaded only from environment variables. They are never rendered,
+logged, written to SQLite, included in configuration snapshots, or used in result
+fingerprints. Broker error messages are sanitized. The application uses no `eval`,
+`exec`, shell command, or symbol-derived filesystem operation.
+
+## Important limitations
+
+- Profit is not promised. A strategy can pass every historical gate and still lose.
+- The live engine uses completed-bar REST polling and latest quote snapshots, not a
+  co-located low-latency execution stack. It is unsuitable for latency-sensitive
+  scalping.
+- Bar-volume zero can represent a midpoint-derived Alpaca crypto bar. The price bar is
+  retained for continuity but fails the entry liquidity filter.
+- The backtest cannot reproduce queue position, order-book impact, partial fills,
+  exchange outages, fee-tier changes, or stop-limit nonexecution exactly.
+- Crypto is 24/7, but Alpaca maintenance or API/data outages can still prevent an exit.
+  Broker-side protection and the watchdog reduce risk; they do not eliminate it.
+- Manually altering bot positions or orders while an engine runs can trigger a fail-safe
+  halt. Stop the engine before manual account intervention whenever possible.
+- Live configuration is a capability for explicitly authorized controlled use, not a
+  certification that the repository is suitable for unattended live-money operation.
+
+## Files
 
 | File | Responsibility |
 | --- | --- |
-| `app.py` | Streamlit dashboard: configuration forms, backtest results, live controls, logs. Presentation only — no trading logic. |
-| `config.py` | Typed configuration objects, validation, timeframe mapping, `.env` credential loading. |
-| `indicators.py` | Deterministic, causal indicator math (SMA, Wilder RSI, ATR, volume ratio, ATR percentile). |
-| `strategy.py` | `TrendStrategy` — the only implementation of the trading rules. |
-| `risk_manager.py` | `RiskManager` — stop price, position sizing, session loss limit. |
-| `backtest.py` | Historical simulation and statistics (drawdown, Sharpe, win rate). |
-| `trade_engine.py` | Live paper-trading loop: polling, order lifecycle, reconciliation, safety guards. |
-| `broker.py` | All Alpaca trading-API access; hardcodes the paper endpoint; only touches orders in its own `trendbot-` namespace. |
-| `data_feed.py` | Historical/recent bars, completed-bar detection, staleness rules, retry/backoff. |
-| `state_store.py` | SQLite persistence (sessions, orders, trades, equity, logs) shared by engine and UI. |
-| `models.py` | Shared dataclasses and enums. |
-
-## Execution and backtest assumptions
-
-The backtest is honest about what it can and cannot know:
-
-- **Next-bar execution:** a signal generated on completed bar N fills at bar N+1's
-  **open** — never at bar N's close, which the strategy could not have traded at.
-- **Conservative stop fills:** if a bar *opens* at or below the stop (a gap), the fill is
-  the open price — you do **not** get the stop price; otherwise, if the bar's low touches
-  the stop, the fill is the stop price capped at the bar's open (a stop exit is never
-  booked at a better price than the bar opened at, which matters on the entry bar itself
-  when slippage is configured).
-- **Directional slippage:** buys fill slightly higher, sells slightly lower — slippage
-  always works against you.
-- **Slippage and commission are configurable and default to 0**, and that assumption is
-  stated in the results panel. Zero-cost fills are optimistic; try nonzero values.
-- **Split-adjusted bars:** without adjustment, a stock split (say 4-for-1) makes the price
-  chart drop 75% overnight and creates fake crossovers; split adjustment removes these
-  artifacts.
-- **Completed (closed) bars only**, in both backtest and live — the bot never acts on a
-  bar that is still forming.
-- **Regular market hours only:** the live engine trades only while the market is open; no
-  extended-hours trading.
-- **One symbol per session**, and the configuration is frozen once a session starts.
-- The backtest models a **cash account**: buying power equals cash, whole shares only.
-
-## Why paper and backtest results differ from real trading
-
-- **Fills and slippage:** a simulation fills you at a clean reference price; real markets
-  fill you at whatever the order book offers at that instant.
-- **Liquidity and partial fills:** large orders (or thin symbols) may fill in pieces at
-  worsening prices, or not at all. The engine handles partial fills, but a backtest
-  assumes complete fills.
-- **Outages and delays:** data feeds stall, brokers rate-limit, clocks drift. The engine
-  guards against these (see below) by *not trading*, which a backtest never has to do.
-- **IEX vs SIP data:** Alpaca's **free tier serves IEX data only** — one exchange, a
-  fraction of consolidated (SIP) market volume. This matters here because the **volume
-  confirmation filter** compares bar volume to its average: on IEX both numbers are small
-  and their ratio behaves differently than volume figures you might see on other
-  platforms or charting tools. The feed is configurable (`iex`/`sip`; SIP requires a paid
-  data subscription) and the active feed is shown in the sidebar.
-
-## Pattern Day Trading (PDT), for beginners
-
-FINRA (the US brokerage regulator) flags an account as a **pattern day trader** when it
-makes **4 or more day trades within 5 business days** (a day trade = buying and selling
-the same symbol in the same day) while holding **under $25,000** in equity. Flagged
-accounts face trading restrictions. Alpaca's paper environment **simulates this rule**, so
-you can learn about it safely.
-
-The bot's handling: on intraday timeframes, when account equity is below $25,000 and the
-account is flagged or already has 3 day trades in the rolling window, new entries are
-**blocked with reason `pdt_restriction`** rather than risking a fourth. The dashboard's
-live tab shows the account's PDT flag and current day-trade count.
-
-## Safety behaviors
-
-- **Session loss halt:** when equity falls a configured percentage (default 3%) below the
-  session's starting equity, the bot **halts new entries** and stops the session. It does
-  **not** auto-liquidate — an open position and its broker-side protective stop are left
-  in place.
-- **Emergency Stop leaves the protective stop in place.** This is deliberate: the stop
-  order lives at the broker (GTC), so an open position keeps its downside protection even
-  after the engine process is gone.
-- **Unclean-stop acknowledgement:** after an emergency stop, a session loss halt, or a
-  fatal error, a persisted "kill switch" prevents restarting until you review the state
-  and click the acknowledgement button in the UI.
-- **Position ownership boundary:** the bot refuses to start if a position already exists
-  in the configured symbol that it did not open. It only manages positions and orders it
-  created (all its orders carry a `trendbot-` client-order-id prefix).
-- **Partial-fill containment:** after an entry partially fills, the filled quantity is
-  persisted and protected, the unfilled remainder is canceled, and any fill that races
-  with cancellation causes the stop to be replaced at the exact final quantity. Partial
-  exits and stop fills use cumulative-fill accounting so the bot never sells more than
-  broker-reported position truth.
-- **Exact stop ownership and quantity:** restart reconciliation adopts only a bot-owned
-  sell stop whose remaining quantity exactly matches the bot position. Duplicate,
-  wrong-side, or mismatched bot stops are canceled individually; unrelated orders are
-  never canceled.
-- **Entries blocked near the close:** by default, no new entries in the final 30 minutes
-  of the regular session (configurable).
-- **Optional flat-before-close (off by default):** when off, positions are held overnight
-  and exposed to **opening-gap risk** — the next day's open can be far from the stop
-  price, and a gap through the stop fills at the worse open price. When on, the bot sells
-  its position shortly before the close.
-- **Clock-skew guard:** if the local clock disagrees with Alpaca's by more than a
-  threshold (default 30 s), trading pauses — bar-completion logic depends on local time.
-- **Stale-data guard:** if the newest completed bar is too old (default: 3 bar-lengths
-  intraday), the bot skips the trading decision instead of acting on outdated prices.
-- **Single engine per state database:** engine startup takes an OS-level lock on a
-  sibling of the SQLite file and holds it until shutdown. A second app instance (or an
-  engine orphaned by a source reload) refuses to trade against the same database. The
-  lock dies with its process, so a crash can never leave it stuck.
-- **Kill switch enforced by the engine:** after an emergency stop, daily-loss halt, or
-  fatal error, the engine itself refuses to start until the unclean stop is
-  acknowledged in the dashboard — not just the Start button.
-- Other engine invariants: each bar is processed at most once (persisted across
-  restarts), the same submission attempt has a deterministic order ID while a confirmed
-  terminal retry gets a distinct bounded ID, and fills are always confirmed from broker
-  state before any dependent action.
-
-## Glossary
-
-- **Moving average (MA):** the average of the last N closing prices; smooths out noise to
-  show the general direction.
-- **Crossover:** the moment one moving average moves from one side of another to the
-  other side — used here as a trend-change trigger.
-- **RSI (Relative Strength Index):** a 0–100 momentum score; high values mean price has
-  recently risen a lot relative to its declines.
-- **ATR (Average True Range):** the typical size of a bar's price movement; a measure of
-  volatility.
-- **Stop loss:** a resting order to sell if price falls to a set level, limiting further
-  loss on a position.
-- **Drawdown:** how far equity has fallen from its previous peak, in percent.
-- **Sharpe ratio:** average return divided by the variability of returns — a
-  volatility-adjusted summary statistic, meaningful only with many observations.
-- **Slippage:** the difference between the price you expected and the price your order
-  actually filled at.
-- **PDT (pattern day trading):** the FINRA rule described above, limiting frequent
-  intraday round-trips in accounts under $25,000.
-- **Paper trading:** simulated trading with fake money against real market data — how
-  this entire project operates.
+| `app.py` | Streamlit stock/crypto research, verification, and engine controls. |
+| `config.py` | Stock config, account modes, isolated credential loading. |
+| `crypto_config.py` | Frozen crypto strategy, portfolio risk, engine, and simulation config. |
+| `indicators.py` | Causal SMA, Wilder RSI/ATR/ADX, efficiency, volume, ATR percentile. |
+| `strategy.py` / `risk_manager.py` | Shared stock decision and risk implementation. |
+| `crypto_strategy.py` / `crypto_risk.py` | Shared crypto decision, ranking, sizing, correlation, and loss latch. |
+| `backtest.py` / `research.py` | Stock backtest and walk-forward promotion. |
+| `crypto_backtest.py` / `crypto_research.py` | Multi-asset crypto simulation and promotion. |
+| `trade_engine.py` | Audited paper stock order lifecycle. |
+| `crypto_engine.py` | 24/7 crypto reconciliation, partial fills, stops, watchdog, restart. |
+| `broker.py` | Exact environment verification and stock/crypto Alpaca requests. |
+| `data_feed.py` / `crypto_data_feed.py` | Completed bars, staleness, retries, crypto quotes. |
+| `state_store.py` | SQLite sessions, bars, orders, fills, equity, logs, positions. |
+| `models.py` / `crypto_models.py` | Typed boundary structures. |
 
 ## Troubleshooting
 
-- **Missing or invalid credentials:** the dashboard shows a setup box; copy
-  `.env.example` to `.env`, add your paper keys, and restart Streamlit. A 401 error means
-  Alpaca rejected the keys — re-copy them from the dashboard's Paper Trading section.
-- **Data subscription errors:** requesting SIP data (or very recent minutes) on the free
-  tier is rejected by Alpaca. Switch the data feed to `iex`.
-- **PDT rejections (`pdt_restriction`):** you are on an intraday timeframe with equity
-  under $25,000 and the day-trade limit is in reach. Use the `1Day` timeframe, or wait
-  for the 5-business-day window to roll off. Paper equity is simulated, so you can also
-  reset the paper account from Alpaca's dashboard.
-- **Market closed:** entries are blocked outside regular US market hours
-  (reason `market_closed`); the bot idles until the next open.
-- **Symbol not tradable:** the symbol must be an active, tradable US equity on Alpaca;
-  check spelling (e.g. `BRK.B`) or pick another symbol.
-- **Insufficient buying power / position too small:** the sizing caps produced 0 shares
-  or a position under the configured minimums. Lower the entry price target (cheaper
-  symbol), or review risk-per-trade and minimum-position settings.
-- **"Not enough historical data" when backtesting:** the configured indicator periods
-  need more warmup bars than the date range provides — widen the date range or shorten
-  the indicator periods (the error message states the exact bar count needed).
-- **Stale "unclean stop" message blocks starting:** the previous session ended with an
-  emergency stop, loss halt, or error. Review the Logs/State tab, then click
-  *"I understand — clear and allow restart"* on the live tab.
-- **Resetting bot state:** all persistent state lives in a SQLite file at
-  `data/trading_bot.db`. Deleting it (while the app is stopped) resets the bot's local
-  state — sessions, orders, trades, logs, and position bookkeeping. It does not change
-  anything at Alpaca; check your paper account for leftover positions or orders.
+- **Paper account will not verify:** confirm paper keys and exact names in `.env`. A 401
+  means Alpaca rejected the credentials.
+- **Live remains disabled:** set `ENABLE_LIVE_TRADING=true`, configure separate live
+  keys, restart Streamlit, select Live, acknowledge risk, type `LIVE`, and verify.
+- **Live selection resets:** an active engine freezes mode; stop it first. A process
+  restart intentionally clears the typed live unlock.
+- **Crypto asset rejected:** use an active Alpaca USD pair in `BASE/USD` format. The app
+  also requires tradable, fractionable, non-marginable, non-shortable metadata and
+  dynamic increments.
+- **No crypto entry:** inspect every filter and quote guard. Zero volume, wide/stale
+  quote, stale/misaligned bars, regime stress, correlation, exposure, or loss latch all
+  fail closed.
+- **Not enough history:** widen the period or use a slower timeframe. The regime and ATR
+  percentile require a substantial causal warmup.
+- **Walk-forward cannot form folds:** the requested train + embargo + test windows exceed
+  aligned history, or no candidate produced the minimum training trade count.
+- **Kill switch blocks Start:** inspect logs and Alpaca account/order state, then use the
+  explicit dashboard acknowledgement and re-verify the account.
+- **Manual position blocks startup:** the bot cannot prove ownership. Resolve it manually
+  in Alpaca; the application will not adopt or liquidate an unexplained position.
 
-## A note on statistics and parameter choice
-
-With few trades, summary statistics are noise: the dashboard explicitly flags win rate
-and Sharpe ratio as **statistically meaningless below roughly 30 completed trades**, and
-withholds the Sharpe ratio entirely below 20 return observations. Parameters are chosen
-**manually, by design** — there is no auto-optimization, because searching many parameter
-combinations until a backtest looks good mostly finds settings that fit past noise
-(overfitting), not settings that mean anything about the future. Results are specific to
-the exact parameters and date range you chose; small changes can produce large result
-changes.
-
----
-
-*Educational software for Alpaca PAPER trading. Nothing in this repository is investment
-advice, and nothing about it implies any expected outcome.*
+Use Paper mode unless you independently understand and accept every live-money failure
+mode above.

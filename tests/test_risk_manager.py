@@ -355,3 +355,100 @@ class TestCheckDailyLossLimit:
     def test_gain_false(self):
         manager = make_manager()
         assert manager.check_daily_loss_limit(100_000.0, 105_000.0) is False
+
+
+class TestAdaptiveRisk:
+    def test_scale_can_only_reduce_the_risk_budget(self):
+        manager = make_manager(max_position_pct=100.0, min_position_value=0.0)
+        full = manager.calculate_position_size(
+            equity=100_000, buying_power=100_000, entry_price=100, stop_price=96
+        )
+        half = manager.calculate_position_size(
+            equity=100_000,
+            buying_power=100_000,
+            entry_price=100,
+            stop_price=96,
+            risk_scale=0.5,
+        )
+        assert full.qty == 250
+        assert half.qty == 125
+        assert half.risk_amount == pytest.approx(full.risk_amount * 0.5)
+
+    @pytest.mark.parametrize("scale", [0.0, -0.1, 1.01, float("nan")])
+    def test_invalid_scale_is_rejected(self, scale):
+        result = make_manager().calculate_position_size(
+            equity=100_000,
+            buying_power=100_000,
+            entry_price=100,
+            stop_price=96,
+            risk_scale=scale,
+        )
+        assert_rejected(result, "invalid_risk_scale")
+
+    def test_drawdown_and_volatility_scales_are_hand_computable(self):
+        manager = make_manager(
+            enable_adaptive_risk=True,
+            min_risk_scale=0.25,
+            drawdown_risk_reduction_start_pct=1.0,
+            max_daily_loss_pct=3.0,
+            volatility_target_percentile=50.0,
+        )
+        assert manager.calculate_risk_scale(100_000, 100_000, 100_000, 50) == 1.0
+        # 2% drawdown is halfway between the 1% soft and 3% hard limits.
+        assert manager.calculate_risk_scale(100_000, 98_000, 100_000, 50) == pytest.approx(0.625)
+        assert manager.calculate_risk_scale(100_000, 97_000, 100_000, 50) == pytest.approx(0.25)
+        # ATR percentile 75 is halfway from target 50 to the ceiling 100.
+        assert manager.calculate_risk_scale(100_000, 100_000, 100_000, 75) == pytest.approx(0.625)
+
+    def test_malformed_equity_state_fails_to_minimum_scale(self):
+        manager = make_manager(enable_adaptive_risk=True)
+        assert manager.calculate_risk_scale(0, 100, 100, 50) == pytest.approx(0.25)
+
+
+class TestRatchetStop:
+    def test_trailing_stop_tightens_from_completed_highest_close(self):
+        stop = make_manager().calculate_ratchet_stop(
+            entry_price=100,
+            initial_stop_price=96,
+            current_stop_price=96,
+            highest_close=110,
+            atr_value=2,
+            trailing_atr_multiplier=3,
+        )
+        assert stop == pytest.approx(104)
+
+    def test_ratchet_never_loosens_an_existing_stop(self):
+        stop = make_manager().calculate_ratchet_stop(
+            entry_price=100,
+            initial_stop_price=96,
+            current_stop_price=105,
+            highest_close=108,
+            atr_value=4,
+            trailing_atr_multiplier=3,
+        )
+        assert stop == pytest.approx(105)
+
+    def test_break_even_activates_only_after_requested_r_multiple(self):
+        manager = make_manager()
+        before = manager.calculate_ratchet_stop(
+            entry_price=100,
+            initial_stop_price=96,
+            current_stop_price=96,
+            highest_close=103.99,
+            atr_value=10,
+            trailing_atr_multiplier=3,
+            enable_break_even=True,
+            break_even_trigger_r=1,
+        )
+        at_trigger = manager.calculate_ratchet_stop(
+            entry_price=100,
+            initial_stop_price=96,
+            current_stop_price=96,
+            highest_close=104,
+            atr_value=10,
+            trailing_atr_multiplier=3,
+            enable_break_even=True,
+            break_even_trigger_r=1,
+        )
+        assert before == pytest.approx(96)
+        assert at_trigger == pytest.approx(100)

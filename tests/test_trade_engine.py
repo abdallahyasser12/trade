@@ -424,6 +424,8 @@ def build_harness(
     engine_cfg: Optional[EngineConfig] = None,
     account: Optional[AccountInfo] = None,
     market_open: bool = True,
+    strategy_cfg: Optional[StrategyConfig] = None,
+    risk_cfg: Optional[RiskConfig] = None,
 ) -> Harness:
     """Wire a TradeEngine to fakes with a fixed now_fn equal to the fake
     clock timestamp (no skew) and next_close 3h away (no near-close block)."""
@@ -432,8 +434,8 @@ def build_harness(
         broker.account = account
     broker.clock = replace(broker.clock, is_open=market_open)
     feed = FakeDataFeed()
-    strategy_cfg = small_strategy_config(timeframe)
-    risk_cfg = RiskConfig()
+    strategy_cfg = strategy_cfg or small_strategy_config(timeframe)
+    risk_cfg = risk_cfg or RiskConfig()
     resolved_engine_cfg = engine_cfg or EngineConfig(poll_interval_seconds=5)
     store = StateStore(str(tmp_path / "state.db"))
     holder = MutableNow(now)
@@ -2018,3 +2020,146 @@ def test_done_for_day_partial_entry_remainder_is_canceled_and_fill_protected(tmp
     stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
     assert len(stops) == 1 and stops[0].requested_qty == pytest.approx(40.0)
     assert len([t for t in h.store.get_trades() if t["action"] == "BUY"]) == 1
+
+
+def test_benchmark_outage_does_not_consume_symbol_bar_before_retry(tmp_path):
+    strategy_cfg = replace(
+        small_strategy_config(),
+        enable_market_regime_filter=True,
+        regime_symbol="MKT",
+        regime_timeframe="1Day",
+        regime_ma_period=3,
+        regime_slope_period=1,
+    )
+    h = build_harness(tmp_path, strategy_cfg=strategy_cfg)
+    symbol_bars = make_buy_bars(NOW)
+    signal_ts = symbol_bars.index[-1]
+    market_index = pd.date_range(
+        end=signal_ts - pd.Timedelta(days=1), periods=6, freq="D", tz="UTC"
+    )
+    market_bars = pd.DataFrame(
+        {"close": [90.0, 91.0, 92.0, 93.0, 94.0, 95.0]}, index=market_index
+    )
+    state = {"fail": True}
+
+    def routed_bars(symbol, timeframe, lookback_bars, **kwargs):
+        if symbol == SYMBOL:
+            return symbol_bars
+        if state["fail"]:
+            raise DataFeedError("temporary benchmark outage")
+        return market_bars
+
+    h.feed.get_recent_bars = routed_bars
+    h.engine._startup()
+    h.engine.run_iteration()
+    assert not h.store.is_bar_processed(SYMBOL, "1Day", signal_ts.to_pydatetime())
+
+    state["fail"] = False
+    h.engine.run_iteration()
+    assert h.store.is_bar_processed(SYMBOL, "1Day", signal_ts.to_pydatetime())
+    assert last_signal(h)["action"] == "BUY"
+
+
+def test_live_trailing_stop_cancels_then_rearms_exact_tighter_stop(tmp_path):
+    strategy_cfg = replace(
+        small_strategy_config(),
+        enable_trailing_stop=True,
+        trailing_atr_multiplier=3.0,
+    )
+    h = build_harness(tmp_path, strategy_cfg=strategy_cfg, market_open=False)
+    old_stop = preset_bot_position(h, qty=10, entry_price=100, atr=2, stop_price=96)
+    h.engine._startup()
+    decision = SignalDecision(
+        action=BotAction.HOLD,
+        timestamp=NOW,
+        reason="no_crossover",
+        atr=2.0,
+        details={"close": 110.0},
+    )
+
+    breached = h.engine._update_trailing_stop(decision, NOW, NOW)
+
+    assert breached is False
+    assert h.broker.orders[old_stop].status == "canceled"
+    open_stops = [o for o in h.broker.list_open_orders(SYMBOL) if o.purpose == "stop"]
+    assert len(open_stops) == 1
+    assert open_stops[0].requested_qty == pytest.approx(10)
+    assert open_stops[0].stop_price == pytest.approx(104.0)
+    position = h.store.get_bot_position(SYMBOL)
+    assert position["initial_stop_price"] == pytest.approx(96.0)
+    assert position["highest_close"] == pytest.approx(110.0)
+
+
+def test_regime_exit_reason_is_preserved_into_live_exit_intent(tmp_path, monkeypatch):
+    h = build_harness(tmp_path)
+    preset_bot_position(h, qty=10)
+    captured = {}
+
+    def capture(reason, bar_ts, signal=None):
+        captured.update(reason=reason, bar_ts=bar_ts, signal=signal)
+
+    monkeypatch.setattr(h.engine, "_initiate_exit", capture)
+    decision = SignalDecision(
+        action=BotAction.EXIT,
+        timestamp=NOW,
+        reason="market_regime_break",
+    )
+
+    h.engine._handle_exit_signal(decision, NOW)
+
+    assert captured["reason"] == "market_regime_break"
+    assert captured["signal"]["reason"] == "market_regime_break"
+
+
+def test_malformed_broker_stop_price_is_replaced_without_crashing(tmp_path):
+    h = build_harness(tmp_path)
+    stop_id = preset_bot_position(h, qty=10, stop_price=96.0)
+    h.broker.orders[stop_id].stop_price = "malformed"
+
+    h.engine._ensure_protective_stop(NOW)
+
+    open_stops = [
+        order
+        for order in h.broker.list_open_orders(SYMBOL)
+        if order.purpose == OrderPurpose.STOP.value
+    ]
+    assert len(open_stops) == 1
+    assert open_stops[0].client_order_id != stop_id
+    assert open_stops[0].stop_price == pytest.approx(96.0)
+
+
+def test_live_entry_uses_adaptive_risk_scale_without_exceeding_base_risk(tmp_path):
+    risk_cfg = RiskConfig(
+        max_position_pct=100.0,
+        min_position_value=0.0,
+        enable_adaptive_risk=True,
+        min_risk_scale=0.25,
+        drawdown_risk_reduction_start_pct=1.0,
+        max_daily_loss_pct=3.0,
+        volatility_target_percentile=50.0,
+    )
+    h = build_harness(tmp_path, risk_cfg=risk_cfg)
+    bars = make_buy_bars(NOW)
+    h.feed.frame = bars
+    h.engine._startup()
+    h.broker.account = replace(h.broker.account, equity=98_000.0)
+
+    h.engine.run_iteration()
+
+    decision = h.engine.status.last_signal
+    assert decision is not None
+    assert decision.risk_scale == pytest.approx(0.625)
+    close_price = float(decision.details["close"])
+    stop = h.engine.risk_manager.calculate_stop_price(
+        close_price, float(decision.atr), h.strategy_cfg.atr_multiplier
+    )
+    expected = h.engine.risk_manager.calculate_position_size(
+        equity=98_000.0,
+        buying_power=h.broker.account.buying_power,
+        entry_price=close_price,
+        stop_price=stop,
+        risk_scale=0.625,
+    )
+    entries = submitted_by_purpose(h, OrderPurpose.ENTRY.value)
+    assert len(entries) == 1
+    assert entries[0].requested_qty == expected.qty
