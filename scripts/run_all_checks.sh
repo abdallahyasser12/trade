@@ -53,6 +53,15 @@ section() {
 
 skip() { say "   -> SKIPPED: $2"; SKIPPED+=("$1 ,$2"); }
 
+# Surface the tail of the log on the terminal. A failure the operator cannot
+# see without opening a file is a failure they will misread.
+show_tail() {
+  local lines="${1:-25}"
+  printf '\n  --- last %s lines of output ---\n' "$lines"
+  tail -n "$lines" "$REPORT" | sed 's/^/  | /'
+  printf '  --- end ---\n\n'
+}
+
 : >"$REPORT"
 rule
 say "TRADE BOT VERIFICATION REPORT"
@@ -64,6 +73,13 @@ say "  Repo         $REPO"
 say "  Branch       $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'not a git repo')"
 say "  Commit       $(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
 say "  Tree         $(if [ -z "$(git status --porcelain 2>/dev/null)" ]; then echo clean; else echo 'has local changes'; fi)"
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  say ""
+  say "  NOTE: this is an extracted archive, not a git clone, so you cannot pull"
+  say "  updates. To pick up fixes, either re-download the branch archive or run:"
+  say "    git clone https://github.com/abdallahyasser12/trade.git"
+  say "    cd trade && git checkout claude/elite-trader-capabilities-4h8fnk"
+fi
 say ""
 
 # ---------------------------------------------------------------- interpreter
@@ -127,11 +143,11 @@ section "Byte-compile every module" python -m compileall -q .
 # ----------------------------------------------------------------- test suite
 say ""
 if [ "$MOBILE_OK" -eq 1 ]; then
-  section "Test suite" python -m pytest -q --durations=10
+  section "Test suite" python -m pytest -q -p no:cacheprovider --durations=10 || show_tail 30
 else
   section "Test suite (excluding mobile)" \
-    python -m pytest -q --durations=10 \
-      --ignore=tests/test_mobile_api.py --ignore=tests/test_mobile_push.py
+    python -m pytest -q -p no:cacheprovider --durations=10 \
+      --ignore=tests/test_mobile_api.py --ignore=tests/test_mobile_push.py || show_tail 30
 fi
 
 # --------------------------------------------------------------- cost arithmetic
@@ -180,10 +196,22 @@ else
   case $code in
     0) say "   -> PROMOTION PASS"; PASSED+=("Research (defaults): PASS") ;;
     1) say "   -> PROMOTION FAIL (a normal research outcome)"; PASSED+=("Research (defaults): gates failed") ;;
-    *) say "   -> could not complete (exit $code)"; FAILED+=("Research (defaults) ,exit $code") ;;
+    *)
+      say "   -> could not complete (exit $code)"
+      FAILED+=("Research (defaults) ,exit $code")
+      show_tail 25
+      say "  Running the credential and connectivity diagnostic…"
+      say ""
+      python scripts/diagnose_alpaca.py 2>&1 | tee -a "$REPORT"
+      say ""
+      say "  Skipping the second research pass: the first could not reach data."
+      RESEARCH_BROKEN=1
+      ;;
   esac
 
-  if [ "$QUICK" -eq 1 ]; then
+  if [ "${RESEARCH_BROKEN:-0}" -eq 1 ]; then
+    skip "Research (strict cost)" "the first pass could not reach market data"
+  elif [ "$QUICK" -eq 1 ]; then
     skip "Research (strict cost)" "--quick was passed"
   else
     say ""
@@ -194,7 +222,11 @@ else
     case $code in
       0) say "   -> PROMOTION PASS"; PASSED+=("Research (strict): PASS") ;;
       1) say "   -> PROMOTION FAIL (a normal research outcome)"; PASSED+=("Research (strict): gates failed") ;;
-      *) say "   -> could not complete (exit $code)"; FAILED+=("Research (strict) ,exit $code") ;;
+      *)
+        say "   -> could not complete (exit $code)"
+        FAILED+=("Research (strict) ,exit $code")
+        show_tail 25
+        ;;
     esac
   fi
 fi
