@@ -45,6 +45,9 @@ on:
       test_bars:
         description: "Out-of-sample bars per fold"
         default: "500"
+      min_train_trades:
+        description: "Minimum trades a candidate must show in-sample to be considered"
+        default: "5"
 
 concurrency:
   group: crypto-research-${{ github.ref }}
@@ -91,6 +94,7 @@ jobs:
             --max-cost-to-risk "${{ inputs.max_cost_to_risk }}" \
             --train-bars "${{ inputs.train_bars }}" \
             --test-bars "${{ inputs.test_bars }}" \
+            --min-train-trades "${{ inputs.min_train_trades }}" \
             --json-out verdict.json \
             2>&1 | tee report.txt
           echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
