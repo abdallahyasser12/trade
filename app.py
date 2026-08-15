@@ -919,7 +919,7 @@ def render_research_tab(
     )
     metrics[4].metric("OOS trades", str(result.total_oos_trades))
     metrics[5].metric("Positive folds", f"{result.positive_fold_ratio:.0%}")
-    gate_metrics = st.columns(4)
+    gate_metrics = st.columns(6)
     gate_metrics[0].metric(
         "Profit factor",
         f"{result.profit_factor:.2f}" if result.profit_factor is not None else "n/a",
@@ -932,6 +932,17 @@ def render_research_tab(
         f"{result.compounded_return_pct - result.baseline_compounded_return_pct:+.2f}%",
     )
     gate_metrics[3].metric(
+        "Buy & hold OOS", f"{result.benchmark_compounded_return_pct:+.2f}%"
+    )
+    gate_metrics[4].metric(
+        "Excess vs buy & hold",
+        f"{result.benchmark_excess_return_pct:+.2f}%",
+        help=(
+            "The alternative a long-only book always has. Negative means "
+            "holding the benchmark outperformed the strategy out of sample."
+        ),
+    )
+    gate_metrics[5].metric(
         "Evidence", f"{len(result.folds)} folds · {result.candidate_count} candidates"
     )
 
