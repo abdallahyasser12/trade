@@ -89,7 +89,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
           printf 'using %s %s and scheme %s\n' "${container_flag}" "${container}" "${scheme}"
 
-      - name: Archive the app without signing
+      - name: Build the app without signing
         env:
           CONTAINER_FLAG: ${{ steps.xcode.outputs.container_flag }}
           CONTAINER: ${{ steps.xcode.outputs.container }}
@@ -97,28 +97,37 @@ jobs:
         run: |
           set -euo pipefail
 
+          # `xcodebuild archive` looks like the natural choice, but Xcode only
+          # copies the product into <archive>/Products/Applications when
+          # signing succeeds — with signing disabled it prints
+          # "ARCHIVE SUCCEEDED" and silently produces an empty archive. A
+          # plain `build` writes the .app straight into DerivedData
+          # regardless of signing, so we read it from there instead.
+          #
           # Signing is deliberately disabled. Your free Apple ID re-signs the
           # result locally, which is the only step that needs your identity.
-          xcodebuild archive \
+          xcodebuild build \
             "${CONTAINER_FLAG}" "${CONTAINER}" \
             -scheme "${SCHEME}" \
             -configuration Release \
+            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -archivePath "${RUNNER_TEMP}/Trade.xcarchive" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS=""
 
-      - name: Package the archive as an .ipa
+      - name: Package the build as an .ipa
         id: package
         run: |
           set -euo pipefail
 
-          app_path="$(find "${RUNNER_TEMP}/Trade.xcarchive/Products/Applications" \
-            -maxdepth 1 -name '*.app' | head -n 1)"
+          app_path="$(find "${RUNNER_TEMP}/DerivedData/Build/Products" \
+            -maxdepth 2 -name '*.app' | head -n 1)"
           if [ -z "${app_path}" ]; then
-            echo "no .app was produced by the archive step" >&2
+            echo "no .app was produced by the build step" >&2
+            find "${RUNNER_TEMP}/DerivedData/Build/Products" -maxdepth 2 || true
             exit 1
           fi
 
