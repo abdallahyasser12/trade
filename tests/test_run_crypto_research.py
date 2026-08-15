@@ -261,3 +261,173 @@ def test_embargo_defaults_to_the_strategy_warmup(monkeypatch, capsys):
         symbols=("BTC/USD", "ETH/USD")
     ).warmup_bars()
     assert f"embargo {warmup} (warmup-derived)" in out
+
+
+def test_cross_engine_searches_its_own_parameters_not_the_breakout_grid():
+    """The breakout grid varies keys the cross engine never reads."""
+
+    module = _load()
+    from crypto_config import CryptoStrategyConfig
+
+    strategy = CryptoStrategyConfig(symbols=("BTC/USD", "ETH/USD", "SOL/USD"))
+    grid = module._cross_parameter_grid(strategy)
+    assert "cross" in grid
+    assert not {"breakout_period", "min_adx", "min_efficiency_ratio"} & set(grid)
+    # The stop axis must not collapse to a single value against the default.
+    assert len(grid["atr_stop_multiplier"]) == 2
+
+    from cross_sectional import CrossSectionalConfig
+    from cross_sectional_research import _candidate_builder
+
+    candidates = _candidate_builder(CrossSectionalConfig())(
+        strategy, grid, max_candidates=32
+    )
+    identities = {repr(sorted(c.to_dict().items())) for c in candidates}
+    assert len(candidates) == 12
+    assert len(identities) == 12, "candidates collapsed: the search would be a no-op"
+
+
+def test_cross_engine_runs_end_to_end_and_reports_what_each_fold_selected(
+    monkeypatch, capsys
+):
+    module = _load()
+    monkeypatch.setattr(
+        module, "load_credentials",
+        lambda *a, **k: type("C", (), {"api_key": "k", "secret_key": "s"})(),
+    )
+    frames = {
+        "BTC/USD": _bars(seed=1),
+        "ETH/USD": _bars(seed=2, slope=0.09),
+        "SOL/USD": _bars(seed=3, slope=0.03),
+    }
+
+    class StubFeed:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_bars(self, symbol, timeframe, start=None, end=None):
+            return frames[symbol]
+
+    monkeypatch.setattr(module, "AlpacaCryptoDataFeed", StubFeed)
+    code = module.main(
+        [
+            "--symbols", "BTC/USD,ETH/USD,SOL/USD",
+            "--benchmark", "BTC/USD",
+            "--engine", "cross",
+            "--train-bars", "700",
+            "--test-bars", "300",
+            "--min-train-trades", "1",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code in (0, 1)
+    assert "PROMOTION VERDICT" in out
+    assert "Candidates per fold        12" in out
+    assert "Selected per fold (in-sample):" in out
+    assert "lookback" in out
+
+
+def test_a_late_listing_is_named_rather_than_silently_truncating_everything(
+    monkeypatch, capsys
+):
+    """The failure this reproduces: one 2023 listing ate 65% of the window."""
+
+    module = _load()
+    monkeypatch.setattr(
+        module, "load_credentials",
+        lambda *a, **k: type("C", (), {"api_key": "k", "secret_key": "s"})(),
+    )
+    full = _bars(periods=2_000, seed=1)
+    frames = {
+        "BTC/USD": full,
+        "ETH/USD": _bars(periods=2_000, seed=2),
+        "LATE/USD": _bars(periods=2_000, seed=3).iloc[-700:],
+    }
+
+    class StubFeed:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_bars(self, symbol, timeframe, start=None, end=None):
+            return frames[symbol]
+
+    monkeypatch.setattr(module, "AlpacaCryptoDataFeed", StubFeed)
+    code = module.main(
+        [
+            "--symbols", "BTC/USD,ETH/USD,LATE/USD",
+            "--benchmark", "BTC/USD",
+            "--train-bars", "700",
+            "--test-bars", "300",
+        ]
+    )
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    # Whatever the outcome, the symbol responsible must be named.
+    assert "LATE/USD" in out
+    assert "alignment cost" in out
+    assert "--drop-late-listings" in out
+    # 700 aligned bars cannot serve 700 train + 226 embargo + 300 test.
+    assert code == 2
+    assert "too few for one fold" in out
+
+
+def test_too_little_aligned_history_fails_before_the_folds_not_during():
+    """A vague 'walk-forward could not complete' is a worse error than this."""
+
+    module = _load()
+    frames = {
+        "BTC/USD": _bars(periods=2_000, seed=1),
+        "ETH/USD": _bars(periods=2_000, seed=2).iloc[-400:],
+    }
+
+    class StubFeed:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_bars(self, symbol, timeframe, start=None, end=None):
+            return frames[symbol]
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            module, "load_credentials",
+            lambda *a, **k: type("C", (), {"api_key": "k", "secret_key": "s"})(),
+        )
+        mp.setattr(module, "AlpacaCryptoDataFeed", StubFeed)
+        code = module.main(
+            [
+                "--symbols", "BTC/USD,ETH/USD",
+                "--benchmark", "BTC/USD",
+                "--train-bars", "700",
+                "--test-bars", "300",
+            ]
+        )
+    assert code == 2
+
+
+def test_dropping_late_listings_recovers_the_window_and_keeps_the_benchmark():
+    module = _load()
+    index = pd.date_range("2021-01-01", periods=2_000, freq="h", tz="UTC")
+    frames = {
+        "BTC/USD": pd.DataFrame({"close": 1.0}, index=index),
+        "ETH/USD": pd.DataFrame({"close": 1.0}, index=index),
+        "SOL/USD": pd.DataFrame({"close": 1.0}, index=index),
+        "LATE/USD": pd.DataFrame({"close": 1.0}, index=index[-500:]),
+    }
+    kept, dropped = module._drop_late_listings(frames, "BTC/USD")
+    assert [symbol for symbol, _ in dropped] == ["LATE/USD"]
+    assert set(kept) == {"BTC/USD", "ETH/USD", "SOL/USD"}
+    assert module._aligned_length(kept) == 2_000
+
+    # The benchmark is never dropped, even when it is the late one.
+    benchmark_late = dict(frames)
+    benchmark_late["BTC/USD"] = pd.DataFrame({"close": 1.0}, index=index[-500:])
+    kept, _ = module._drop_late_listings(benchmark_late, "BTC/USD")
+    assert "BTC/USD" in kept
+
+    # And a universe already at the floor is left alone.
+    three = {k: frames[k] for k in ("BTC/USD", "ETH/USD", "LATE/USD")}
+    kept, dropped = module._drop_late_listings(three, "BTC/USD")
+    assert dropped == []
+    assert set(kept) == set(three)

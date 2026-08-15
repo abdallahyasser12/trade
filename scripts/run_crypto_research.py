@@ -25,6 +25,7 @@ import json
 import math
 import os
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -96,6 +97,14 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--train-bars", type=int, default=1_500)
     parser.add_argument("--test-bars", type=int, default=500)
     parser.add_argument("--min-train-trades", type=int, default=5)
+    parser.add_argument(
+        "--drop-late-listings",
+        action="store_true",
+        help="Drop symbols whose history starts late enough to truncate the "
+             "aligned window for everything else. The universe is intersected "
+             "to common timestamps, so one 2023 listing in a 2021 universe "
+             "costs every symbol those years. Trades breadth for window length.",
+    )
     parser.add_argument(
         "--max-positions",
         type=int,
@@ -170,6 +179,42 @@ def _cross_parameter_grid(strategy: CryptoStrategyConfig) -> dict:
         ],
         "atr_stop_multiplier": sorted({strategy.atr_stop_multiplier, 4.0}),
     }
+
+
+def _drop_late_listings(bars: dict, benchmark: str, *, min_symbols: int = 3):
+    """Drop symbols that would truncate the aligned window, worst first.
+
+    Greedy and explicit: while removing the latest-starting symbol would
+    genuinely lengthen the common window, remove it and say so. The benchmark
+    is never dropped — it defines the comparison — and the universe never
+    falls below ``min_symbols``, because a cross-sectional ranking over two
+    names is not a ranking.
+    """
+
+    kept = dict(bars)
+    dropped: list[tuple[str, str]] = []
+    while len(kept) > min_symbols:
+        candidates = {s: f for s, f in kept.items() if s != benchmark}
+        if not candidates:
+            break
+        latest = max(candidates, key=lambda symbol: candidates[symbol].index[0])
+        before = _aligned_length(kept)
+        after = _aligned_length({s: f for s, f in kept.items() if s != latest})
+        if after <= before:
+            break
+        start = kept[latest].index[0]
+        dropped.append(
+            (latest, f"starts {start:%Y-%m-%d}; keeping it costs {after - before} aligned bars")
+        )
+        kept.pop(latest)
+    return kept, dropped
+
+
+def _aligned_length(bars: dict) -> int:
+    common = None
+    for frame in bars.values():
+        common = frame.index if common is None else common.intersection(frame.index)
+    return 0 if common is None else len(common)
 
 
 def _json_grid(grid) -> dict:
@@ -365,13 +410,51 @@ def main(argv=None) -> int:
         print(f"    {symbol:<10} {len(frame):>7} bars  "
               f"{frame.index[0]:%Y-%m-%d} .. {frame.index[-1]:%Y-%m-%d}")
 
-    # The simulator requires exactly aligned indices across the universe.
+    # The simulator requires exactly aligned indices across the universe, so a
+    # single late listing truncates every other symbol down to its own start.
+    # That is easy to do by accident and expensive: one 2023 listing in an
+    # otherwise 2021 universe costs two and a half years of history for all of
+    # them. Name the symbol responsible rather than letting the fold arithmetic
+    # fail later with something vague.
+    if args.drop_late_listings:
+        bars, dropped = _drop_late_listings(bars, args.benchmark)
+        for symbol, reason in dropped:
+            print(f"    dropped {symbol:<10} {reason}")
+        if dropped:
+            symbols = tuple(bars)
+            strategy = replace(strategy, symbols=symbols)
+
     common = None
     for frame in bars.values():
         common = frame.index if common is None else common.intersection(frame.index)
     if common is None or len(common) == 0:
         return _fail("The symbols share no common timestamps.")
+    # Measured before the reassignment below, or every frame is already the
+    # aligned length and the comparison can never fire.
+    longest = max(len(frame) for frame in bars.values())
+    binding, first = max(
+        ((symbol, frame.index[0]) for symbol, frame in bars.items()),
+        key=lambda item: item[1],
+    )
     bars = {symbol: frame.loc[common] for symbol, frame in bars.items()}
+    if len(common) < longest:
+        lost = longest - len(common)
+        print(
+            f"    NOTE: alignment cost {lost} bars ({lost / longest:.0%} of the "
+            f"longest series); {binding} starts {first:%Y-%m-%d}."
+        )
+        if not args.drop_late_listings:
+            print("          Pass --drop-late-listings to trade breadth for window length.")
+
+    needed = walk.train_bars + walk.embargo_bars + walk.test_bars
+    if len(common) < needed:
+        return _fail(
+            f"{len(common)} aligned bars is too few for one fold: "
+            f"{walk.train_bars} train + {walk.embargo_bars} embargo + "
+            f"{walk.test_bars} test = {needed} required.\n"
+            "Widen --start, shorten the folds, or drop the late-listing symbol "
+            "named above (--drop-late-listings)."
+        )
     print(f"    aligned    {len(common):>7} bars across {len(bars)} symbols")
 
     grid = (
