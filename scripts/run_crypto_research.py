@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
+from advanced_crypto_research import run_regime_ensemble_walk_forward
 from config import load_credentials, timeframe_to_timedelta
 from cost_model import break_even_win_rate, cost_to_risk, round_trip_cost_bps
 from crypto_config import (
@@ -46,6 +47,7 @@ from crypto_research import (
     CryptoWalkForwardConfig,
     run_crypto_walk_forward,
 )
+from regime_ensemble import EnsembleConfig
 
 RULE = "=" * 78
 
@@ -69,6 +71,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--start", default="2023-01-01", help="First research date (UTC).")
     parser.add_argument("--end", default="", help="Last research date (UTC). Blank = yesterday.")
+    parser.add_argument(
+        "--engine",
+        default="base",
+        choices=["base", "ensemble"],
+        help="Decision engine to walk forward. 'base' is the audited breakout/trend "
+             "strategy. 'ensemble' is the regime-aware multi-sleeve blend — it has "
+             "never been exercised end-to-end (no dashboard wiring existed before "
+             "this flag).",
+    )
     parser.add_argument(
         "--max-cost-to-risk",
         type=float,
@@ -232,6 +243,7 @@ def main(argv=None) -> int:
     print("CRYPTO WALK-FORWARD RESEARCH")
     print(RULE)
     print(f"  Universe    {', '.join(symbols)}   benchmark {args.benchmark}")
+    print(f"  Engine      {args.engine}")
     print(f"  Timeframe   {args.timeframe}")
     print(f"  Window      {start_date} .. {end_date}")
     print(f"  Folds       {args.train_bars} train / {args.test_bars} test bars")
@@ -278,9 +290,15 @@ def main(argv=None) -> int:
 
     print("\n  Running bounded chronological walk-forward…")
     try:
-        result = run_crypto_walk_forward(
-            bars, strategy, risk, backtest, grid, walk, criteria
-        )
+        if args.engine == "ensemble":
+            result = run_regime_ensemble_walk_forward(
+                bars, strategy, risk, backtest, grid, walk, criteria,
+                ensemble_config=EnsembleConfig(),
+            )
+        else:
+            result = run_crypto_walk_forward(
+                bars, strategy, risk, backtest, grid, walk, criteria
+            )
     except ValueError as exc:
         return _fail(
             f"Walk-forward could not complete: {exc}\n"
@@ -320,6 +338,7 @@ def main(argv=None) -> int:
             "config": {
                 "symbols": list(symbols),
                 "benchmark": args.benchmark,
+                "engine": args.engine,
                 "timeframe": args.timeframe,
                 "start": str(start_date),
                 "end": str(end_date),

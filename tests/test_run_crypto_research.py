@@ -105,6 +105,56 @@ def test_full_report_renders_and_returns_a_promotion_exit_code(monkeypatch, caps
     assert ("PASS" in out) or ("FAIL" in out)
 
 
+def test_ensemble_engine_runs_and_reports_a_verdict(monkeypatch, capsys):
+    """The ensemble engine must produce a structurally valid report too."""
+
+    module = _load()
+    monkeypatch.setattr(
+        module, "load_credentials",
+        lambda *a, **k: type("C", (), {"api_key": "k", "secret_key": "s"})(),
+    )
+
+    frames = {
+        "BTC/USD": _bars(seed=1),
+        "ETH/USD": _bars(seed=2),
+    }
+
+    class StubFeed:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_bars(self, symbol, timeframe, start=None, end=None):
+            return frames[symbol]
+
+    monkeypatch.setattr(module, "AlpacaCryptoDataFeed", StubFeed)
+
+    code = module.main(
+        [
+            "--symbols", "BTC/USD,ETH/USD",
+            "--benchmark", "BTC/USD",
+            "--train-bars", "700",
+            "--test-bars", "300",
+            "--min-train-trades", "1",
+            "--engine", "ensemble",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    # The verdict must be reachable regardless of which way it goes.
+    assert code in (0, 1)
+    assert "COST" in out
+    assert "Round-trip friction" in out
+    assert "VERSUS BUY-AND-HOLD" in out
+    assert "PROMOTION VERDICT" in out
+    assert ("PASS" in out) or ("FAIL" in out)
+
+
+def test_default_engine_is_base(monkeypatch):
+    module = _load()
+    args = module._parse_args(["--symbols", "BTC/USD"])
+    assert args.engine == "base"
+
+
 def test_json_output_is_written_and_parsable(monkeypatch, tmp_path):
     import json
 

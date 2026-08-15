@@ -25,6 +25,11 @@ on:
         type: choice
         options: ["1Hour", "1Day", "15Min"]
         default: "1Hour"
+      engine:
+        description: "Decision engine: base (audited) or ensemble (regime-aware blend)"
+        type: choice
+        options: ["base", "ensemble"]
+        default: "base"
       start:
         description: "First research date (UTC, YYYY-MM-DD)"
         default: "2023-01-01"
@@ -80,6 +85,7 @@ jobs:
             --symbols "${{ inputs.symbols }}" \
             --benchmark "${{ inputs.benchmark }}" \
             --timeframe "${{ inputs.timeframe }}" \
+            --engine "${{ inputs.engine }}" \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
             --max-cost-to-risk "${{ inputs.max_cost_to_risk }}" \
