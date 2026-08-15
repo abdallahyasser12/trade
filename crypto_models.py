@@ -146,6 +146,8 @@ class CryptoPositionState:
     stop_attempt: int = 1
     pending_exit_client_order_id: Optional[str] = None
     breached_at: Optional[str] = None
+    breach_confirmations: int = 0
+    guard_attempt: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

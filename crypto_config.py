@@ -243,6 +243,8 @@ class CryptoEngineConfig:
     max_spread_bps: float = 40.0
     stop_limit_buffer_bps: float = 50.0
     stop_watchdog_grace_seconds: float = 15.0
+    stop_watchdog_min_confirmations: int = 2
+    position_open_poll_interval_seconds: float = 5.0
     entry_order_timeout_seconds: float = 120.0
     fill_poll_attempts: int = 3
 
@@ -282,10 +284,31 @@ class CryptoEngineConfig:
             errors.append("Entry order timeout must be at least 30 seconds.")
         if self.fill_poll_attempts < 1 or self.fill_poll_attempts > 20:
             errors.append("Fill poll attempts must be between 1 and 20.")
+        if not (1 <= self.stop_watchdog_min_confirmations <= 10):
+            errors.append("Stop watchdog confirmations must be between 1 and 10.")
+        if (
+            not math.isfinite(self.position_open_poll_interval_seconds)
+            or self.position_open_poll_interval_seconds < 1
+        ):
+            errors.append("Position-open polling interval must be at least 1 second.")
         return errors
 
     def resolved_poll_interval(self, timeframe: str) -> float:
         return self.poll_interval_seconds or default_poll_interval(timeframe)
+
+    def exposed_poll_interval(self, timeframe: str) -> float:
+        """Polling cadence while capital is exposed.
+
+        Requiring repeated breach confirmations is only safe if the engine also
+        looks more often while it has something to protect; at the 1Hour default
+        of 120s a two-poll confirmation would delay a real stop escalation by
+        four minutes.  Never slower than the idle cadence.
+        """
+
+        return min(
+            self.resolved_poll_interval(timeframe),
+            self.position_open_poll_interval_seconds,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
