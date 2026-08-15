@@ -2,6 +2,33 @@ name: Build production iOS app
 
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "EAS build profile"
+        type: choice
+        default: preview
+        options:
+          - preview
+          - production
+      submit:
+        description: "Submit the finished build to TestFlight (production profile only)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "ios-v*"
+    branches:
+      - main
+    paths:
+      - "mobile/**"
+      - ".github/workflows/eas-ios-build.yml"
+
+concurrency:
+  group: eas-ios-build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   eas-build:
@@ -14,12 +41,174 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm install --no-audit --no-fund
+
+      - name: Resolve build parameters
+        id: params
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_SUBMIT: ${{ inputs.submit }}
+        run: |
+          set -euo pipefail
+
+          # Tag pushes ship a real release build; every other automatic run
+          # produces an internally distributable install link.
+          if [ -n "${INPUT_PROFILE}" ]; then
+            profile="${INPUT_PROFILE}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            profile="production"
+          else
+            profile="preview"
+          fi
+
+          submit="false"
+          if [ "${INPUT_SUBMIT}" = "true" ] && [ "${profile}" = "production" ]; then
+            submit="true"
+          fi
+
+          ready="true"
+          if [ -z "${EXPO_TOKEN}" ]; then
+            ready="false"
+          fi
+
+          {
+            echo "profile=${profile}"
+            echo "submit=${submit}"
+            echo "ready=${ready}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Explain missing Expo credentials
+        if: steps.params.outputs.ready != 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "## iOS build skipped"
+            echo
+            echo "No \`EXPO_TOKEN\` repository secret is configured, so no signed iOS"
+            echo "artifact and no install link can be produced."
+            echo
+            echo "To enable automatic install links:"
+            echo
+            echo "1. Create an Expo account and run \`npx eas-cli@latest init\` once inside \`mobile/\`."
+            echo "2. Create an access token at https://expo.dev/settings/access-tokens."
+            echo "3. Add it to this repository as the \`EXPO_TOKEN\` secret."
+            echo "4. Link an Apple Developer account when EAS asks for signing credentials."
+            echo
+            echo "Re-run this workflow afterwards and the install link is published here."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install mobile dependencies
+        if: steps.params.outputs.ready == 'true'
+        run: npm install --no-audit --no-fund
+
       - name: Verify Expo project
+        if: steps.params.outputs.ready == 'true'
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: npx eas-cli@latest project:info --non-interactive
-      - name: Queue signed production iOS build
+
+      - name: Build signed iOS app and wait for the artifact
+        if: steps.params.outputs.ready == 'true'
+        id: build
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: npx eas-cli@latest build --platform ios --profile production --non-interactive --no-wait
+          PROFILE: ${{ steps.params.outputs.profile }}
+        run: |
+          set -euo pipefail
+
+          # --wait blocks until EAS finishes so the artifact URL exists by the
+          # time this step returns. --json keeps the output machine readable.
+          npx eas-cli@latest build \
+            --platform ios \
+            --profile "${PROFILE}" \
+            --non-interactive \
+            --wait \
+            --json > build.json
+
+          # EAS has used several artifact field names across versions; take the
+          # first one that is actually populated.
+          # `eas build --json` emits an array, but normalize anyway so a single
+          # object response cannot silently produce empty values.
+          norm='if type == "array" then . else [.] end'
+
+          build_id="$(jq -r "${norm} | map(.id // empty) | first // \"\"" build.json)"
+          status="$(jq -r "${norm} | map(.status // empty) | first // \"unknown\"" build.json)"
+          install_url="$(jq -r "${norm}
+            | map(.artifacts.buildUrl? // empty, .artifacts.applicationArchiveUrl? // empty)
+            | map(select(. != \"\")) | first // \"\"" build.json)"
+          page_url="$(jq -r "${norm}
+            | map(select(.id and .project.slug and .project.ownerAccount.name)
+                  | \"https://expo.dev/accounts/\(.project.ownerAccount.name)/projects/\(.project.slug)/builds/\(.id)\")
+            | first // \"\"" build.json)"
+
+          {
+            echo "build_id=${build_id}"
+            echo "status=${status}"
+            echo "install_url=${install_url}"
+            echo "page_url=${page_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [ "$(printf '%s' "${status}" | tr '[:upper:]' '[:lower:]')" != "finished" ]; then
+            echo "EAS build did not finish successfully (status: ${status})." >&2
+            exit 1
+          fi
+
+      - name: Publish the install link
+        if: steps.params.outputs.ready == 'true'
+        env:
+          PROFILE: ${{ steps.params.outputs.profile }}
+          BUILD_ID: ${{ steps.build.outputs.build_id }}
+          INSTALL_URL: ${{ steps.build.outputs.install_url }}
+          PAGE_URL: ${{ steps.build.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## iOS build ready"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Profile | \`${PROFILE}\` |"
+            echo "| Build ID | \`${BUILD_ID}\` |"
+            if [ -n "${PAGE_URL}" ]; then
+              echo "| Install page (open on the iPhone) | ${PAGE_URL} |"
+            fi
+            if [ -n "${INSTALL_URL}" ]; then
+              echo "| Direct artifact | ${INSTALL_URL} |"
+            fi
+            echo
+            if [ "${PROFILE}" = "production" ]; then
+              echo "A \`production\` artifact is an App Store build. Install it through"
+              echo "TestFlight after submission and Apple processing."
+            else
+              echo "Open the install page on the iPhone itself. Internal distribution"
+              echo "only installs on devices registered with the Apple Developer account."
+            fi
+            echo
+            echo "The app asks for a Mobile API URL and access token on first launch."
+            echo "Produce both with \`scripts/deploy_backend.sh\` on the backend host."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Attach the install link to the release tag
+        if: steps.params.outputs.ready == 'true' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PROFILE: ${{ steps.params.outputs.profile }}
+          INSTALL_URL: ${{ steps.build.outputs.install_url }}
+          PAGE_URL: ${{ steps.build.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          notes="$(printf 'iOS build (%s profile).\n\nInstall page: %s\nArtifact: %s\n' \
+            "${PROFILE}" "${PAGE_URL:-unavailable}" "${INSTALL_URL:-unavailable}")"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --notes "${notes}"
+          else
+            gh release create "${TAG}" --title "${TAG}" --notes "${notes}"
+          fi
+
+      - name: Submit to TestFlight
+        if: steps.params.outputs.ready == 'true' && steps.params.outputs.submit == 'true'
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          BUILD_ID: ${{ steps.build.outputs.build_id }}
+        run: npx eas-cli@latest submit --platform ios --profile production --id "${BUILD_ID}" --non-interactive
