@@ -44,7 +44,7 @@ everything else, and is expected to be judged by them.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from typing import Any, Mapping, Optional
 
@@ -93,6 +93,52 @@ class CrossSectionalConfig:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CrossSectionalStrategyConfig(CryptoStrategyConfig):
+    """A base config that carries its own cross-sectional parameters.
+
+    The audited walk-forward searches by calling ``dataclasses.replace`` on
+    whatever config it was handed, and de-duplicates candidates by their
+    ``to_dict``. Frozen-dataclass inheritance means the replacement preserves
+    both this subclass and this field, and ``asdict`` recurses into it — so
+    two candidates that differ only in lookback or ``top_k`` are genuinely
+    distinct rather than being collapsed into one.
+
+    That is the whole point. Without it the grid can only vary keys the
+    cross-sectional engine never reads, which would run N identical backtests
+    per fold, decide the argmax arbitrarily, and report a candidate count —
+    and therefore a multiple-testing penalty — for a search that never
+    happened.
+    """
+
+    cross: CrossSectionalConfig = CrossSectionalConfig()
+
+    def validate(self) -> list[str]:
+        return super().validate() + self.cross.validate()
+
+
+def with_cross_config(
+    config: CryptoStrategyConfig, cross: CrossSectionalConfig
+) -> CrossSectionalStrategyConfig:
+    """Attach cross-sectional parameters to any base config, idempotently."""
+
+    if isinstance(config, CrossSectionalStrategyConfig):
+        return replace(config, cross=cross)
+    values = {field.name: getattr(config, field.name) for field in fields(CryptoStrategyConfig)}
+    return CrossSectionalStrategyConfig(**values, cross=cross)
+
+
+def resolve_cross_config(
+    config: CryptoStrategyConfig, fallback: Optional[CrossSectionalConfig] = None
+) -> CrossSectionalConfig:
+    """Prefer parameters the candidate carries; fall back to the run default."""
+
+    carried = getattr(config, "cross", None)
+    if isinstance(carried, CrossSectionalConfig):
+        return carried
+    return fallback or CrossSectionalConfig()
+
+
 class CrossSectionalMomentumStrategy:
     """Rank-based long-only selection, interface-compatible with the base engine."""
 
@@ -105,7 +151,9 @@ class CrossSectionalMomentumStrategy:
         if errors:
             raise ValueError("Invalid crypto strategy configuration: " + "; ".join(errors))
         self.config = config
-        self.cross_config = cross_config or CrossSectionalConfig()
+        # A candidate produced by the walk-forward search carries the
+        # parameters it was selected with; an explicit argument still wins.
+        self.cross_config = cross_config or resolve_cross_config(config)
         cross_errors = self.cross_config.validate()
         if cross_errors:
             raise ValueError(

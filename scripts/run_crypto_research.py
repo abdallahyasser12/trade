@@ -144,6 +144,45 @@ def _parameter_grid(strategy: CryptoStrategyConfig, timeframe: str) -> dict:
     }
 
 
+def _cross_parameter_grid(strategy: CryptoStrategyConfig) -> dict:
+    """Search what the cross-sectional engine actually reads.
+
+    It never looks at breakout_period, min_adx or min_efficiency_ratio, so the
+    grid above would have produced twelve behaviourally identical candidates
+    per fold: twelve times the compute, an argmax decided by tie-break order,
+    and a reported candidate count implying a search that never happened.
+
+    Twelve real candidates instead. The momentum horizon and the volatility
+    horizon are tied together deliberately — measure the move over the same
+    window you measure its noise — which halves the surface for free. The stop
+    multiplier is the second axis because it sets the denominator of
+    cost-to-risk: a wider stop means a smaller position for the same risk
+    budget and therefore less friction per unit of R, and friction per unit of
+    R is the constraint that has decided every experiment so far. The wide
+    value has to be genuinely wider than the default or the axis collapses.
+    """
+
+    return {
+        "cross": [
+            CrossSectionalConfig(lookback=window, vol_lookback=window, top_k=top_k)
+            for window in (20, 30, 45)
+            for top_k in (2, 3)
+        ],
+        "atr_stop_multiplier": sorted({strategy.atr_stop_multiplier, 4.0}),
+    }
+
+
+def _json_grid(grid) -> dict:
+    """Grid values are plain numbers except the cross-sectional axis."""
+
+    return {
+        key: [
+            value.to_dict() if hasattr(value, "to_dict") else value for value in values
+        ]
+        for key, values in grid.items()
+    }
+
+
 def _fail(message: str) -> int:
     print(f"\nERROR: {message}", file=sys.stderr)
     return 2
@@ -335,14 +374,17 @@ def main(argv=None) -> int:
     bars = {symbol: frame.loc[common] for symbol, frame in bars.items()}
     print(f"    aligned    {len(common):>7} bars across {len(bars)} symbols")
 
-    grid = _parameter_grid(strategy, args.timeframe)
+    grid = (
+        _cross_parameter_grid(strategy)
+        if args.engine == "cross"
+        else _parameter_grid(strategy, args.timeframe)
+    )
 
     print("\n  Running bounded chronological walk-forward…")
     try:
         if args.engine == "cross":
             result = run_cross_sectional_walk_forward(
                 bars, strategy, risk, backtest, grid, walk, criteria,
-                cross_config=CrossSectionalConfig(),
             )
         elif args.engine == "ensemble":
             result = run_regime_ensemble_walk_forward(
@@ -373,6 +415,21 @@ def main(argv=None) -> int:
     print(f"  Positive folds             {result.positive_fold_ratio:.0%}")
     print(f"  Stressed OOS return        {result.stressed_compounded_return_pct:+.2f}%")
 
+    if args.engine == "cross":
+        # Which parameters each fold selected in-sample. Agreement across folds
+        # is weak evidence of a stable optimum; disagreement means the search
+        # is fitting fold-specific noise and the result should be read as such.
+        print("\n  Selected per fold (in-sample):")
+        for index, fold in enumerate(result.folds, start=1):
+            chosen = getattr(fold.selected_config, "cross", None)
+            if chosen is None:
+                continue
+            print(
+                f"    fold {index:<2} lookback {chosen.lookback:>3}"
+                f"  top_k {chosen.top_k}"
+                f"  stop {fold.selected_config.atr_stop_multiplier:g}x ATR"
+            )
+
     print(f"\n{RULE}\nPROMOTION VERDICT\n{RULE}")
     if result.promotion.promoted:
         print("  PASS — eligible for controlled PAPER testing only.")
@@ -401,7 +458,7 @@ def main(argv=None) -> int:
                 "taker_fee_bps": args.taker_fee_bps,
                 "spread_bps": args.spread_bps,
                 "embargo_bars": embargo,
-                "grid": grid,
+                "grid": _json_grid(grid),
             },
             "cost": cost,
             "benchmark": benchmark,

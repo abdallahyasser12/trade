@@ -4,9 +4,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cross_sectional import CrossSectionalConfig, CrossSectionalMomentumStrategy
-from cross_sectional_research import run_cross_sectional_backtest
+from cross_sectional import (
+    CrossSectionalConfig,
+    CrossSectionalMomentumStrategy,
+    CrossSectionalStrategyConfig,
+    with_cross_config,
+)
+from cross_sectional_research import (
+    _candidate_builder,
+    run_cross_sectional_backtest,
+    run_cross_sectional_walk_forward,
+)
 from crypto_config import CryptoBacktestConfig, CryptoRiskConfig, CryptoStrategyConfig
+from crypto_research import CryptoPromotionCriteria, CryptoWalkForwardConfig
 from models import BotAction
 
 SYMBOLS = ("BTC/USD", "ETH/USD", "LTC/USD", "DOGE/USD")
@@ -29,9 +39,9 @@ def _bars(periods=900, seed=0, drift=0.05, vol=0.02):
     )
 
 
-def _universe():
+def _universe(periods=900):
     return {
-        symbol: _bars(seed=i, drift=0.20 - 0.10 * i)
+        symbol: _bars(periods=periods, seed=i, drift=0.20 - 0.10 * i)
         for i, symbol in enumerate(SYMBOLS)
     }
 
@@ -176,6 +186,114 @@ def test_it_actually_trades_where_the_breakout_conjunction_did_not():
     assert result.median_cost_to_risk is not None
 
 
+def test_candidates_that_differ_only_cross_sectionally_are_distinct():
+    """The bug this guards: a search that runs N identical backtests.
+
+    The audited builder de-duplicates by ``to_dict``. If the cross-sectional
+    parameters did not reach that dict, every candidate would collapse to one
+    and the reported candidate count would describe a search that never ran.
+    """
+
+    build = _candidate_builder(CrossSectionalConfig())
+    candidates = build(
+        CryptoStrategyConfig(symbols=SYMBOLS),
+        {"cross": [CrossSectionalConfig(lookback=20), CrossSectionalConfig(lookback=45)]},
+        max_candidates=32,
+    )
+    assert len(candidates) == 2
+    assert {c.cross.lookback for c in candidates} == {20, 45}
+    identities = {repr(sorted(c.to_dict().items())) for c in candidates}
+    assert len(identities) == 2, "cross parameters never reached the dedup identity"
+
+
+def test_the_cross_axis_multiplies_the_base_axis():
+    build = _candidate_builder(CrossSectionalConfig())
+    candidates = build(
+        CryptoStrategyConfig(symbols=SYMBOLS),
+        {
+            "cross": [CrossSectionalConfig(top_k=1), CrossSectionalConfig(top_k=3)],
+            "atr_stop_multiplier": [2.0, 3.0],
+        },
+        max_candidates=32,
+    )
+    assert len(candidates) == 4
+    assert {(c.cross.top_k, c.atr_stop_multiplier) for c in candidates} == {
+        (1, 2.0), (1, 3.0), (3, 2.0), (3, 3.0)
+    }
+
+
+def test_the_candidate_cap_still_binds_after_the_cross_axis_is_added():
+    """Delegating to the audited builder must not smuggle candidates past it."""
+
+    build = _candidate_builder(CrossSectionalConfig())
+    grid = {
+        "cross": [CrossSectionalConfig(lookback=lb) for lb in (10, 20, 30)],
+        "atr_stop_multiplier": [2.0, 2.5, 3.0],
+    }
+    with pytest.raises(ValueError, match="maximum is"):
+        build(CryptoStrategyConfig(symbols=SYMBOLS), grid, max_candidates=8)
+    # And the base allowlist is still enforced, not bypassed.
+    with pytest.raises(ValueError, match="Unsupported crypto tunables"):
+        build(
+            CryptoStrategyConfig(symbols=SYMBOLS),
+            {"cross": [CrossSectionalConfig()], "not_a_real_parameter": [1]},
+            max_candidates=8,
+        )
+
+
+def test_a_searched_candidate_is_evaluated_with_its_own_parameters():
+    """Each candidate must be judged on the parameters it carries."""
+
+    slow = with_cross_config(
+        CryptoStrategyConfig(symbols=SYMBOLS, timeframe="1Day"),
+        CrossSectionalConfig(lookback=45, vol_lookback=45),
+    )
+    fast = with_cross_config(slow, CrossSectionalConfig(lookback=10, vol_lookback=10))
+    assert isinstance(fast, CrossSectionalStrategyConfig)
+    assert CrossSectionalMomentumStrategy(slow).cross_config.lookback == 45
+    assert CrossSectionalMomentumStrategy(fast).cross_config.lookback == 10
+
+    universe = _universe()
+    backtest = CryptoBacktestConfig(
+        start_date=universe["BTC/USD"].index[0].date(),
+        end_date=universe["BTC/USD"].index[-1].date(),
+    )
+    slow_result = run_cross_sectional_backtest(
+        universe, slow, CryptoRiskConfig(), backtest
+    )
+    fast_result = run_cross_sectional_backtest(
+        universe, fast, CryptoRiskConfig(), backtest
+    )
+    assert slow_result.num_trades != fast_result.num_trades, (
+        "both candidates produced identical books: the parameters were ignored"
+    )
+
+
+def test_walk_forward_searches_the_cross_axis_and_reports_what_it_searched():
+    universe = _universe(periods=1_400)
+    grid = {"cross": [CrossSectionalConfig(lookback=lb) for lb in (15, 30)]}
+    result = run_cross_sectional_walk_forward(
+        universe,
+        CryptoStrategyConfig(symbols=SYMBOLS, timeframe="1Day"),
+        CryptoRiskConfig(),
+        CryptoBacktestConfig(
+            start_date=universe["BTC/USD"].index[0].date(),
+            end_date=universe["BTC/USD"].index[-1].date(),
+        ),
+        grid,
+        CryptoWalkForwardConfig(
+            train_bars=400, test_bars=150, step_bars=150, min_train_trades=1
+        ),
+        CryptoPromotionCriteria(),
+    )
+    assert result.candidate_count == 2
+    assert result.protocol["decision_engine"] == "cross_sectional_momentum"
+    assert [entry["lookback"] for entry in result.protocol["cross_sectional_grid"]] == [15, 30]
+    assert result.protocol["cross_sectional_selected"]["lookback"] in (15, 30)
+    for fold in result.folds:
+        assert fold.selected_config.cross.lookback in (15, 30)
+
+
 def test_invalid_configuration_is_rejected():
     with pytest.raises(ValueError, match="cross-sectional"):
         CrossSectionalMomentumStrategy(
@@ -185,3 +303,15 @@ def test_invalid_configuration_is_rejected():
         "falling assets" in error
         for error in CrossSectionalConfig(min_score=-1.0).validate()
     )
+    # A bad cross-sectional candidate must fail the combined config too, so the
+    # audited builder's validity filter can drop it.
+    assert CrossSectionalStrategyConfig(
+        symbols=SYMBOLS, cross=CrossSectionalConfig(top_k=0)
+    ).validate()
+    assert not CrossSectionalStrategyConfig(symbols=SYMBOLS).validate()
+    with pytest.raises(ValueError, match="CrossSectionalConfig instances"):
+        _candidate_builder(CrossSectionalConfig())(
+            CryptoStrategyConfig(symbols=SYMBOLS),
+            {"cross": [{"lookback": 20}]},
+            max_candidates=8,
+        )
