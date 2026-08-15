@@ -59,7 +59,6 @@ jobs:
           if [ -n "${workspace}" ]; then
             container_flag="-workspace"
             container="${workspace}"
-            schemes_query='.workspace.schemes[]?'
           else
             project="$(find ios -maxdepth 1 -name '*.xcodeproj' | head -n 1)"
             if [ -z "${project}" ]; then
@@ -70,17 +69,24 @@ jobs:
             echo "note: no .xcworkspace found, building ${project} directly"
             container_flag="-project"
             container="${project}"
-            schemes_query='.project.schemes[]?'
           fi
 
-          # Ignore CocoaPods' own schemes and prefer the app scheme.
-          scheme="$(xcodebuild "${container_flag}" "${container}" -list -json \
-            | jq -r "[${schemes_query} | select(startswith(\"Pods\") | not)] | first // \"\"")"
-          if [ -z "${scheme}" ]; then
-            echo "could not determine an app scheme" >&2
-            xcodebuild "${container_flag}" "${container}" -list || true
+          # `xcodebuild -list` is not safe for scheme selection here: on a
+          # CocoaPods workspace it also enumerates one autocreated scheme per
+          # pod target (e.g. "EXApplication", "React-Core"), and those don't
+          # start with "Pods" either, so a naive exclude filter can still pick
+          # a library instead of the app — which silently "succeeds" while
+          # never building or producing Trade.app. Expo prebuild always
+          # writes exactly one real *shared* scheme, named after the app
+          # target; read that file directly instead of trusting -list.
+          scheme_file="$(find ios -path '*/xcshareddata/xcschemes/*.xcscheme' | head -n 1)"
+          if [ -z "${scheme_file}" ]; then
+            echo "no shared Xcode scheme found under ios/**/xcshareddata/xcschemes" >&2
+            find ios -maxdepth 4 -iname '*.xcscheme' || true
             exit 1
           fi
+          scheme="$(basename "${scheme_file}" .xcscheme)"
+          echo "note: using shared scheme file ${scheme_file}"
 
           {
             echo "container_flag=${container_flag}"
