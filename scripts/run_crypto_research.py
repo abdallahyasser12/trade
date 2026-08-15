@@ -94,6 +94,14 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--test-bars", type=int, default=500)
     parser.add_argument("--min-train-trades", type=int, default=5)
     parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=None,
+        help="Concurrent position slots. Omit to use the config default (3). "
+             "With a wide universe the portfolio heat cap, not this count, is "
+             "what bounds total open risk.",
+    )
+    parser.add_argument(
         "--json-out", default="", help="Optional path to write the full verdict as JSON."
     )
     return parser.parse_args(argv)
@@ -219,6 +227,8 @@ def main(argv=None) -> int:
     risk_kwargs = {}
     if args.max_cost_to_risk is not None:
         risk_kwargs["max_cost_to_risk"] = args.max_cost_to_risk
+    if args.max_positions is not None:
+        risk_kwargs["max_positions"] = args.max_positions
     risk = CryptoRiskConfig(**risk_kwargs)
     backtest = CryptoBacktestConfig(
         start_date=start_date,
