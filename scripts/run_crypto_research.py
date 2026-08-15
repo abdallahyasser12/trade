@@ -161,52 +161,76 @@ def _cross_parameter_grid(strategy: CryptoStrategyConfig) -> dict:
     per fold: twelve times the compute, an argmax decided by tie-break order,
     and a reported candidate count implying a search that never happened.
 
-    Twelve real candidates instead. The momentum horizon and the volatility
-    horizon are tied together deliberately — measure the move over the same
-    window you measure its noise — which halves the surface for free. The stop
-    multiplier is the second axis because it sets the denominator of
+    Real candidates instead. The momentum horizon and the volatility horizon
+    are tied together deliberately — measure the move over the same window you
+    measure its noise — which halves the surface for free.
+
+    The stop multiplier is the second axis because it sets the denominator of
     cost-to-risk: a wider stop means a smaller position for the same risk
     budget and therefore less friction per unit of R, and friction per unit of
     R is the constraint that has decided every experiment so far. The wide
     value has to be genuinely wider than the default or the axis collapses.
+
+    The benchmark-regime gate is the third axis, and it earned its place by
+    killing a run. With the gate always on, a long-only book is flat whenever
+    BTC trades below its 200-day average — so a training window sitting inside
+    the 2022 bear market produces zero trades for every candidate, no
+    candidate can meet the in-sample evidence bar, and the entire walk-forward
+    aborts on its first fold. Searching the gate means a bear fold still has
+    something to select, and it turns "is the regime filter earning its keep?"
+    from an assumption into a question each fold answers with its own data.
     """
 
     return {
         "cross": [
-            CrossSectionalConfig(lookback=window, vol_lookback=window, top_k=top_k)
+            CrossSectionalConfig(
+                lookback=window,
+                vol_lookback=window,
+                top_k=top_k,
+                require_benchmark_bull=gated,
+            )
             for window in (20, 30, 45)
             for top_k in (2, 3)
+            for gated in (True, False)
         ],
         "atr_stop_multiplier": sorted({strategy.atr_stop_multiplier, 4.0}),
     }
 
 
 def _drop_late_listings(bars: dict, benchmark: str, *, min_symbols: int = 3):
-    """Drop symbols that would truncate the aligned window, worst first.
+    """Drop whichever symbol most limits the aligned window, repeatedly.
 
-    Greedy and explicit: while removing the latest-starting symbol would
-    genuinely lengthen the common window, remove it and say so. The benchmark
-    is never dropped — it defines the comparison — and the universe never
-    falls below ``min_symbols``, because a cross-sectional ranking over two
-    names is not a ranking.
+    Selection is by measured impact, not by start date. A late listing is the
+    obvious way to truncate the common index, but it is not the only one: a
+    symbol that began on day one and is missing 400 scattered days costs just
+    as much, and picking by start date would never touch it. Removing the
+    symbol whose removal recovers the most bars covers both cases with one
+    rule.
+
+    The benchmark is never dropped — it defines the comparison — and the
+    universe never falls below ``min_symbols``, because a cross-sectional
+    ranking over two names is not a ranking.
     """
 
     kept = dict(bars)
     dropped: list[tuple[str, str]] = []
     while len(kept) > min_symbols:
-        candidates = {s: f for s, f in kept.items() if s != benchmark}
-        if not candidates:
-            break
-        latest = max(candidates, key=lambda symbol: candidates[symbol].index[0])
         before = _aligned_length(kept)
-        after = _aligned_length({s: f for s, f in kept.items() if s != latest})
-        if after <= before:
+        best, recovered = None, before
+        for symbol in kept:
+            if symbol == benchmark:
+                continue
+            length = _aligned_length({s: f for s, f in kept.items() if s != symbol})
+            if length > recovered:
+                best, recovered = symbol, length
+        if best is None:
             break
-        start = kept[latest].index[0]
-        dropped.append(
-            (latest, f"starts {start:%Y-%m-%d}; keeping it costs {after - before} aligned bars")
-        )
-        kept.pop(latest)
+        frame = kept.pop(best)
+        dropped.append((
+            best,
+            f"starts {frame.index[0]:%Y-%m-%d}, {len(frame)} bars; "
+            f"dropping it recovers {recovered - before} aligned bars",
+        ))
     return kept, dropped
 
 
@@ -481,8 +505,14 @@ def main(argv=None) -> int:
     except ValueError as exc:
         return _fail(
             f"Walk-forward could not complete: {exc}\n"
-            "This is usually too little history for the requested fold sizes, or a\n"
-            "cost gate strict enough that no candidate met --min-train-trades."
+            "Three causes account for almost every occurrence:\n"
+            "  - too little aligned history for the requested fold sizes (the note\n"
+            "    above says which symbol cost the most bars; --drop-late-listings\n"
+            "    removes it),\n"
+            "  - a cost gate strict enough that no candidate met --min-train-trades,\n"
+            "  - a training window sitting entirely inside a bear market, where a\n"
+            "    regime-gated long-only book never trades and so cannot be selected\n"
+            "    on. Lengthen --train-bars so each window spans both regimes."
         )
 
     cost = _cost_section(strategy, backtest, result)
@@ -511,6 +541,7 @@ def main(argv=None) -> int:
                 f"    fold {index:<2} lookback {chosen.lookback:>3}"
                 f"  top_k {chosen.top_k}"
                 f"  stop {fold.selected_config.atr_stop_multiplier:g}x ATR"
+                f"  regime gate {'on' if chosen.require_benchmark_bull else 'off'}"
             )
 
     print(f"\n{RULE}\nPROMOTION VERDICT\n{RULE}")

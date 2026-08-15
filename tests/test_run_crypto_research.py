@@ -283,8 +283,11 @@ def test_cross_engine_searches_its_own_parameters_not_the_breakout_grid():
         strategy, grid, max_candidates=32
     )
     identities = {repr(sorted(c.to_dict().items())) for c in candidates}
-    assert len(candidates) == 12
-    assert len(identities) == 12, "candidates collapsed: the search would be a no-op"
+    assert len(candidates) == 24
+    assert len(identities) == 24, "candidates collapsed: the search would be a no-op"
+    # Both regime settings must be present, or a bear-market training window
+    # has nothing to select and the whole run aborts on its first fold.
+    assert {c.cross.require_benchmark_bull for c in candidates} == {True, False}
 
 
 def test_cross_engine_runs_end_to_end_and_reports_what_each_fold_selected(
@@ -322,7 +325,7 @@ def test_cross_engine_runs_end_to_end_and_reports_what_each_fold_selected(
     out = capsys.readouterr().out
     assert code in (0, 1)
     assert "PROMOTION VERDICT" in out
-    assert "Candidates per fold        12" in out
+    assert "Candidates per fold        24" in out
     assert "Selected per fold (in-sample):" in out
     assert "lookback" in out
 
@@ -418,6 +421,17 @@ def test_dropping_late_listings_recovers_the_window_and_keeps_the_benchmark():
     kept, dropped = module._drop_late_listings(frames, "BTC/USD")
     assert [symbol for symbol, _ in dropped] == ["LATE/USD"]
     assert set(kept) == {"BTC/USD", "ETH/USD", "SOL/USD"}
+    assert module._aligned_length(kept) == 2_000
+    assert "recovers 1500 aligned bars" in dropped[0][1]
+
+    # Selection is by measured impact, not start date: a symbol that begins on
+    # day one but is missing scattered days limits the window just as much, and
+    # a start-date rule would never see it.
+    gappy = dict(frames)
+    del gappy["LATE/USD"]
+    gappy["GAPPY/USD"] = pd.DataFrame({"close": 1.0}, index=index.delete(slice(100, 900)))
+    kept, dropped = module._drop_late_listings(gappy, "BTC/USD")
+    assert [symbol for symbol, _ in dropped] == ["GAPPY/USD"]
     assert module._aligned_length(kept) == 2_000
 
     # The benchmark is never dropped, even when it is the late one.

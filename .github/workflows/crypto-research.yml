@@ -45,9 +45,13 @@ on:
       test_bars:
         description: "Out-of-sample bars per fold"
         default: "500"
-      min_train_trades:
-        description: "Minimum trades a candidate must show in-sample to be considered"
-        default: "5"
+      # workflow_dispatch allows at most 10 inputs. --min-train-trades held the
+      # last slot and was set to 5 on every run; this toggle is needed on most
+      # of them, because one late listing silently truncates the whole universe.
+      drop_late_listings:
+        description: "Drop the symbols that most truncate the aligned window (reports each drop)"
+        type: boolean
+        default: false
 
 concurrency:
   group: crypto-research-${{ github.ref }}
@@ -97,7 +101,8 @@ jobs:
             --max-cost-to-risk "${{ inputs.max_cost_to_risk }}" \
             --train-bars "${{ inputs.train_bars }}" \
             --test-bars "${{ inputs.test_bars }}" \
-            --min-train-trades "${{ inputs.min_train_trades }}" \
+            --min-train-trades 5 \
+            ${{ inputs.drop_late_listings && '--drop-late-listings' || '' }} \
             --json-out verdict.json \
             2>&1 | tee report.txt
           echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
