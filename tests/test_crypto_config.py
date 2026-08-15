@@ -15,10 +15,16 @@ from crypto_config import (
 
 
 def test_live_credentials_never_fall_back_to_paper(monkeypatch):
+    # Blank rather than delete: the namespaced names take precedence over the
+    # legacy ones, and `load_credentials` calls `load_dotenv`, which would
+    # repopulate a deleted variable from a local .env. Setting them empty keeps
+    # this hermetic on a machine that has real credentials exported.
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "")
     monkeypatch.setenv("ALPACA_API_KEY", "legacy-paper")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "legacy-secret")
-    monkeypatch.delenv("ALPACA_LIVE_API_KEY", raising=False)
-    monkeypatch.delenv("ALPACA_LIVE_SECRET_KEY", raising=False)
+    monkeypatch.setenv("ALPACA_LIVE_API_KEY", "")
+    monkeypatch.setenv("ALPACA_LIVE_SECRET_KEY", "")
     live = load_credentials(account_mode=AccountMode.LIVE)
     paper = load_credentials(account_mode=AccountMode.PAPER)
     assert live.is_configured is False

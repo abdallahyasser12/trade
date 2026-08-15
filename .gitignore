@@ -39,3 +39,9 @@ Thumbs.db
 .idea/
 .vscode/
 
+
+# Local verification artifacts from scripts/run_all_checks.sh
+check-report-*.txt
+research-*.json
+report.txt
+verdict.json
