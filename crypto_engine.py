@@ -22,6 +22,7 @@ from crypto_config import (
 )
 from crypto_data_feed import AlpacaCryptoDataFeed, is_crypto_data_stale, quote_is_safe
 from crypto_models import CryptoEngineStatus, CryptoPositionState, CryptoSignalDecision
+from cost_model import cost_to_risk, round_trip_cost_bps
 from crypto_risk import CryptoRiskManager, portfolio_market_value
 from crypto_strategy import CryptoRegimeStrategy
 from data_feed import DataFeedError
@@ -35,6 +36,9 @@ CRYPTO_ENGINE_STATUS_KEY = "crypto_engine_status"
 CRYPTO_KILL_SWITCH_KEY = "crypto_kill_switch"
 CRYPTO_LAST_SIGNALS_KEY = "crypto_last_signals"
 _QTY_EPSILON = 1e-12
+# A guard exit that keeps coming back rejected is an unhandled broker state,
+# not something to retry indefinitely against a live position.
+_MAX_GUARD_ATTEMPTS = 5
 
 
 def _utc_now() -> datetime:
@@ -145,7 +149,10 @@ class CryptoTradeEngine:
             with self._lock:
                 self._status.state = EngineState.RUNNING
                 self._persist_status()
-            interval = self.engine_config.resolved_poll_interval(
+            idle_interval = self.engine_config.resolved_poll_interval(
+                self.strategy_config.timeframe
+            )
+            exposed_interval = self.engine_config.exposed_poll_interval(
                 self.strategy_config.timeframe
             )
             while not self._stop_event.is_set():
@@ -159,6 +166,9 @@ class CryptoTradeEngine:
                     with self._lock:
                         self._status.warnings = [str(exc)]
                         self._persist_status()
+                # Watch far more often while something is at risk.  The bar
+                # cadence governs decisions; protection is a quote-level job.
+                interval = exposed_interval if self._has_exposure() else idle_interval
                 if self._stop_event.wait(interval):
                     break
             with self._lock:
@@ -457,6 +467,26 @@ class CryptoTradeEngine:
             entry_price = quote.ask_price
             atr_value = float(decision.atr or 0.0)
             stop_price = entry_price - atr_value * self.strategy_config.atr_stop_multiplier
+            # Friction measured against this trade's own risk unit, using the
+            # live spread. A trade that pays most of 1R to get in and out needs
+            # an implausible win rate; it is rejected before it is sized.
+            trade_cost_to_risk = cost_to_risk(
+                entry_price=entry_price,
+                stop_price=stop_price,
+                round_trip_bps=round_trip_cost_bps(
+                    slippage_bps=self.engine_config.expected_slippage_bps,
+                    spread_bps=quote.spread_bps,
+                    taker_fee_bps=self.engine_config.taker_fee_bps,
+                ),
+            )
+            if trade_cost_to_risk > self.risk_config.max_cost_to_risk:
+                self._log(
+                    "INFO",
+                    f"{symbol} entry blocked: round-trip cost is "
+                    f"{trade_cost_to_risk:.2f}R, above the "
+                    f"{self.risk_config.max_cost_to_risk:.2f}R limit.",
+                )
+                continue
             asset = self._assets[symbol]
             size = self.risk.size_position(
                 equity=account.equity,
@@ -1007,13 +1037,30 @@ class CryptoTradeEngine:
                     f"{symbol} stop watchdog ignored unsafe quote: {watchdog_reason}",
                 )
                 continue
-            if quote.bid_price <= local.stop_price and local.breached_at is None:
-                local.breached_at = now.isoformat()
-                self._save_position(local)
-            if local.breached_at is None:
+            # A breach must be observed, sustained, and still true at
+            # escalation time.  Any quote back above the stop clears the latch:
+            # without this un-latch a single wick permanently arms a market
+            # liquidation that fires on the next poll even after a full price
+            # recovery, which turns winning trends into scratches.
+            if quote.bid_price > local.stop_price:
+                if local.breached_at is not None or local.breach_confirmations:
+                    local.breached_at = None
+                    local.breach_confirmations = 0
+                    self._save_position(local)
+                    self._log(
+                        "INFO",
+                        f"{symbol} stop breach cleared; bid {quote.bid_price} "
+                        f"recovered above stop {local.stop_price}.",
+                    )
                 continue
+            if local.breached_at is None:
+                local.breached_at = now.isoformat()
+            local.breach_confirmations += 1
+            self._save_position(local)
             breached = datetime.fromisoformat(local.breached_at)
             if (now - breached).total_seconds() < self.engine_config.stop_watchdog_grace_seconds:
+                continue
+            if local.breach_confirmations < self.engine_config.stop_watchdog_min_confirmations:
                 continue
             stop = (
                 self.broker.get_order_by_client_id(local.stop_client_order_id)
@@ -1031,7 +1078,32 @@ class CryptoTradeEngine:
                 self.store.clear_bot_position(symbol)
                 continue
             timestamp = breached
-            client_id = make_client_order_id(self.session_id, "guard", timestamp, symbol)
+            # The id stays deterministic per breach so a timeout after
+            # acceptance maps back to the same order.  It advances only when
+            # the previous guard is terminal WITHOUT a fill: otherwise a single
+            # rejection freezes this id forever and every later escalation
+            # resolves to that dead order, leaving the position unprotected.
+            attempt = max(1, local.guard_attempt)
+            client_id = make_client_order_id(
+                self.session_id, "guard", timestamp, symbol, attempt=attempt
+            )
+            while attempt < _MAX_GUARD_ATTEMPTS:
+                prior = self.broker.get_order_by_client_id(client_id)
+                if prior is None or not prior.is_terminal or prior.filled_qty > 0:
+                    break
+                attempt += 1
+                client_id = make_client_order_id(
+                    self.session_id, "guard", timestamp, symbol, attempt=attempt
+                )
+            else:
+                self._log(
+                    "CRITICAL",
+                    f"{symbol} guard exit was rejected {_MAX_GUARD_ATTEMPTS} times; "
+                    "arming the kill switch instead of resubmitting.",
+                )
+                self._arm_kill_switch(f"{symbol} guard exit repeatedly rejected")
+                continue
+            local.guard_attempt = attempt
             local.pending_exit_client_order_id = client_id
             local.stop_client_order_id = None
             local.stop_broker_order_id = None
@@ -1059,6 +1131,21 @@ class CryptoTradeEngine:
             self._record_fill_delta(intent, order, None)
             self._log("CRITICAL", f"{symbol} stop-limit watchdog submitted market exit.")
 
+    def _arm_kill_switch(self, message: str) -> None:
+        """Latch the dashboard kill switch; Start stays blocked until acked."""
+
+        self.store.set_kv(
+            CRYPTO_KILL_SWITCH_KEY,
+            json.dumps(
+                {
+                    "armed": True,
+                    "reason": "GUARD_EXIT_FAILED",
+                    "at": self._now_fn().isoformat(),
+                    "message": message,
+                }
+            ),
+        )
+
     def _cancel_and_confirm(self, order: OrderRecord) -> bool:
         if order.is_terminal:
             return True
@@ -1085,6 +1172,22 @@ class CryptoTradeEngine:
                 self._cancel_and_confirm(order)
         except BrokerError as exc:
             self._log("ERROR", f"Could not cancel orphan {local.symbol} stop: {exc}")
+
+    def _has_exposure(self) -> bool:
+        """True when a bot position is open, from local state only.
+
+        Deliberately does not call the broker: this only picks a sleep length
+        and runs outside the iteration's error handling, so it must never
+        raise and must never add a network round trip to the loop.
+        """
+
+        try:
+            for symbol in self.strategy_config.symbols:
+                if self.store.get_bot_position(symbol):
+                    return True
+        except Exception:  # noqa: BLE001 - cadence choice must never break the loop
+            return True
+        return False
 
     def _load_position(self, symbol: str) -> Optional[CryptoPositionState]:
         data = self.store.get_bot_position(symbol)

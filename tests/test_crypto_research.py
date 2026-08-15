@@ -111,3 +111,53 @@ def test_walk_forward_rejects_insufficient_aligned_history():
             CryptoWalkForwardConfig(train_bars=100, test_bars=40, step_bars=40),
             CryptoPromotionCriteria(),
         )
+
+
+def _fold(strategy_return_pct, benchmark_return_pct):
+    """Minimal fold stub carrying only what the promotion gate reads."""
+
+    from types import SimpleNamespace
+
+    def result(total):
+        return SimpleNamespace(
+            total_return_pct=total,
+            benchmark_return_pct=benchmark_return_pct,
+            num_trades=20,
+            max_drawdown_pct=5.0,
+            sharpe_ratio=1.5,
+            profit_factor=2.0,
+            equity_curve=pd.Series(
+                np.linspace(100.0, 100.0 * (1 + total / 100.0), 60),
+                index=pd.date_range("2025-01-01", periods=60, freq="h", tz="UTC"),
+            ),
+            trades=[],
+            config_snapshot={"backtest": {"risk_free_rate": 0.0}},
+        )
+
+    return SimpleNamespace(
+        test_result=result(strategy_return_pct),
+        baseline_result=result(0.0),
+        stressed_result=result(strategy_return_pct),
+        selected_config=compact_crypto_config(),
+    )
+
+
+def test_promotion_rejects_a_strategy_that_loses_to_buy_and_hold():
+    from crypto_research import evaluate_crypto_promotion
+
+    # Profitable in absolute terms, but the benchmark tripled it every fold.
+    folds = [_fold(5.0, 30.0) for _ in range(3)]
+    decision, metrics = evaluate_crypto_promotion(folds, CryptoPromotionCriteria())
+    assert not decision.promoted
+    assert metrics["benchmark_excess"] < 0
+    assert any("buy-and-hold" in failure for failure in decision.failures)
+
+
+def test_promotion_reports_benchmark_excess_when_the_strategy_wins():
+    from crypto_research import evaluate_crypto_promotion
+
+    folds = [_fold(30.0, 5.0) for _ in range(3)]
+    decision, metrics = evaluate_crypto_promotion(folds, CryptoPromotionCriteria())
+    assert metrics["benchmark_excess"] > 0
+    assert metrics["benchmark_beating_ratio"] == 1.0
+    assert not any("buy-and-hold" in failure for failure in decision.failures)

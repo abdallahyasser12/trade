@@ -87,6 +87,11 @@ class CryptoPromotionCriteria:
     min_profit_factor: float = 1.10
     max_fold_drawdown_pct: float = 20.0
     min_stressed_return_pct: float = 0.0
+    # A long-only book always has the alternative of simply holding the
+    # benchmark.  ``min_excess_return_pct`` compares the tuned config against
+    # the untuned one, which is a different question entirely.
+    min_benchmark_excess_return_pct: float = 0.0
+    min_benchmark_beating_fold_ratio: float = 0.50
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -103,11 +108,14 @@ class CryptoPromotionCriteria:
             "minimum profit factor": self.min_profit_factor,
             "maximum drawdown": self.max_fold_drawdown_pct,
             "minimum stressed return": self.min_stressed_return_pct,
+            "minimum benchmark excess return": self.min_benchmark_excess_return_pct,
         }.items():
             if not math.isfinite(value):
                 errors.append(f"{label} must be finite.")
         if self.min_profit_factor <= 0 or self.max_fold_drawdown_pct <= 0:
             errors.append("Profit-factor and drawdown gates must be positive.")
+        if not 0 <= self.min_benchmark_beating_fold_ratio <= 1:
+            errors.append("Benchmark-beating fold ratio must be between 0 and 1.")
         return errors
 
 
@@ -137,6 +145,9 @@ class CryptoWalkForwardResult:
     compounded_return_pct: float
     baseline_compounded_return_pct: float
     stressed_compounded_return_pct: float
+    benchmark_compounded_return_pct: float
+    benchmark_excess_return_pct: float
+    benchmark_beating_fold_ratio: float
     median_fold_return_pct: float
     positive_fold_ratio: float
     aggregate_sharpe: Optional[float]
@@ -201,6 +212,15 @@ def _compound(results: list[CryptoBacktestResult]) -> float:
     return (wealth - 1.0) * 100.0
 
 
+def _compound_benchmark(results: list[CryptoBacktestResult]) -> float:
+    """Buy-and-hold wealth over exactly the same out-of-sample folds."""
+
+    wealth = 1.0
+    for result in results:
+        wealth *= max(0.0, 1.0 + result.benchmark_return_pct / 100.0)
+    return (wealth - 1.0) * 100.0
+
+
 def _aggregate_sharpe(
     results: list[CryptoBacktestResult], timeframe: str, risk_free_rate: float
 ) -> Optional[float]:
@@ -248,6 +268,11 @@ def evaluate_crypto_promotion(
     compounded = _compound(tests)
     baseline = _compound(baselines)
     stressed_return = _compound(stressed)
+    benchmark = _compound_benchmark(tests)
+    benchmark_excess = compounded - benchmark
+    benchmark_beating_ratio = sum(
+        result.total_return_pct > result.benchmark_return_pct for result in tests
+    ) / len(tests)
     positive_ratio = sum(result.total_return_pct > 0 for result in tests) / len(tests)
     total_trades = sum(result.num_trades for result in tests)
     sharpe = _aggregate_sharpe(
@@ -268,12 +293,26 @@ def evaluate_crypto_promotion(
         (pf is not None and pf >= criteria.min_profit_factor, f"profit factor {'n/a' if pf is None else f'{pf:.2f}'} < {criteria.min_profit_factor:.2f}"),
         (worst_drawdown <= criteria.max_fold_drawdown_pct, f"worst drawdown {worst_drawdown:.2f}% > {criteria.max_fold_drawdown_pct:.2f}%"),
         (stressed_return >= criteria.min_stressed_return_pct, f"stressed return {stressed_return:.2f}% < {criteria.min_stressed_return_pct:.2f}%"),
+        (
+            benchmark_excess >= criteria.min_benchmark_excess_return_pct,
+            f"return vs buy-and-hold {benchmark_excess:+.2f}% "
+            f"({compounded:.2f}% strategy vs {benchmark:.2f}% benchmark) < "
+            f"{criteria.min_benchmark_excess_return_pct:.2f}%",
+        ),
+        (
+            benchmark_beating_ratio >= criteria.min_benchmark_beating_fold_ratio,
+            f"folds beating buy-and-hold {benchmark_beating_ratio:.2f} < "
+            f"{criteria.min_benchmark_beating_fold_ratio:.2f}",
+        ),
     ]
     failures.extend(message for passed, message in checks if not passed)
     metrics = {
         "compounded": compounded,
         "baseline": baseline,
         "stressed": stressed_return,
+        "benchmark": benchmark,
+        "benchmark_excess": benchmark_excess,
+        "benchmark_beating_ratio": benchmark_beating_ratio,
         "positive_ratio": positive_ratio,
         "total_trades": total_trades,
         "sharpe": sharpe,
@@ -392,6 +431,9 @@ def run_crypto_walk_forward(
         candidate_count=len(candidates),
         compounded_return_pct=metrics["compounded"],
         baseline_compounded_return_pct=metrics["baseline"],
+        benchmark_compounded_return_pct=metrics["benchmark"],
+        benchmark_excess_return_pct=metrics["benchmark_excess"],
+        benchmark_beating_fold_ratio=metrics["benchmark_beating_ratio"],
         stressed_compounded_return_pct=metrics["stressed"],
         median_fold_return_pct=float(median(fold.test_result.total_return_pct for fold in folds)),
         positive_fold_ratio=metrics["positive_ratio"],

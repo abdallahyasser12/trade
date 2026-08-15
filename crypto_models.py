@@ -128,6 +128,8 @@ class CryptoBacktestResult:
     realized_pnl: float
     total_fees: float
     exposure_time_pct: float
+    round_trip_cost_bps: float = 0.0
+    median_cost_to_risk: Optional[float] = None
     config_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
@@ -146,6 +148,8 @@ class CryptoPositionState:
     stop_attempt: int = 1
     pending_exit_client_order_id: Optional[str] = None
     breached_at: Optional[str] = None
+    breach_confirmations: int = 0
+    guard_attempt: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

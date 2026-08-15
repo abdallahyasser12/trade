@@ -1,0 +1,122 @@
+name: Crypto walk-forward research
+
+# Manual only. Runs the chronological walk-forward protocol against real
+# Alpaca market data and reports what a round trip costs and whether the
+# strategy beat simply holding the benchmark.
+#
+# Market data only: the script never constructs a broker and can never place
+# an order. Paper credentials are used purely to authenticate the data API.
+#
+# Required repository secrets:
+#   ALPACA_PAPER_API_KEY
+#   ALPACA_PAPER_SECRET_KEY
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Comma-separated Alpaca USD crypto pairs"
+        default: "BTC/USD,ETH/USD,SOL/USD"
+      benchmark:
+        description: "Buy-and-hold comparator (must be in the universe)"
+        default: "BTC/USD"
+      timeframe:
+        description: "Bar size — widen this if cost per trade is high"
+        type: choice
+        options: ["1Hour", "1Day", "15Min"]
+        default: "1Hour"
+      start:
+        description: "First research date (UTC, YYYY-MM-DD)"
+        default: "2023-01-01"
+      end:
+        description: "Last research date (UTC, blank = yesterday)"
+        default: ""
+      max_cost_to_risk:
+        description: "Cost admission gate in units of R (1.0 = config default, 0.25 = strict)"
+        default: "1.0"
+      train_bars:
+        description: "Training bars per fold"
+        default: "1500"
+      test_bars:
+        description: "Out-of-sample bars per fold"
+        default: "500"
+
+concurrency:
+  group: crypto-research-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: python -m pip install -r requirements.txt
+
+      - name: Verify credentials are configured
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          if [ -z "$ALPACA_PAPER_API_KEY" ] || [ -z "$ALPACA_PAPER_SECRET_KEY" ]; then
+            echo "::error::Set the ALPACA_PAPER_API_KEY and ALPACA_PAPER_SECRET_KEY repository secrets."
+            exit 1
+          fi
+
+      - name: Run walk-forward research
+        id: research
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          set +e
+          python scripts/run_crypto_research.py \
+            --symbols "${{ inputs.symbols }}" \
+            --benchmark "${{ inputs.benchmark }}" \
+            --timeframe "${{ inputs.timeframe }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --max-cost-to-risk "${{ inputs.max_cost_to_risk }}" \
+            --train-bars "${{ inputs.train_bars }}" \
+            --test-bars "${{ inputs.test_bars }}" \
+            --json-out verdict.json \
+            2>&1 | tee report.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the verdict
+        if: always()
+        run: |
+          {
+            echo "## Crypto walk-forward verdict"
+            echo
+            case "${{ steps.research.outputs.code }}" in
+              0) echo "**PASS** — eligible for controlled *paper* testing only. This does not unlock live trading." ;;
+              1) echo "**FAIL** — do not promote this configuration. A failure is information: the right response is a different timeframe, universe, or cost structure, never a looser gate." ;;
+              *) echo "**Could not complete** — see the log (credentials, data, or configuration)." ;;
+            esac
+            echo
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crypto-research-verdict
+          path: |
+            report.txt
+            verdict.json
+          if-no-files-found: warn
+
+      # A promotion FAIL (exit 1) is a legitimate research outcome and must not
+      # look like a broken pipeline. Only a run that could not complete fails.
+      - name: Fail only when the run could not complete
+        if: steps.research.outputs.code != '0' && steps.research.outputs.code != '1'
+        run: exit 1
