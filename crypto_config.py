@@ -192,6 +192,12 @@ class CryptoRiskConfig:
     # 1R in costs; tighten it toward 0.25 once walk-forward has been re-run
     # with the honest number in view.
     max_cost_to_risk: float = 1.0
+    # Enforced ceiling on the SUM of open risk (distance to each protective
+    # stop, marked from the latest price) as a percent of equity. Previously
+    # total heat was only an emergent product of max_positions multiplied by
+    # risk_per_trade_pct; the default equals that product so behaviour is
+    # unchanged until an operator raises positions or per-trade risk.
+    max_portfolio_heat_pct: float = 1.05
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -231,6 +237,10 @@ class CryptoRiskConfig:
             errors.append("Live total exposure cannot exceed the absolute 20% safety ceiling.")
         if not (0 < self.max_cost_to_risk <= 1):
             errors.append("Maximum cost-to-risk must be in (0, 1]; 1R of cost is never tradeable.")
+        if not (0 < self.max_portfolio_heat_pct <= 10):
+            errors.append("Portfolio heat cap must be in (0, 10]% of equity.")
+        if self.max_portfolio_heat_pct < self.risk_per_trade_pct:
+            errors.append("Portfolio heat cap cannot be below the per-trade risk budget.")
         return errors
 
     def to_dict(self) -> dict[str, Any]:

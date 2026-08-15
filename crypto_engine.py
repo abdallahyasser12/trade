@@ -427,7 +427,30 @@ class CryptoTradeEngine:
         }
         positions = dict(broker_positions)
         all_account_positions = self.broker.list_positions()
-        exposure = portfolio_market_value(all_account_positions)
+        # Broker truth includes every asset class on a shared account. Only
+        # crypto counts toward the crypto exposure cap; an unknown class still
+        # counts, so the gate can only fail conservative.
+        exposure = portfolio_market_value(
+            [
+                position
+                for position in all_account_positions
+                if position.asset_class in (None, "crypto")
+            ]
+        )
+        # Portfolio heat: the sum of distance-to-stop across held positions,
+        # marked from the latest completed close. This is what the heat cap
+        # in sizing measures new candidates against.
+        open_risk = 0.0
+        for held_symbol, held_position in positions.items():
+            local = self._load_position(held_symbol)
+            frame = prepared.get(held_symbol)
+            if local is None or frame is None:
+                continue
+            marks = frame["close"].loc[:bar_timestamp]
+            if marks.empty:
+                continue
+            mark = float(marks.iloc[-1])
+            open_risk += max(0.0, mark - local.stop_price) * held_position.qty
         newly_submitted = 0
         remaining_cash = account.cash
         remaining_buying_power = account.buying_power
@@ -497,6 +520,7 @@ class CryptoTradeEngine:
                 asset=asset,
                 current_crypto_exposure=exposure,
                 current_position_count=len(positions) + newly_submitted,
+                current_open_risk=open_risk,
                 peak_equity=self._peak_equity or account.equity,
                 atr_percentile=(
                     decision.atr_percentile
@@ -553,6 +577,7 @@ class CryptoTradeEngine:
             self._record_fill_delta(intent, order, decision)
             pending_buy_symbols.add(symbol)
             exposure += size.position_notional
+            open_risk += size.qty * size.risk_per_unit
             remaining_cash = max(0.0, remaining_cash - size.position_notional)
             remaining_buying_power = max(
                 0.0, remaining_buying_power - size.position_notional

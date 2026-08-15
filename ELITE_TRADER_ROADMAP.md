@@ -103,6 +103,40 @@ the same script from repository secrets (`ALPACA_PAPER_API_KEY`,
 `report.txt` and `verdict.json`. A promotion failure does not fail the pipeline —
 only a run that could not complete does.
 
+### 4. The regime ensemble is wired everywhere and is the default
+
+Previously the ensemble existed only as unreachable modules. It is now the
+default **Decision engine** selection in the dashboard (backtest, walk-forward
+research, and the paper/live engine itself, via the audited parent execution
+class), and available in the research CLI and CI workflow as `--engine
+ensemble`. The selection is part of the result fingerprint so cached research
+never mixes engines. First real out-of-sample run (daily bars, BTC/ETH,
+2021–2026): the ensemble sat out three crash folds and took only 2 trades —
+correctly rejected by the promotion gate as too little evidence, which is the
+gate doing its job.
+
+### 5. Portfolio heat is enforced, not emergent
+
+`CryptoRiskConfig.max_portfolio_heat_pct` caps the **sum of open risk**
+(distance to each held position's current stop, marked from the latest price)
+across the book, in sizing, in both the simulator and the live engine. The
+default equals the previously emergent maximum (`max_positions ×
+risk_per_trade_pct`), so behaviour is unchanged until an operator raises either
+knob — at which point the cap now holds where before nothing did.
+
+### 6. Stock positions no longer throttle crypto sizing
+
+`BrokerPosition` carries `asset_class`; the crypto exposure gate counts only
+crypto (and unknown, which fails conservative). On a shared account, a large
+equity book previously consumed the crypto exposure cap and silently blocked
+entries.
+
+### 7. Adaptive risk is on by default
+
+`RiskConfig.enable_adaptive_risk` defaulted `False` in code while the dashboard
+defaulted it `True`, so programmatic and UI configurations silently disagreed.
+Both now default on.
+
 ## Tier 1 — foundational (do before anything else)
 
 Nothing below this line is trustworthy until these exist. This is overwhelmingly

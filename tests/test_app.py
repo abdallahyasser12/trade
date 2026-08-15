@@ -30,6 +30,8 @@ def test_dashboard_renders_without_env_and_keeps_start_disabled(tmp_path, monkey
     account_mode = next(radio for radio in page.radio if radio.label == "Alpaca crypto account")
     assert account_mode.value == "Paper"
     assert account_mode.options == ["Paper", "Live"]
+    engine_radio = next(radio for radio in page.radio if radio.label == "Decision engine")
+    assert engine_radio.value == "Regime ensemble (default)"
 
 
 def test_live_switch_is_fail_closed_when_deployment_flag_is_absent(tmp_path, monkeypatch):
@@ -46,7 +48,10 @@ def test_live_switch_is_fail_closed_when_deployment_flag_is_absent(tmp_path, mon
     monkeypatch.chdir(tmp_path)
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     page = AppTest.from_file(str(app_path), default_timeout=20).run()
-    page.radio[0].set_value("Live").run()
+    account_mode = next(
+        radio for radio in page.radio if radio.label == "Alpaca crypto account"
+    )
+    account_mode.set_value("Live").run()
     assert list(page.exception) == []
     assert any("LIVE ACCOUNT" in error.value for error in page.error)
     unlock = next(button for button in page.button if button.label == "Unlock LIVE Trading")

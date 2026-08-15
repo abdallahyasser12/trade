@@ -425,7 +425,10 @@ class RiskConfig:
     max_daily_loss_pct: float = 3.0
     min_position_value: float = 100.0
     min_shares: int = 1
-    enable_adaptive_risk: bool = False
+    # On by default and matching the dashboard default: drawdown throttling
+    # and volatility scaling apply unless an operator deliberately disables
+    # them. Programmatic configs and UI configs now agree.
+    enable_adaptive_risk: bool = True
     min_risk_scale: float = 0.25
     drawdown_risk_reduction_start_pct: float = 1.0
     volatility_target_percentile: float = 50.0

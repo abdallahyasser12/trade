@@ -32,6 +32,9 @@ from config import (
     live_trading_enabled,
     result_context_fingerprint,
 )
+from advanced_crypto_backtest import run_regime_ensemble_backtest
+from advanced_crypto_engine import make_regime_aware_crypto_engine
+from advanced_crypto_research import run_regime_ensemble_walk_forward
 from cost_model import break_even_win_rate
 from crypto_backtest import run_crypto_backtest
 from crypto_config import (
@@ -53,6 +56,7 @@ from crypto_research import (
     run_crypto_walk_forward,
 )
 from data_feed import AlpacaDataFeed, DataFeedError, DataSubscriptionError
+from regime_ensemble import EnsembleConfig
 from models import BotAction, EngineState, SignalDecision, StopReason
 from risk_manager import RiskManager
 from research import (
@@ -1485,6 +1489,7 @@ def _crypto_context_fingerprint(
     risk: CryptoRiskConfig,
     engine: CryptoEngineConfig,
     backtest: CryptoBacktestConfig,
+    decision_engine: str = "base",
 ) -> str:
     payload = {
         "credential_fingerprint": credentials.fingerprint,
@@ -1492,6 +1497,7 @@ def _crypto_context_fingerprint(
         "risk": risk.to_dict(),
         "engine": engine.to_dict(),
         "backtest": backtest.to_dict(),
+        "decision_engine": decision_engine,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1592,6 +1598,23 @@ def render_crypto_workspace(store: StateStore) -> None:
     )
     controller = get_controller()
     engine_active = controller.is_running
+
+    decision_engine_label = st.radio(
+        "Decision engine",
+        ["Regime ensemble (default)", "Base breakout/trend"],
+        horizontal=True,
+        disabled=engine_active,
+        key="crypto_decision_engine",
+        help=(
+            "Both engines run through the identical execution, sizing, cost-gate, "
+            "and promotion machinery. The ensemble blends breakout, pullback, and "
+            "mean-reversion sleeves weighted by market regime; the base engine is "
+            "the original breakout/trend model. The selection is part of the result "
+            "fingerprint, so cached research never mixes engines."
+        ),
+    )
+    use_ensemble = decision_engine_label.startswith("Regime")
+    ensemble_config = EnsembleConfig() if use_ensemble else None
 
     mode_label = st.radio(
         "Alpaca crypto account",
@@ -1824,7 +1847,12 @@ def render_crypto_workspace(store: StateStore) -> None:
     )
     credentials = load_credentials(account_mode=account_mode)
     context_key = _crypto_context_fingerprint(
-        credentials, strategy_config, risk_config, engine_config, backtest_config
+        credentials,
+        strategy_config,
+        risk_config,
+        engine_config,
+        backtest_config,
+        decision_engine="ensemble" if use_ensemble else "base",
     )
     config_errors = (
         strategy_config.validate()
@@ -1863,13 +1891,23 @@ def render_crypto_workspace(store: StateStore) -> None:
                     )
                     for symbol in symbols
                 }
-                result = run_crypto_backtest(
-                    bars,
-                    strategy_config,
-                    risk_config,
-                    backtest_config,
-                    active_start=pd.Timestamp(activation),
-                )
+                if use_ensemble:
+                    result = run_regime_ensemble_backtest(
+                        bars,
+                        strategy_config,
+                        risk_config,
+                        backtest_config,
+                        active_start=pd.Timestamp(activation),
+                        ensemble_config=ensemble_config,
+                    )
+                else:
+                    result = run_crypto_backtest(
+                        bars,
+                        strategy_config,
+                        risk_config,
+                        backtest_config,
+                        active_start=pd.Timestamp(activation),
+                    )
             st.session_state["crypto_backtest_result"] = result
             st.session_state["crypto_backtest_bars"] = bars
             st.session_state["crypto_backtest_context"] = context_key
@@ -1917,15 +1955,27 @@ def render_crypto_workspace(store: StateStore) -> None:
                     for symbol, frame in st.session_state["crypto_backtest_bars"].items()
                 }
                 with st.spinner("Running bounded chronological crypto research…"):
-                    report = run_crypto_walk_forward(
-                        research_bars,
-                        strategy_config,
-                        risk_config,
-                        backtest_config,
-                        grid,
-                        walk,
-                        CryptoPromotionCriteria(),
-                    )
+                    if use_ensemble:
+                        report = run_regime_ensemble_walk_forward(
+                            research_bars,
+                            strategy_config,
+                            risk_config,
+                            backtest_config,
+                            grid,
+                            walk,
+                            CryptoPromotionCriteria(),
+                            ensemble_config=ensemble_config,
+                        )
+                    else:
+                        report = run_crypto_walk_forward(
+                            research_bars,
+                            strategy_config,
+                            risk_config,
+                            backtest_config,
+                            grid,
+                            walk,
+                            CryptoPromotionCriteria(),
+                        )
                 st.session_state["crypto_walk_result"] = report
                 st.session_state["crypto_walk_context"] = context_key
             except Exception as exc:
@@ -2020,6 +2070,19 @@ def render_crypto_workspace(store: StateStore) -> None:
         def factory():
             broker = _crypto_broker_for(credentials, risk_config)
             data_feed = AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
+            if use_ensemble:
+                # Same production engine underneath: broker verification, mode
+                # isolation, loss latch, stop watchdog, and recovery are all
+                # owned by the parent class. Only the decision layer differs.
+                return make_regime_aware_crypto_engine(
+                    broker,
+                    data_feed,
+                    store,
+                    strategy_config,
+                    risk_config,
+                    engine_config,
+                    ensemble_config=ensemble_config,
+                )
             return CryptoTradeEngine(
                 broker,
                 data_feed,

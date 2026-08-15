@@ -121,3 +121,32 @@ def test_correlation_gate_fails_closed_on_insufficient_history():
     assert not allowed
     assert correlation is None
     assert "Insufficient" in reason
+
+
+def test_heat_cap_rejects_when_open_risk_consumes_the_budget():
+    """Configured heat is enforced, not an emergent accident of settings."""
+
+    manager = CryptoRiskManager(CryptoRiskConfig())
+    # Default cap is 1.05% of 100k = $1,050 of open risk.
+    result = size(manager, current_open_risk=1_050.0)
+    assert not result.approved
+    assert "heat" in (result.rejection_reason or "").lower()
+
+
+def test_heat_cap_binds_sizing_below_the_per_trade_risk_budget():
+    manager = CryptoRiskManager(CryptoRiskConfig())
+    # $900 already at risk leaves $150 of heat against a $5 risk-per-unit:
+    # at most 30 units, well below the 70 the per-trade budget would allow.
+    constrained = size(manager, current_open_risk=900.0)
+    unconstrained = size(manager)
+    assert constrained.approved and unconstrained.approved
+    assert constrained.qty == pytest.approx(30.0)
+    assert unconstrained.qty == pytest.approx(70.0)
+    assert constrained.quantity_by_heat == pytest.approx(30.0)
+
+
+def test_heat_cap_cannot_be_configured_below_per_trade_risk():
+    errors = CryptoRiskConfig(
+        risk_per_trade_pct=0.5, max_portfolio_heat_pct=0.25
+    ).validate()
+    assert any("heat" in error.lower() for error in errors)

@@ -542,3 +542,18 @@ def test_entry_blocked_when_round_trip_cost_eats_the_risk_unit(tmp_path):
         [decision], prepared, bar_ts, {"BTC/USD": quote}, account, {}, now
     )
     assert [call for call in broker.market_calls if call[2] == "buy"]
+
+
+def test_stock_positions_do_not_consume_the_crypto_exposure_cap(tmp_path):
+    """A shared account's equity holdings must not throttle crypto sizing."""
+
+    engine, broker, store, _ = make_engine(tmp_path)
+    # A large stock position: under the old unfiltered exposure sum this
+    # consumed the entire 30% crypto cap and blocked every entry.
+    broker.positions["AAPL"] = BrokerPosition(
+        "AAPL", 100, 500, 500, 50_000, 0, 0, asset_class="us_equity"
+    )
+    engine._startup()
+    engine.run_iteration()
+    buys = [call for call in broker.market_calls if call[2] == "buy"]
+    assert len(buys) == 1

@@ -271,6 +271,9 @@ class BrokerPosition:
     market_value: Optional[float]
     unrealized_pl: Optional[float]
     unrealized_plpc: Optional[float]
+    # None means unknown; exposure gates treat unknown as crypto so they can
+    # only fail conservative on a shared stock-and-crypto account.
+    asset_class: Optional[str] = None
 
 
 @dataclass

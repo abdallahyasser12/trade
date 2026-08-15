@@ -114,6 +114,7 @@ class CryptoRiskManager:
         current_position_count: int,
         peak_equity: float,
         atr_percentile: float,
+        current_open_risk: float = 0.0,
         account_mode: AccountMode | str = AccountMode.PAPER,
     ) -> CryptoPositionSizeResult:
         mode = AccountMode(account_mode)
@@ -127,6 +128,7 @@ class CryptoRiskManager:
             current_crypto_exposure,
             peak_equity,
             atr_percentile,
+            current_open_risk,
         )
         if not all(math.isfinite(value) for value in numeric):
             return zero
@@ -149,6 +151,18 @@ class CryptoRiskManager:
         risk_per_unit = entry_price - stop_price
         risk_budget = equity * self.config.risk_per_trade_pct / 100.0 * scale
         by_risk = risk_budget / risk_per_unit
+        # Portfolio heat: the sum of open risk across every held position plus
+        # this candidate may never exceed the configured share of equity.
+        remaining_heat = (
+            equity * self.config.max_portfolio_heat_pct / 100.0
+            - max(0.0, current_open_risk)
+        )
+        if remaining_heat <= 0:
+            return self._rejected(
+                "Portfolio heat cap reached; open risk across held positions "
+                "already consumes the configured budget."
+            )
+        by_heat = remaining_heat / risk_per_unit
         by_position = equity * self.config.max_position_pct / 100.0 / entry_price
         total_cap_pct = (
             self.config.max_live_total_exposure_pct
@@ -160,7 +174,7 @@ class CryptoRiskManager:
         )
         by_portfolio = remaining_exposure / entry_price
         by_buying_power = min(cash, buying_power) / entry_price
-        candidates = [by_risk, by_position, by_portfolio, by_buying_power]
+        candidates = [by_risk, by_position, by_portfolio, by_buying_power, by_heat]
         if mode is AccountMode.LIVE:
             candidates.append(self.config.max_live_order_notional / entry_price)
         quantity = floor_to_increment(min(candidates), increment)
@@ -184,6 +198,7 @@ class CryptoRiskManager:
             quantity_by_buying_power=by_buying_power,
             position_notional=notional,
             risk_scale=scale,
+            quantity_by_heat=by_heat,
         )
 
     def correlation_gate(
