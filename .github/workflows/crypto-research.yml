@@ -26,9 +26,9 @@ on:
         options: ["1Hour", "4Hour", "1Day", "15Min"]
         default: "1Hour"
       engine:
-        description: "Decision engine: base (audited) or ensemble (regime-aware blend)"
+        description: "Decision engine: base, ensemble, or cross (cross-sectional momentum)"
         type: choice
-        options: ["base", "ensemble"]
+        options: ["base", "ensemble", "cross"]
         default: "base"
       start:
         description: "First research date (UTC, YYYY-MM-DD)"

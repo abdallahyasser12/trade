@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 
 from advanced_crypto_research import run_regime_ensemble_walk_forward
+from cross_sectional import CrossSectionalConfig
+from cross_sectional_research import run_cross_sectional_walk_forward
 from config import load_credentials, timeframe_to_timedelta
 from cost_model import break_even_win_rate, cost_to_risk, round_trip_cost_bps
 from crypto_config import (
@@ -74,11 +76,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--engine",
         default="base",
-        choices=["base", "ensemble"],
+        choices=["base", "ensemble", "cross"],
         help="Decision engine to walk forward. 'base' is the audited breakout/trend "
-             "strategy. 'ensemble' is the regime-aware multi-sleeve blend — it has "
-             "never been exercised end-to-end (no dashboard wiring existed before "
-             "this flag).",
+             "strategy. 'ensemble' is the regime-aware multi-sleeve blend. 'cross' is "
+             "cross-sectional risk-adjusted momentum — a different hypothesis (relative "
+             "ranking rather than an absolute filter conjunction), with six parameters "
+             "instead of fifteen.",
     )
     parser.add_argument(
         "--max-cost-to-risk",
@@ -336,7 +339,12 @@ def main(argv=None) -> int:
 
     print("\n  Running bounded chronological walk-forward…")
     try:
-        if args.engine == "ensemble":
+        if args.engine == "cross":
+            result = run_cross_sectional_walk_forward(
+                bars, strategy, risk, backtest, grid, walk, criteria,
+                cross_config=CrossSectionalConfig(),
+            )
+        elif args.engine == "ensemble":
             result = run_regime_ensemble_walk_forward(
                 bars, strategy, risk, backtest, grid, walk, criteria,
                 ensemble_config=EnsembleConfig(),
