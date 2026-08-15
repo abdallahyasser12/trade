@@ -18,6 +18,10 @@ stop-limit orders can remain unfilled through a gap. This software is not invest
 advice and is not described as live-money production-ready merely because live API
 access exists.
 
+An audit of every subsystem against professional systematic-desk practice, with
+a ranked and sequenced improvement plan, is in
+[`ELITE_TRADER_ROADMAP.md`](ELITE_TRADER_ROADMAP.md).
+
 The implemented stock design is documented in
 [`SMART_STRATEGY_PLAN.md`](SMART_STRATEGY_PLAN.md). The crypto architecture, safety
 boundary, execution model, and acceptance gates are documented in
