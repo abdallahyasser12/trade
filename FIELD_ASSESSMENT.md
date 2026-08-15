@@ -1,19 +1,23 @@
 # Field assessment — 15 August 2026
 
-Seven completed out-of-sample experiments against real Alpaca market data, run
-through promotion gates that were never loosened. An eighth, testing a
-structurally different signal family, is running.
+Eight completed out-of-sample experiments against real Alpaca market data, run
+through promotion gates that were never loosened.
 
 Hosted report: https://claude.ai/code/artifact/ea38f266-e60c-42eb-9af9-12b874dfa2b1
 
 ## Verdict
 
-**Not elite — yet.** The engineering is close to professional grade and in two
-places ahead of it. The strategy has now been measured seven ways and loses money
-in every configuration tested — most decisively in experiment 7, which removed the
-cost excuse and the sample-size excuse simultaneously and still lost 9 folds out
-of 9. Those are separate findings; conflating them is the mistake this document
-exists to prevent.
+**Not elite — yet, but no longer edgeless.** The engineering is close to
+professional grade and in two places ahead of it. Seven configurations of the
+breakout/ensemble signal lost money; experiment 7 removed the cost excuse and the
+sample-size excuse simultaneously and still lost 9 folds out of 9. Experiment 8
+changed the hypothesis rather than the parameters and produced the first positive
+expectancy at a real sample size — profit factor 1.48, Sharpe 0.52, positive under
+stress — while still failing promotion because it deploys almost no capital and so
+loses badly to simply holding BTC.
+
+Engineering quality and strategy quality are separate findings; conflating them is
+the mistake this document exists to prevent.
 
 ## Evidence
 
@@ -28,6 +32,7 @@ All figures out-of-sample, walk-forward, net of 75 bps round-trip friction.
 | 5 | 1Day | base | 9 symbols | 2 | 4 | −0.07% | +19.80% | −0.14 | 0.82 |
 | 6 | 4Hour | base | 8 symbols | 9 | 82 | −2.48% | +207.71% | −0.40 | 0.76 |
 | 7 | 4Hour | ensemble | 8 symbols | 9 | 164 | −11.50% | +207.71% | −1.80 | 0.35 |
+| 8 | 1Day | **cross** | 9 symbols | 8 | 96 | **+2.01%** | +112.48% | **+0.52** | **1.48** |
 
 Runs 2 and 4 appear to "beat the benchmark" only because the strategy sat in cash
 through a crash. With 1–2 trades they carry no statistical weight, and the
@@ -96,23 +101,28 @@ noise, not from the strategy having good stretches.
 
 - **It cannot fool itself about costs.** One friction formula feeds simulator and
   live engine, expressed in units of the risk each trade takes.
-- **Its gates do not bend.** Seven runs, seven honest verdicts, zero adjustments.
+- **Its gates do not bend.** Eight runs, eight honest verdicts, zero adjustments —
+  including the one that finally showed positive expectancy and was still rejected.
 
 That machinery is the durable asset — it is what makes the negative result
 trustworthy, and what any future strategy would be judged by.
 
 ## What would have to change
 
-Every lever the codebase exposes has been pulled — three timeframes, four universe
-sizes, both engines, two grid scales, a corrected embargo — and they converge.
+Every lever the codebase exposes was pulled against the original signal — three
+timeframes, four universe sizes, both engines, two grid scales, a corrected
+embargo — and they converged on failure. Item 1 has since been done, and changed
+the picture.
 
-1. A different signal family, through the same unmodified gates.
+1. ~~A different signal family, through the same unmodified gates.~~ **Done —
+   experiment 8.** It produced the first positive expectancy. It still fails on
+   deployment, not on edge, which is a different and more tractable problem.
 2. Build the execution-quality ledger first; until realized slippage is measured,
    no live result can be attributed to signal versus execution.
 3. Or stop: keep the measurement machine, run the ensemble in paper as a
    capital-preservation overlay, and stop paying the opportunity cost.
 
-### Item 1 is now in progress
+### Item 1 — what was built
 
 `cross_sectional.py` is the different signal family, chosen to attack the two
 diagnosed failures rather than to reparameterise around them:
@@ -147,8 +157,69 @@ have produced a dishonest test:
   bull folds only — the strategy would score better the more often it declined to
   trade. The gate is therefore searched rather than assumed.
 
-Whether it has edge is an empirical question. Nothing above answers it; it only
-makes the question askable through gates that have never been loosened.
+### Experiment 8 — the first positive expectancy
+
+The cross-sectional engine still **FAILS** promotion, and correctly so. But it
+fails for an entirely different reason than everything before it, and that
+difference is the most useful thing measured so far.
+
+| | Experiment 7 (ensemble) | Experiment 8 (cross-sectional) |
+|---|---|---|
+| Profit factor | 0.35 | **1.48** |
+| Aggregate Sharpe | −1.80 | **+0.52** |
+| Positive folds | 0% | 50% |
+| Stressed return | −15.74% | **+1.11%** |
+| Compounded return | −11.50% | **+2.01%** |
+
+Eight leakage-free folds, 96 out-of-sample trades, 24 candidates searched per
+fold. This is the first configuration at a meaningful sample size that makes
+money rather than bleeding, and it stays positive under the stress run (35 bps
+slippage, 50 bps fee, 20 bps spread). The hypothesis change did what changing the
+parameters never did.
+
+It fails on three gates, all of them fair:
+
+- positive-fold ratio 0.50 < 0.60 — coin-flip territory
+- excess return −1.35% < 0
+- return versus buy-and-hold −110.47% (+2.01% strategy against +112.48% BTC)
+
+**The parameter selections are stable, which is weak but real evidence.** Across
+eight independent folds the search chose `lookback=30` seven times and a 4× ATR
+stop seven times. Independent windows converging on the same values is what a
+genuine optimum looks like; noise-fitting scatters. The regime gate did not
+converge — off in five folds, on in three — so that filter is not reliably
+earning its place and should be regarded as unresolved rather than validated.
+
+**The binding constraint is now exposure, not signal.** Sizing is risk-based:
+position notional = `risk_per_trade_pct` ÷ stop distance. At the default 0.35%
+risk and the 4× ATR stop the search preferred, a daily crypto stop sits roughly
+6–20% from entry, so each position is about 1.8–5.8% of equity. Three positions
+means the book is **roughly 82–95% cash at all times**. A portfolio that is ~90%
+in cash cannot track a benchmark that rose 112%, no matter how good its entries
+are.
+
+That reframes the problem. Every prior experiment failed because the signal had
+no edge; this one has positive expectancy and simply deploys almost no capital
+against it. Sizing is a far more tractable problem than edge.
+
+Three caveats, stated because they are what would make this wrong:
+
+1. **The search burden is real.** Sharpe 0.52 was selected from 24 candidates per
+   fold. The selection penalty at 96 observations is roughly 0.26, so a deflated
+   figure lands near 0.26 — positive, but weak. This is suggestive, not
+   established.
+2. **Scaling exposure amplifies whatever is there, including noise.** Raising
+   risk per trade does not create edge. If the 1.48 profit factor is a small-sample
+   artefact, larger positions turn a small drift into a large one in whichever
+   direction the artefact points.
+3. **Eight folds over one crypto cycle.** Alpaca history starts 2021-01-01. This
+   has not been tested across an independent market epoch, and cannot be.
+
+The correct next experiment is therefore a sizing sweep at fixed signal — vary
+`risk_per_trade_pct` and `max_positions` while holding the selected momentum
+parameters constant — to establish whether risk-adjusted performance survives
+higher deployment or was an artefact of trading tiny. That question is answerable
+with the machinery already built, through the same unmodified gates.
 
 ## Limits
 
