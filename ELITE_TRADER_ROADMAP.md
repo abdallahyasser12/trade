@@ -84,6 +84,25 @@ cost, median cost-per-trade in R, and the break-even win rate that implies.
 > information, not failure. The honest responses are 4Hour/1Day bars or maker
 > entries — not a looser ratio.
 
+### Running it
+
+`scripts/run_crypto_research.py` executes the protocol and prints both verdicts —
+what a round trip costs in units of R, and whether the strategy beat holding the
+benchmark. It reads paper credentials from the environment and touches market
+data only; it never constructs a broker and cannot place an order.
+
+```bash
+python scripts/run_crypto_research.py                       # config defaults
+python scripts/run_crypto_research.py --max-cost-to-risk 0.25 --timeframe 1Day
+```
+
+Exit codes: `0` promoted, `1` gates failed (a normal, informative outcome), `2`
+could not run. The **Crypto walk-forward research** GitHub Actions workflow runs
+the same script from repository secrets (`ALPACA_PAPER_API_KEY`,
+`ALPACA_PAPER_SECRET_KEY`), publishes the verdict to the job summary, and uploads
+`report.txt` and `verdict.json`. A promotion failure does not fail the pipeline —
+only a run that could not complete does.
+
 ## Tier 1 — foundational (do before anything else)
 
 Nothing below this line is trustworthy until these exist. This is overwhelmingly
