@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import hashlib
+import math
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -31,6 +32,7 @@ from config import (
     live_trading_enabled,
     result_context_fingerprint,
 )
+from cost_model import break_even_win_rate
 from crypto_backtest import run_crypto_backtest
 from crypto_config import (
     DEFAULT_CRYPTO_UNIVERSE,
@@ -1506,6 +1508,34 @@ def _render_crypto_backtest_result(result) -> None:
     )
     cols[4].metric("Closed trades", str(result.num_trades))
     cols[5].metric("Modeled fees", fmt_money(result.total_fees))
+
+    cost_cols = st.columns(3)
+    cost_cols[0].metric(
+        "Round-trip cost", f"{result.round_trip_cost_bps:.1f} bps",
+        help="Both legs: slippage, half the spread, and the taker fee.",
+    )
+    if result.median_cost_to_risk is None:
+        cost_cols[1].metric("Cost per trade", "—")
+        cost_cols[2].metric("Break-even win rate", "—")
+    else:
+        ratio = result.median_cost_to_risk
+        cost_cols[1].metric(
+            "Cost per trade", f"{ratio:.2f} R",
+            help=(
+                "Median friction as a fraction of the trade's own risk unit "
+                "(entry minus stop). Above ~0.25R the strategy is paying a "
+                "large share of what it risks just to transact."
+            ),
+        )
+        win_rate = break_even_win_rate(ratio, reward_to_risk=2.0)
+        cost_cols[2].metric(
+            "Break-even win rate",
+            "unreachable" if math.isnan(win_rate) else f"{win_rate:.1%}",
+            help=(
+                "Win rate needed at 2R reward:risk just to break even after "
+                "costs. Trend systems typically win 35-45%."
+            ),
+        )
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(

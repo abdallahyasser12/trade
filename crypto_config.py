@@ -187,6 +187,11 @@ class CryptoRiskConfig:
     volatility_target_percentile: float = 50.0
     max_live_order_notional: float = 1_000.0
     max_live_total_exposure_pct: float = 10.0
+    # Round-trip friction as a fraction of the trade's own risk unit. The
+    # default rejects only the indefensible case of paying at least a whole
+    # 1R in costs; tighten it toward 0.25 once walk-forward has been re-run
+    # with the honest number in view.
+    max_cost_to_risk: float = 1.0
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -224,6 +229,8 @@ class CryptoRiskConfig:
             errors.append("Live total exposure cap must be positive and no larger than paper cap.")
         if self.max_live_total_exposure_pct > 20:
             errors.append("Live total exposure cannot exceed the absolute 20% safety ceiling.")
+        if not (0 < self.max_cost_to_risk <= 1):
+            errors.append("Maximum cost-to-risk must be in (0, 1]; 1R of cost is never tradeable.")
         return errors
 
     def to_dict(self) -> dict[str, Any]:
@@ -245,6 +252,11 @@ class CryptoEngineConfig:
     stop_watchdog_grace_seconds: float = 15.0
     stop_watchdog_min_confirmations: int = 2
     position_open_poll_interval_seconds: float = 5.0
+    # Live-path friction assumptions. The spread is measured from the live
+    # quote; these cover the parts a quote cannot show. Keep them aligned
+    # with the backtest cost settings or simulation and live will disagree.
+    taker_fee_bps: float = 25.0
+    expected_slippage_bps: float = 10.0
     entry_order_timeout_seconds: float = 120.0
     fill_poll_attempts: int = 3
 
@@ -286,6 +298,12 @@ class CryptoEngineConfig:
             errors.append("Fill poll attempts must be between 1 and 20.")
         if not (1 <= self.stop_watchdog_min_confirmations <= 10):
             errors.append("Stop watchdog confirmations must be between 1 and 10.")
+        for label, value in {
+            "taker fee": self.taker_fee_bps,
+            "expected slippage": self.expected_slippage_bps,
+        }.items():
+            if not math.isfinite(value) or value < 0:
+                errors.append(f"Live {label} must be finite and non-negative.")
         if (
             not math.isfinite(self.position_open_poll_interval_seconds)
             or self.position_open_poll_interval_seconds < 1

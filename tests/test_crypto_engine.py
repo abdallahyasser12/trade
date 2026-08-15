@@ -512,3 +512,33 @@ def test_unknown_exit_outcome_keeps_intent_and_reuses_same_id_without_rearming_s
     assert len([call for call in broker.market_calls if call[2] == "sell"]) == 1
     engine._ensure_all_protection(now, reconciled)
     assert broker.stop_calls == []
+
+
+def test_entry_blocked_when_round_trip_cost_eats_the_risk_unit(tmp_path):
+    """A stop so tight that friction exceeds it must never be entered."""
+
+    from crypto_models import CryptoSignalDecision as Decision
+
+    engine, broker, store, now = make_engine(tmp_path)
+    engine._assets = {"BTC/USD": asset()}
+    account = broker.get_account()
+    bar_ts = breakout_bars(periods=31).index[-1]
+    prepared = engine.strategy.prepare_universe(
+        {"BTC/USD": breakout_bars(periods=31)}
+    )
+
+    # ATR of 0.001 on a $100 price gives a 2.5bp stop distance against a
+    # 75bp round trip: cost is many multiples of 1R.
+    decision = Decision("BTC/USD", BotAction.BUY, bar_ts, "breakout", close=100, atr=0.001)
+    quote = CryptoQuote("BTC/USD", now, 99.99, 100.0)
+    engine._handle_entries(
+        [decision], prepared, bar_ts, {"BTC/USD": quote}, account, {}, now
+    )
+    assert [call for call in broker.market_calls if call[2] == "buy"] == []
+
+    # A normal ATR keeps friction well inside 1R and the entry proceeds.
+    decision = Decision("BTC/USD", BotAction.BUY, bar_ts, "breakout", close=100, atr=2.0)
+    engine._handle_entries(
+        [decision], prepared, bar_ts, {"BTC/USD": quote}, account, {}, now
+    )
+    assert [call for call in broker.market_calls if call[2] == "buy"]

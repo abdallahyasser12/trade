@@ -128,6 +128,8 @@ class CryptoBacktestResult:
     realized_pnl: float
     total_fees: float
     exposure_time_pct: float
+    round_trip_cost_bps: float = 0.0
+    median_cost_to_risk: Optional[float] = None
     config_snapshot: dict[str, Any] = field(default_factory=dict)
 
 

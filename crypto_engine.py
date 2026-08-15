@@ -22,6 +22,7 @@ from crypto_config import (
 )
 from crypto_data_feed import AlpacaCryptoDataFeed, is_crypto_data_stale, quote_is_safe
 from crypto_models import CryptoEngineStatus, CryptoPositionState, CryptoSignalDecision
+from cost_model import cost_to_risk, round_trip_cost_bps
 from crypto_risk import CryptoRiskManager, portfolio_market_value
 from crypto_strategy import CryptoRegimeStrategy
 from data_feed import DataFeedError
@@ -466,6 +467,26 @@ class CryptoTradeEngine:
             entry_price = quote.ask_price
             atr_value = float(decision.atr or 0.0)
             stop_price = entry_price - atr_value * self.strategy_config.atr_stop_multiplier
+            # Friction measured against this trade's own risk unit, using the
+            # live spread. A trade that pays most of 1R to get in and out needs
+            # an implausible win rate; it is rejected before it is sized.
+            trade_cost_to_risk = cost_to_risk(
+                entry_price=entry_price,
+                stop_price=stop_price,
+                round_trip_bps=round_trip_cost_bps(
+                    slippage_bps=self.engine_config.expected_slippage_bps,
+                    spread_bps=quote.spread_bps,
+                    taker_fee_bps=self.engine_config.taker_fee_bps,
+                ),
+            )
+            if trade_cost_to_risk > self.risk_config.max_cost_to_risk:
+                self._log(
+                    "INFO",
+                    f"{symbol} entry blocked: round-trip cost is "
+                    f"{trade_cost_to_risk:.2f}R, above the "
+                    f"{self.risk_config.max_cost_to_risk:.2f}R limit.",
+                )
+                continue
             asset = self._assets[symbol]
             size = self.risk.size_position(
                 equity=account.equity,

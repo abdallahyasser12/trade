@@ -16,6 +16,7 @@ from crypto_config import (
     crypto_bars_per_year,
 )
 from crypto_models import CryptoBacktestResult, CryptoSignalDecision, CryptoTradeRecord
+from cost_model import cost_to_risk, round_trip_cost_bps
 from crypto_risk import CryptoRiskManager, floor_to_increment
 from crypto_strategy import CryptoRegimeStrategy
 from models import AssetInfo, BotAction
@@ -164,6 +165,11 @@ def run_crypto_backtest(
     slippage = backtest_config.slippage_bps / 10_000.0
     half_spread = backtest_config.spread_bps / 20_000.0
     fee_rate = backtest_config.taker_fee_bps / 10_000.0
+    round_trip_bps = round_trip_cost_bps(
+        slippage_bps=backtest_config.slippage_bps,
+        spread_bps=backtest_config.spread_bps,
+        taker_fee_bps=backtest_config.taker_fee_bps,
+    )
     buy_cost = slippage + half_spread
     sell_cost = slippage + half_spread
 
@@ -177,6 +183,7 @@ def run_crypto_backtest(
     equity_index: list[pd.Timestamp] = []
     exposure_bars = 0
     total_fees = 0.0
+    cost_to_risk_samples: list[float] = []
 
     def close_position(symbol: str, timestamp: pd.Timestamp, fill: float, reason: str) -> None:
         nonlocal cash, total_fees
@@ -229,6 +236,15 @@ def run_crypto_backtest(
                 fill = raw_open * (1.0 + buy_cost)
                 atr_value = float(decision.atr or 0.0)
                 stop = fill - atr_value * strategy_config.atr_stop_multiplier
+                # Same admission rule as the live engine, on the same formula,
+                # so a config that trades here also trades there.
+                trade_cost_to_risk = cost_to_risk(
+                    entry_price=fill,
+                    stop_price=stop,
+                    round_trip_bps=round_trip_bps,
+                )
+                if trade_cost_to_risk > risk_config.max_cost_to_risk:
+                    continue
                 open_equity = cash + sum(
                     position.qty * float(rows[held]["open"])
                     for held, position in positions.items()
@@ -264,6 +280,7 @@ def run_crypto_backtest(
                     continue
                 cash -= notional + entry_fee
                 total_fees += entry_fee
+                cost_to_risk_samples.append(trade_cost_to_risk)
                 positions[symbol] = _Position(
                     symbol=symbol,
                     qty=quantity,
@@ -414,6 +431,12 @@ def run_crypto_backtest(
         realized_pnl=sum(float(trade.pnl or 0.0) for trade in closed),
         total_fees=total_fees,
         exposure_time_pct=exposure_bars / len(equity_points) * 100.0,
+        round_trip_cost_bps=round_trip_bps,
+        median_cost_to_risk=(
+            float(pd.Series(cost_to_risk_samples).median())
+            if cost_to_risk_samples
+            else None
+        ),
         config_snapshot={
             "strategy": strategy_config.to_dict(),
             "risk": risk_config.to_dict(),
