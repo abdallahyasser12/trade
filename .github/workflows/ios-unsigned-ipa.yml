@@ -1,0 +1,170 @@
+name: Build unsigned iOS IPA
+
+# Produces an UNSIGNED .ipa for sideloading with a free Apple ID (AltStore,
+# SideStore, or Sideloadly). No paid Apple Developer membership and no Expo
+# account are required, because nothing here is signed or uploaded to Apple.
+#
+# The signing step happens on your own computer with your own Apple ID, which is
+# what keeps this free. See GET_THE_APP.md for the limits that come with it.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "sideload-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # macOS runners are required: an iOS app can only be compiled with Xcode.
+    # This repository is private, so these minutes bill at the 10x macOS rate.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Show toolchain versions
+        run: |
+          set -euo pipefail
+          node --version
+          xcodebuild -version
+          pod --version || true
+
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Generate the native iOS project
+        # The repository stores no ios/ directory; Expo regenerates it from
+        # app.json so the native project can never drift from the config.
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Resolve workspace and scheme
+        id: xcode
+        run: |
+          set -euo pipefail
+
+          # `pod install` is what creates the .xcworkspace. Fall back to the
+          # .xcodeproj so a pods-free or partially prepared tree still builds.
+          workspace="$(find ios -maxdepth 1 -name '*.xcworkspace' | head -n 1)"
+          if [ -n "${workspace}" ]; then
+            container_flag="-workspace"
+            container="${workspace}"
+            schemes_query='.workspace.schemes[]?'
+          else
+            project="$(find ios -maxdepth 1 -name '*.xcodeproj' | head -n 1)"
+            if [ -z "${project}" ]; then
+              echo "expo prebuild produced neither an .xcworkspace nor an .xcodeproj" >&2
+              ls -la ios || true
+              exit 1
+            fi
+            echo "note: no .xcworkspace found, building ${project} directly"
+            container_flag="-project"
+            container="${project}"
+            schemes_query='.project.schemes[]?'
+          fi
+
+          # Ignore CocoaPods' own schemes and prefer the app scheme.
+          scheme="$(xcodebuild "${container_flag}" "${container}" -list -json \
+            | jq -r "[${schemes_query} | select(startswith(\"Pods\") | not)] | first // \"\"")"
+          if [ -z "${scheme}" ]; then
+            echo "could not determine an app scheme" >&2
+            xcodebuild "${container_flag}" "${container}" -list || true
+            exit 1
+          fi
+
+          {
+            echo "container_flag=${container_flag}"
+            echo "container=${container}"
+            echo "scheme=${scheme}"
+          } >> "${GITHUB_OUTPUT}"
+          printf 'using %s %s and scheme %s\n' "${container_flag}" "${container}" "${scheme}"
+
+      - name: Archive the app without signing
+        env:
+          CONTAINER_FLAG: ${{ steps.xcode.outputs.container_flag }}
+          CONTAINER: ${{ steps.xcode.outputs.container }}
+          SCHEME: ${{ steps.xcode.outputs.scheme }}
+        run: |
+          set -euo pipefail
+
+          # Signing is deliberately disabled. Your free Apple ID re-signs the
+          # result locally, which is the only step that needs your identity.
+          xcodebuild archive \
+            "${CONTAINER_FLAG}" "${CONTAINER}" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "${RUNNER_TEMP}/Trade.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Package the archive as an .ipa
+        id: package
+        run: |
+          set -euo pipefail
+
+          app_path="$(find "${RUNNER_TEMP}/Trade.xcarchive/Products/Applications" \
+            -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${app_path}" ]; then
+            echo "no .app was produced by the archive step" >&2
+            exit 1
+          fi
+
+          # An .ipa is a zip whose single top-level directory is Payload/.
+          staging="${RUNNER_TEMP}/ipa"
+          rm -rf "${staging}"
+          mkdir -p "${staging}/Payload"
+          cp -R "${app_path}" "${staging}/Payload/"
+
+          ipa="${RUNNER_TEMP}/Trade-unsigned-${GITHUB_SHA:0:7}.ipa"
+          (cd "${staging}" && zip -qry "${ipa}" Payload)
+
+          printf 'ipa_path=%s\n' "${ipa}" >> "${GITHUB_OUTPUT}"
+          printf 'ipa_name=%s\n' "$(basename "${ipa}")" >> "${GITHUB_OUTPUT}"
+          ls -lh "${ipa}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.ipa_name }}
+          path: ${{ steps.package.outputs.ipa_path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Explain the next step
+        env:
+          IPA_NAME: ${{ steps.package.outputs.ipa_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Unsigned iOS build ready"
+            echo
+            echo "Download **${IPA_NAME}** from the Artifacts section of this run."
+            echo
+            echo "This .ipa is unsigned, so it will not install on its own. Sign it"
+            echo "on your computer with your free Apple ID:"
+            echo
+            echo "- **Sideloadly** (Windows or Mac) — drag the .ipa in, enter your Apple ID."
+            echo "- **AltStore / SideStore** — add the .ipa through AltServer or SideStore."
+            echo
+            echo "Known limits of free-Apple-ID signing:"
+            echo
+            echo "- The app stops opening after **7 days** and must be re-signed."
+            echo "- **Push notifications will not work.** Apple ties the required"
+            echo "  entitlement to a paid membership, so backend alerts are not delivered."
+            echo "  The app still shows live state whenever you open it."
+            echo "- At most **3 sideloaded apps** per Apple ID at a time."
+            echo
+            echo "GitHub artifacts are wrapped in a .zip. Unzip it to get the .ipa."
+          } >> "${GITHUB_STEP_SUMMARY}"
