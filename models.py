@@ -240,6 +240,10 @@ class OrderRecord:
     limit_price: Optional[float] = None
     submitted_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Price the decision was made against. Set on the locally-created intent;
+    # broker-returned records leave it None and the store preserves the
+    # original, so realized slippage stays measurable.
+    reference_price: Optional[float] = None
 
     @property
     def is_terminal(self) -> bool:

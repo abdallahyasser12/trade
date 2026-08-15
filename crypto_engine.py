@@ -546,6 +546,7 @@ class CryptoTradeEngine:
                 status="intent",
                 submitted_at=now,
                 updated_at=now,
+                reference_price=entry_price,
             )
             self.store.record_order(intent, self.session_id)
             self.store.set_kv(
@@ -752,9 +753,16 @@ class CryptoTradeEngine:
         else:
             incremental_price = current.fill_price
         local = self._load_position(current.symbol)
+        # Fees are charged on both legs. Booking a sell gross of them
+        # overstated every realized figure by the full round trip.
+        fee_rate = self.engine_config.taker_fee_bps / 10_000.0
+        fees = incremental_price * delta * fee_rate
         realized = None
         if current.side == "sell" and local is not None:
-            realized = (incremental_price - local.entry_price) * delta
+            gross = (incremental_price - local.entry_price) * delta
+            entry_fee_share = local.entry_price * delta * fee_rate
+            realized = gross - fees - entry_fee_share
+        event_key = f"{current.client_order_id}:{current.filled_qty:.12f}"
         self.store.record_trade(
             self.session_id,
             current.symbol,
@@ -764,7 +772,27 @@ class CryptoTradeEngine:
             realized,
             current.purpose,
             decision.to_dict() if decision else None,
-            event_key=f"{current.client_order_id}:{current.filled_qty:.12f}",
+            event_key=event_key,
+            fees=fees,
+        )
+        # Execution quality against the price the decision was made at. The
+        # simulator assumes a fixed slippage; this is the only thing that can
+        # ever tell us whether that assumption is true.
+        stored = self.store.get_order_by_client_id(current.client_order_id)
+        reference = current.reference_price or (
+            stored.reference_price if stored is not None else None
+        )
+        self.store.record_execution(
+            self.session_id,
+            current.client_order_id,
+            current.symbol,
+            current.purpose,
+            current.side,
+            reference,
+            incremental_price,
+            delta,
+            fees=fees,
+            event_key=event_key,
         )
 
     def _reconcile_position_truth(self, now: datetime, startup: bool = False):
@@ -1137,7 +1165,7 @@ class CryptoTradeEngine:
             asset = self._assets[symbol]
             intent = OrderRecord(
                 "", client_id, symbol, "guard", "sell", current.qty, 0.0, "intent",
-                submitted_at=now, updated_at=now,
+                submitted_at=now, updated_at=now, reference_price=quote.bid_price,
             )
             self.store.record_order(intent, self.session_id)
             order = self._submit_idempotent(
