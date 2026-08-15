@@ -56,7 +56,10 @@ concurrency:
 jobs:
   research:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The regime ensemble recomputes benchmark context per candidate
+    # evaluation, so wide-grid multi-fold runs on 4Hour bars need hours,
+    # not minutes.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
