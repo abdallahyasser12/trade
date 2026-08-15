@@ -209,3 +209,55 @@ def test_empty_vendor_response_is_reported_not_crashed(monkeypatch, capsys):
     monkeypatch.setattr(module, "AlpacaCryptoDataFeed", EmptyFeed)
     assert module.main(["--symbols", "BTC/USD"]) == 2
     assert "no bars" in capsys.readouterr().err
+
+
+def test_slow_timeframes_search_a_scaled_grid_and_fast_ones_keep_the_original():
+    """Slow bars need shorter breakouts; hourly keeps its audited grid."""
+
+    from crypto_research import TUNABLE_CRYPTO_PARAMETERS
+
+    module = _load()
+    strategy_config = module.CryptoStrategyConfig(symbols=("BTC/USD",))
+    daily = module._parameter_grid(strategy_config, "1Day")
+    hourly = module._parameter_grid(strategy_config, "1Hour")
+    assert 10 in daily["breakout_period"]
+    assert 15.0 in daily["min_adx"]
+    assert set(daily) <= TUNABLE_CRYPTO_PARAMETERS
+    assert set(hourly) <= TUNABLE_CRYPTO_PARAMETERS
+    candidates = 1
+    for values in daily.values():
+        candidates *= len(values)
+    assert candidates <= 32
+    assert hourly["breakout_period"] == [
+        strategy_config.breakout_period, strategy_config.breakout_period + 10
+    ]
+
+
+def test_embargo_defaults_to_the_strategy_warmup(monkeypatch, capsys):
+    """A 1-bar embargo against a 226-bar warmup is silent train/test leakage."""
+
+    module = _load()
+    monkeypatch.setattr(
+        module, "load_credentials",
+        lambda *a, **k: type("C", (), {"api_key": "k", "secret_key": "s"})(),
+    )
+    frames = {"BTC/USD": _bars(seed=5), "ETH/USD": _bars(seed=6)}
+
+    class StubFeed:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_bars(self, symbol, timeframe, start=None, end=None):
+            return frames[symbol]
+
+    monkeypatch.setattr(module, "AlpacaCryptoDataFeed", StubFeed)
+    code = module.main(
+        ["--symbols", "BTC/USD,ETH/USD", "--train-bars", "700",
+         "--test-bars", "300", "--min-train-trades", "1"]
+    )
+    out = capsys.readouterr().out
+    assert code in (0, 1)
+    warmup = module.CryptoStrategyConfig(
+        symbols=("BTC/USD", "ETH/USD")
+    ).warmup_bars()
+    assert f"embargo {warmup} (warmup-derived)" in out

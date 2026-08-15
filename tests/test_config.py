@@ -115,3 +115,24 @@ def test_adaptive_risk_soft_limit_must_precede_hard_halt():
         max_daily_loss_pct=3.0,
     )
     assert any("below the maximum session loss" in error for error in config.validate())
+
+
+def test_four_hour_timeframe_is_wired_through_every_map():
+    """4Hour must exist in every timeframe map or engines break at runtime."""
+
+    from config import (
+        INTRADAY_TIMEFRAMES,
+        TIMEFRAMES,
+        bars_per_year,
+        default_poll_interval,
+        timeframe_to_timedelta,
+    )
+
+    assert "4Hour" in TIMEFRAMES
+    assert "4Hour" in INTRADAY_TIMEFRAMES
+    assert timeframe_to_timedelta("4Hour").total_seconds() == 4 * 3600
+    assert bars_per_year("4Hour") == 252 * 2.0
+    assert default_poll_interval("4Hour") == 180.0
+    alpaca = timeframe_to_alpaca("4Hour")
+    assert alpaca.amount_value == 4
+    assert alpaca.unit_value.value == "Hour"

@@ -39,6 +39,7 @@ def crypto_bars_per_year(timeframe: str) -> float:
         "5Min": 365.25 * 24 * 12,
         "15Min": 365.25 * 24 * 4,
         "1Hour": 365.25 * 24,
+        "4Hour": 365.25 * 6,
         "1Day": 365.25,
     }
     try:

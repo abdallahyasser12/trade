@@ -23,7 +23,7 @@ on:
       timeframe:
         description: "Bar size — widen this if cost per trade is high"
         type: choice
-        options: ["1Hour", "1Day", "15Min"]
+        options: ["1Hour", "4Hour", "1Day", "15Min"]
         default: "1Hour"
       engine:
         description: "Decision engine: base (audited) or ensemble (regime-aware blend)"

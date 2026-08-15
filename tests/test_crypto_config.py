@@ -76,3 +76,7 @@ def test_live_caps_have_absolute_code_ceilings():
 def test_crypto_timeframes_annualize_continuous_market():
     assert crypto_bars_per_year("1Hour") == pytest.approx(365.25 * 24)
     assert CryptoEngineConfig(account_mode=AccountMode.PAPER).validate() == []
+
+
+def test_four_hour_crypto_annualization_is_continuous_market():
+    assert crypto_bars_per_year("4Hour") == pytest.approx(365.25 * 6)

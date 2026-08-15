@@ -66,7 +66,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--timeframe",
         default="1Hour",
-        choices=["15Min", "1Hour", "1Day"],
+        choices=["15Min", "1Hour", "4Hour", "1Day"],
         help="Bar size. Widening this is the standard response to high cost-per-R.",
     )
     parser.add_argument("--start", default="2023-01-01", help="First research date (UTC).")
@@ -102,9 +102,43 @@ def _parse_args(argv=None) -> argparse.Namespace:
              "what bounds total open risk.",
     )
     parser.add_argument(
+        "--embargo-bars",
+        type=int,
+        default=None,
+        help="Gap between each training window and its test window. Omit to "
+             "derive it from the strategy's indicator warmup (currently 226 "
+             "bars), so no test bar's features overlap training data. The "
+             "library default of 1 bar leaks feature windows across the "
+             "boundary and understates out-of-sample honesty.",
+    )
+    parser.add_argument(
         "--json-out", default="", help="Optional path to write the full verdict as JSON."
     )
     return parser.parse_args(argv)
+
+
+def _parameter_grid(strategy: CryptoStrategyConfig, timeframe: str) -> dict:
+    """Bounded search space, scaled to the bar size.
+
+    The hourly-tuned entry defaults almost never fire on slow bars — measured
+    directly: two out-of-sample trades across five years of daily data, at
+    two symbols and again at eight. Slow timeframes therefore search shorter
+    breakout windows and softer trend filters. Every key stays inside the
+    audited TUNABLE_CRYPTO_PARAMETERS allowlist and the candidate count stays
+    well under the protocol's 32-candidate cap; selection remains strictly
+    in-sample per fold, judged out of sample.
+    """
+
+    if timeframe in ("4Hour", "1Day"):
+        return {
+            "breakout_period": sorted({10, 15, strategy.breakout_period}),
+            "min_adx": sorted({15.0, strategy.min_adx}),
+            "min_efficiency_ratio": sorted({0.15, strategy.min_efficiency_ratio}),
+        }
+    return {
+        "breakout_period": [strategy.breakout_period, strategy.breakout_period + 10],
+        "min_adx": [strategy.min_adx, strategy.min_adx + 5.0],
+    }
 
 
 def _fail(message: str) -> int:
@@ -237,10 +271,14 @@ def main(argv=None) -> int:
         taker_fee_bps=args.taker_fee_bps,
         spread_bps=args.spread_bps,
     )
+    embargo = (
+        args.embargo_bars if args.embargo_bars is not None else strategy.warmup_bars()
+    )
     walk = CryptoWalkForwardConfig(
         train_bars=args.train_bars,
         test_bars=args.test_bars,
         step_bars=args.test_bars,
+        embargo_bars=embargo,
         min_train_trades=args.min_train_trades,
     )
     criteria = CryptoPromotionCriteria()
@@ -256,7 +294,8 @@ def main(argv=None) -> int:
     print(f"  Engine      {args.engine}")
     print(f"  Timeframe   {args.timeframe}")
     print(f"  Window      {start_date} .. {end_date}")
-    print(f"  Folds       {args.train_bars} train / {args.test_bars} test bars")
+    print(f"  Folds       {args.train_bars} train / {args.test_bars} test bars, "
+          f"embargo {embargo} (warmup-derived)")
     print(f"  Cost gate   max_cost_to_risk = {risk.max_cost_to_risk:.2f} R")
     print("\n  Market data only. This script never constructs a broker.")
 
@@ -293,10 +332,7 @@ def main(argv=None) -> int:
     bars = {symbol: frame.loc[common] for symbol, frame in bars.items()}
     print(f"    aligned    {len(common):>7} bars across {len(bars)} symbols")
 
-    grid = {
-        "breakout_period": [strategy.breakout_period, strategy.breakout_period + 10],
-        "min_adx": [strategy.min_adx, strategy.min_adx + 5.0],
-    }
+    grid = _parameter_grid(strategy, args.timeframe)
 
     print("\n  Running bounded chronological walk-forward…")
     try:
@@ -356,6 +392,8 @@ def main(argv=None) -> int:
                 "slippage_bps": args.slippage_bps,
                 "taker_fee_bps": args.taker_fee_bps,
                 "spread_bps": args.spread_bps,
+                "embargo_bars": embargo,
+                "grid": grid,
             },
             "cost": cost,
             "benchmark": benchmark,

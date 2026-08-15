@@ -277,7 +277,8 @@ def build_config_inputs() -> tuple[StrategyConfig, RiskConfig, BacktestConfig, E
     with c1:
         symbol = st.text_input("Symbol", value="SPY", help="One US equity ticker, e.g. SPY or AAPL.").strip().upper()
     with c2:
-        timeframe = st.selectbox("Timeframe", cfg.TIMEFRAMES, index=4,
+        timeframe = st.selectbox("Timeframe", cfg.TIMEFRAMES,
+                                 index=cfg.TIMEFRAMES.index("1Day"),
                                  help="Bar size used for every decision. Intraday timeframes can trigger the pattern-day-trading rule on small accounts.")
     with c3:
         start_date = st.date_input(
@@ -1684,7 +1685,7 @@ def render_crypto_workspace(store: StateStore) -> None:
     with config_left:
         timeframe = st.selectbox(
             "Crypto timeframe",
-            ["15Min", "1Hour", "1Day"],
+            ["15Min", "1Hour", "4Hour", "1Day"],
             index=1,
             disabled=engine_active,
             key="crypto_timeframe",
