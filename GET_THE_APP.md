@@ -4,24 +4,22 @@ This is the shortest path from this repository to a running app plus a running
 backend. [IOS_PRODUCTION_DEPLOYMENT.md](IOS_PRODUCTION_DEPLOYMENT.md) explains
 the architecture and the safety boundaries; this file is the checklist.
 
-## What can and cannot be automated
+## Two routes
 
-The build, the install link, and the whole backend are automated here. Two
-things cannot be produced by this repository, by CI, or by any script, because
-Apple issues them to a named human:
+| | Free Apple ID (sideload) | Paid Apple Developer |
+| --- | --- | --- |
+| Cost | Free | 99 USD/year |
+| Workflow | **Build unsigned iOS IPA** | **Build production iOS app** |
+| You get | An `.ipa` you sign yourself | An install link / TestFlight |
+| App expires | **Every 7 days** | No |
+| Push notifications | **No** | Yes |
+| Needs a computer to install | Yes | No |
 
-1. **An Apple Developer Program membership** (99 USD/year). Without it no `.ipa`
-   can be signed, and an unsigned iOS app cannot be installed on any iPhone.
-2. **An Expo account access token**, which is what lets the build run in the
-   cloud instead of on a Mac you own.
+Both routes need the backend from step 1. Pick your route in step 2.
 
-There is also no way around Apple's distribution rules: iOS refuses to install
-an app from an arbitrary download URL. A working install link is always either
-an **internal-distribution link** (installs only on iPhones whose UDID is
-registered with your Apple Developer account) or **TestFlight**. Anything that
-claims otherwise is describing a jailbreak or a revoked enterprise certificate.
-
-Once those two accounts exist, every build publishes an install link on its own.
+Apple's distribution rules apply either way: iOS never installs an app straight
+from an arbitrary download URL. Anything claiming otherwise is describing a
+jailbreak or a revoked enterprise certificate.
 
 ## Step 1 — Backend (do this first)
 
@@ -48,7 +46,59 @@ scripts/verify_backend.sh
 That checks the public health endpoint, checks an authenticated read, and checks
 that an unauthenticated caller is rejected.
 
-## Step 2 — Link the Expo project once
+## Step 2, free route — Sideload with a free Apple ID
+
+Any Apple ID can sign apps for **your own devices**, with no paid membership.
+This is what AltStore, SideStore, and Sideloadly automate. It is legitimate and
+uses Apple's own tooling, but Apple caps it deliberately:
+
+- **The app stops opening after 7 days.** You reconnect it to re-sign. AltStore
+  and SideStore can automate this refresh; Sideloadly is manual.
+- **Push notifications do not work.** The `aps-environment` entitlement requires
+  a paid membership. Your backend still detects engine state changes, safety
+  locks, and fills, but the phone will not be alerted. You see everything when
+  you open the app. For a trading tool this is the limitation that matters —
+  decide whether unattended alerts are something you need.
+- **Three sideloaded apps** per Apple ID at a time, and **ten new App IDs per
+  week**, so avoid repeated reinstalls in one sitting.
+- You need a computer for the initial install (and for refreshes, unless you use
+  SideStore's on-device refresh).
+
+Background refresh still works: it uses ordinary background modes, not a paid
+entitlement. And none of this touches trading safety, because the engine runs on
+the backend, not the phone.
+
+Run the **Build unsigned iOS IPA** workflow in GitHub Actions (Actions tab →
+select it → Run workflow), or push a tag like `sideload-v1`. It compiles the app
+on a macOS runner with signing disabled and uploads the `.ipa` as a run
+artifact. Nothing is sent to Apple and no account is needed for this step.
+
+> This repository is private, so macOS runner minutes bill at GitHub's 10x rate.
+> A build takes roughly 15–25 minutes of macOS time. Only rebuild when the app
+> code changes — re-signing an existing `.ipa` weekly costs nothing.
+
+Then, on your computer:
+
+1. Download the artifact and unzip it to get the `.ipa`.
+2. Install [Sideloadly](https://sideloadly.io) (Windows/macOS) or
+   [AltStore/SideStore](https://altstore.io).
+3. Plug in the iPhone, drag in the `.ipa`, sign in with your Apple ID.
+4. On the iPhone: Settings → General → VPN & Device Management → trust your
+   developer certificate.
+
+Use a throwaway Apple ID if you would rather not put your main account into a
+third-party sideloading tool. Skip to step 4.
+
+To build it yourself on a Mac instead, no CI needed:
+
+```bash
+cd mobile
+npm install
+npx expo prebuild --platform ios --clean
+open ios/*.xcworkspace   # select your personal team in Signing, then Run
+```
+
+## Step 2, paid route — Link the Expo project once
 
 ```bash
 cd mobile
@@ -69,7 +119,7 @@ Apple Developer account when prompted and EAS manages the certificate and
 provisioning profile from then on. Register your iPhone's UDID with that
 account so internal builds can install on it.
 
-## Step 3 — Get the link
+## Step 3, paid route — Get the link
 
 Builds run in GitHub Actions under **Build production iOS app**:
 
@@ -105,7 +155,9 @@ Access token:   <the token printed by deploy_backend.sh>
 ```
 
 Both are stored in Expo SecureStore. Grant notification permission if you want
-push alerts for engine state changes, safety locks, and fills.
+push alerts for engine state changes, safety locks, and fills. On a
+free-Apple-ID sideload that registration fails silently by design — the app
+catches it and keeps working, it just never receives push.
 
 After that the phone can be locked, backgrounded, or the app force-quit. The
 engine keeps running on the backend, because the backend is the engine. If the

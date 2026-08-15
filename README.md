@@ -25,8 +25,10 @@ boundary, execution model, and acceptance gates are documented in
 
 To run this on an iPhone with an always-on backend, follow
 [`GET_THE_APP.md`](GET_THE_APP.md): `scripts/deploy_backend.sh` starts and verifies
-the server side, and the **Build production iOS app** workflow publishes a signed
-install link once an Expo and an Apple Developer account are linked.
+the server side, then either the **Build unsigned iOS IPA** workflow (free Apple
+ID sideloading, no paid membership, no push notifications, 7-day re-signing) or
+the **Build production iOS app** workflow (paid Apple Developer account, signed
+install link or TestFlight) produces the app itself.
 
 ## Installation
 
