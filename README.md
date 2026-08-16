@@ -4,13 +4,25 @@ A deterministic, long-only trading research and execution application with a
 Streamlit dashboard, Alpaca `alpaca-py`, chronological backtests, walk-forward
 promotion gates, SQLite recovery state, and background engines.
 
-The repository contains two deliberately separate workspaces:
+The repository contains two deliberately separate workspaces plus a
+cross-market research layer:
 
 - **US stocks:** the independently audited moving-average trend bot remains
   **Alpaca paper-only**.
 - **Spot crypto:** a 24/7 multi-asset regime/breakout system defaults to paper and
   exposes an explicitly gated live-account mode. Live mode uses real money and is
   disabled in a normal installation.
+- **Quant desk (`quant/`):** a multi-market strategy registry, probabilistic
+  regime engine, opportunity ranker, portfolio-heat governor, execution-cost
+  gate, shadow executor, drift monitors, and an evidence-based strategy
+  lifecycle (RESEARCH → SHADOW → PAPER → LIVE_CANARY → LIVE) with its own
+  walk-forward research factory (Monte Carlo stress + deflated-Sharpe
+  multiple-testing control). It journals every decision — including
+  rejections and abstentions — and never promotes a strategy into a live
+  state without recorded evidence plus an explicit operator acknowledgement.
+  Architecture, methodology, and the honest validation status are in
+  [`QUANT_DESK.md`](QUANT_DESK.md). All new strategies ship in RESEARCH
+  state and deploy no capital.
 
 No strategy is guaranteed to make money. Historical or paper performance is not a
 forecast. Crypto can move sharply, liquidity can disappear, and Alpaca crypto

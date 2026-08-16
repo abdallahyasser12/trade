@@ -63,6 +63,7 @@ class CryptoTradeEngine:
         engine_config: CryptoEngineConfig,
         *,
         now_fn: Callable[[], datetime] = _utc_now,
+        quant_journal=None,
     ):
         errors = (
             strategy_config.validate()
@@ -71,6 +72,10 @@ class CryptoTradeEngine:
         )
         if errors:
             raise ValueError("Invalid crypto engine configuration: " + "; ".join(errors))
+        # Optional desk journal (quant.journal.DecisionJournal). Strictly an
+        # observer: every call it receives is wrapped so a journal failure
+        # can cost an audit row but never an order.
+        self.quant_journal = quant_journal
         self.broker = broker
         self.data_feed = data_feed
         self.store = store
@@ -363,6 +368,8 @@ class CryptoTradeEngine:
             CRYPTO_LAST_SIGNALS_KEY,
             json.dumps({decision.symbol: decision.to_dict() for decision in decisions}),
         )
+        if self.quant_journal is not None:
+            self.quant_journal.record_crypto_decisions(decisions, self.session_id)
 
         # Exits are initiated before any entries. A strategy exit first cancels
         # and confirms the bot-owned stop; it never leaves a stale sell behind.
@@ -383,13 +390,17 @@ class CryptoTradeEngine:
                 local.stop_price, local.highest_close, current_close, current_atr
             )
             new_stop = min(new_stop, current_close * (1 - 1e-12))
+            lowest_changed = False
+            if local.lowest_close is None or current_close < local.lowest_close:
+                local.lowest_close = current_close
+                lowest_changed = True
             if new_stop > local.stop_price + float(self._assets[symbol].price_increment or 0):
                 local.stop_price = new_stop
                 local.highest_close = highest
                 self._save_position(local)
                 self._ensure_protection(symbol, position, now)
-            elif highest > local.highest_close:
-                local.highest_close = highest
+            elif highest > local.highest_close or lowest_changed:
+                local.highest_close = max(local.highest_close, highest)
                 self._save_position(local)
 
         if not self.risk.session_halted:
@@ -592,16 +603,18 @@ class CryptoTradeEngine:
                         current.avg_entry_price
                         - atr_value * self.strategy_config.atr_stop_multiplier
                     )
+                    bounded_stop = max(actual_stop, float(asset.price_increment or 0.0))
                     local = CryptoPositionState(
                         symbol=symbol,
                         qty=current.qty,
                         entry_price=current.avg_entry_price,
                         entry_time=now.isoformat(),
                         atr_at_entry=atr_value,
-                        stop_price=max(
-                            actual_stop, float(asset.price_increment or 0.0)
-                        ),
+                        stop_price=bounded_stop,
                         highest_close=current.avg_entry_price,
+                        initial_stop_price=bounded_stop,
+                        lowest_close=current.avg_entry_price,
+                        entry_regime=decision.regime.value,
                     )
                     self._save_position(local)
                     if actual_stop <= 0 or actual_stop >= current.avg_entry_price:
@@ -794,6 +807,25 @@ class CryptoTradeEngine:
             fees=fees,
             event_key=event_key,
         )
+        if current.side == "sell" and local is not None and self.quant_journal is not None:
+            # One attribution row per sell fill; partial closes yield rows
+            # whose quantities sum to the position while per-unit statistics
+            # stay consistent (see DecisionJournal.record_crypto_exit_fill).
+            self.quant_journal.record_crypto_exit_fill(
+                symbol=current.symbol,
+                session_id=self.session_id,
+                qty=delta,
+                exit_price=incremental_price,
+                total_fees=fees + (local.entry_price * delta * fee_rate),
+                exit_reason=current.purpose,
+                entry_price=local.entry_price,
+                entry_time_iso=local.entry_time,
+                initial_stop_price=local.initial_stop_price,
+                highest_close=local.highest_close,
+                lowest_close=local.lowest_close,
+                entry_regime=local.entry_regime,
+                exit_timestamp=self._now_fn(),
+            )
 
     def _reconcile_position_truth(self, now: datetime, startup: bool = False):
         positions = {
