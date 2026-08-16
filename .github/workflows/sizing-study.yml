@@ -1,0 +1,130 @@
+name: Sizing study
+
+# Manual only. Measures whether a signal's risk-adjusted quality survives being
+# given more capital, by running one backtest per deployment level.
+#
+# Read the Sharpe column, not the return column. Sizing scales a signal rather
+# than improving one, so the highest risk level shows the highest return
+# whenever expectancy is positive at all. What carries information is whether
+# Sharpe holds flat as risk rises (an edge that was under-deployed) or decays
+# (something non-linear that more capital makes worse).
+#
+# Market data only: the script never constructs a broker, can never place an
+# order, and never modifies the live exposure caps.
+#
+# Required repository secrets:
+#   ALPACA_PAPER_API_KEY
+#   ALPACA_PAPER_SECRET_KEY
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Comma-separated Alpaca USD crypto pairs"
+        default: "BTC/USD,ETH/USD,SOL/USD,LTC/USD,AVAX/USD,LINK/USD,UNI/USD,DOGE/USD,BAT/USD"
+      benchmark:
+        description: "Buy-and-hold comparator (must be in the universe)"
+        default: "BTC/USD"
+      timeframe:
+        description: "Bar size"
+        type: choice
+        options: ["1Day", "4Hour", "1Hour", "15Min"]
+        default: "1Day"
+      engine:
+        description: "Decision layer to study"
+        type: choice
+        options: ["cross", "council", "base", "breadth", "meanrev", "volregime"]
+        default: "cross"
+      start:
+        description: "First date (UTC, YYYY-MM-DD)"
+        default: "2021-01-01"
+      end:
+        description: "Last date (UTC, blank = yesterday)"
+        default: ""
+      risk_levels:
+        description: "risk_per_trade_pct values (0.35 is current, 2.0 is the config ceiling)"
+        default: "0.35,0.70,1.05,1.40,2.00"
+      position_counts:
+        description: "max_positions values"
+        default: "3,5,8"
+      drop_late_listings:
+        description: "Drop the symbols that most truncate the aligned window"
+        type: boolean
+        default: true
+
+concurrency:
+  group: sizing-study-${{ github.ref }}-${{ inputs.engine }}
+  cancel-in-progress: true
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: python -m pip install -r requirements.txt
+
+      - name: Verify credentials are configured
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          if [ -z "$ALPACA_PAPER_API_KEY" ] || [ -z "$ALPACA_PAPER_SECRET_KEY" ]; then
+            echo "::error::Set the ALPACA_PAPER_API_KEY and ALPACA_PAPER_SECRET_KEY repository secrets."
+            exit 1
+          fi
+
+      - name: Run the sizing study
+        id: study
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          set +e
+          python scripts/run_sizing_study.py \
+            --symbols "${{ inputs.symbols }}" \
+            --benchmark "${{ inputs.benchmark }}" \
+            --timeframe "${{ inputs.timeframe }}" \
+            --engine "${{ inputs.engine }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --risk-levels "${{ inputs.risk_levels }}" \
+            --position-counts "${{ inputs.position_counts }}" \
+            ${{ inputs.drop_late_listings && '--drop-late-listings' || '' }} \
+            --json-out sizing.json \
+            2>&1 | tee sizing.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the study
+        if: always()
+        run: |
+          {
+            echo "## Sizing study"
+            echo
+            echo "Read the **Sharpe** column, not the return column. A flat Sharpe as risk"
+            echo "rises means the edge was merely under-deployed; a decaying one means more"
+            echo "capital makes it worse. This study cannot promote anything."
+            echo
+            echo '```'
+            cat sizing.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sizing-study
+          path: |
+            sizing.txt
+            sizing.json
+          if-no-files-found: warn
+
+      - name: Fail only when the study could not complete
+        if: steps.study.outputs.code != '0'
+        run: exit 1
