@@ -48,12 +48,17 @@ from crypto_config import (
     CryptoStrategyConfig,
 )
 from crypto_data_feed import AlpacaCryptoDataFeed
+from execution_calibration import (
+    MIN_SAMPLES_FOR_RECOMMENDATION,
+    calibrate_from_store,
+)
 from crypto_research import (
     CryptoPromotionCriteria,
     CryptoWalkForwardConfig,
     run_crypto_walk_forward,
 )
 from regime_ensemble import EnsembleConfig
+from state_store import StateStore
 from universe_alignment import aligned_length, drop_limiting_symbols
 
 RULE = "=" * 78
@@ -96,6 +101,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
              "Tighten toward 0.25 to see the honest picture.",
     )
     parser.add_argument("--slippage-bps", type=float, default=10.0)
+    parser.add_argument(
+        "--slippage-from-ledger",
+        default="",
+        help="Path to a state store whose recorded fills set --slippage-bps "
+             "instead of the assumed default. Fails closed rather than falling "
+             "back: if the ledger holds too few fills to be a measurement, the "
+             "run stops rather than silently reverting to the assumption, "
+             "because a silent revert is exactly the dishonesty this replaces.",
+    )
     parser.add_argument("--taker-fee-bps", type=float, default=25.0)
     parser.add_argument("--spread-bps", type=float, default=5.0)
     parser.add_argument("--train-bars", type=int, default=1_500)
@@ -316,6 +330,30 @@ def _benchmark_section(result, benchmark_symbol: str) -> dict:
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+
+    if args.slippage_from_ledger:
+        ledger = Path(args.slippage_from_ledger)
+        if not ledger.exists():
+            return _fail(f"No state store at {ledger} to calibrate slippage from.")
+        try:
+            calibration = calibrate_from_store(
+                StateStore(str(ledger)), assumed_slippage_bps=args.slippage_bps
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any store failure
+            return _fail(f"Could not read the execution ledger: {exc}")
+        if not calibration.sufficient:
+            return _fail(
+                f"The ledger holds {calibration.overall.samples} fills; "
+                f"{MIN_SAMPLES_FOR_RECOMMENDATION} are needed before an average "
+                "is a measurement. Refusing to fall back to the assumed "
+                f"{args.slippage_bps:g} bps, because doing so silently would "
+                "produce a report that looks calibrated and is not."
+            )
+        measured = calibration.recommended_slippage_bps
+        print(f"  Slippage calibrated from {ledger}: {measured:.1f} bps "
+              f"(assumed {args.slippage_bps:g}) over "
+              f"{calibration.overall.samples} recorded fills")
+        args.slippage_bps = measured
 
     credentials = load_credentials()
     if not credentials.api_key or not credentials.secret_key:
