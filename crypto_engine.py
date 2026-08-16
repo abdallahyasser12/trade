@@ -369,7 +369,22 @@ class CryptoTradeEngine:
             json.dumps({decision.symbol: decision.to_dict() for decision in decisions}),
         )
         if self.quant_journal is not None:
-            self.quant_journal.record_crypto_decisions(decisions, self.session_id)
+            # BUYs are deliberately excluded here. Their entry gates (quote
+            # safety, correlation, cost-to-risk, sizing, exposure, heat) have
+            # not run yet, and quant/journal.py maps a BUY with no block
+            # reason to EXECUTE — so journaling them at signal time recorded
+            # every rejected entry as executed, in the same table the
+            # marketplace and lifecycle read. A BUY is journaled where it is
+            # actually submitted, in _handle_entries.
+            #
+            # Known gap: a REJECTED crypto BUY is currently not journaled at
+            # all. That is a missing row, not a false one. Completing it means
+            # threading a reason through each rejection path in
+            # _handle_entries; tracked as follow-up work.
+            self.quant_journal.record_crypto_decisions(
+                [d for d in decisions if d.action is not BotAction.BUY],
+                self.session_id,
+            )
 
         # Exits are initiated before any entries. A strategy exit first cancels
         # and confirms the bot-owned stop; it never leaves a stale sell behind.
@@ -586,6 +601,12 @@ class CryptoTradeEngine:
                 ),
             )
             self.store.record_order(order, self.session_id)
+            if self.quant_journal is not None:
+                # Cleared every entry gate and an order is live: the one place
+                # a crypto BUY is legitimately an EXECUTE.
+                self.quant_journal.record_crypto_decisions(
+                    [decision], self.session_id
+                )
             self._record_fill_delta(intent, order, decision)
             pending_buy_symbols.add(symbol)
             exposure += size.position_notional

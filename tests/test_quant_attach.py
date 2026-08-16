@@ -337,3 +337,8 @@ def test_a_partially_migrated_database_converges(tmp_path):
     store = QuantStore(str(path))
     assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# A signal is journaled with the outcome it actually had
+# ---------------------------------------------------------------------------
