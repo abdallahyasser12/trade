@@ -1,6 +1,6 @@
 # Field assessment — 15 August 2026
 
-Eight completed out-of-sample experiments against real Alpaca market data, run
+Ten completed out-of-sample experiments against real Alpaca market data, run
 through promotion gates that were never loosened.
 
 Hosted report: https://claude.ai/code/artifact/ea38f266-e60c-42eb-9af9-12b874dfa2b1
@@ -33,6 +33,8 @@ All figures out-of-sample, walk-forward, net of 75 bps round-trip friction.
 | 6 | 4Hour | base | 8 symbols | 9 | 82 | −2.48% | +207.71% | −0.40 | 0.76 |
 | 7 | 4Hour | ensemble | 8 symbols | 9 | 164 | −11.50% | +207.71% | −1.80 | 0.35 |
 | 8 | 1Day | **cross** | 9 symbols | 8 | 96 | **+2.01%** | +112.48% | **+0.52** | **1.48** |
+| 9 | 1Day | council | 9 symbols | 8 | 85 | +1.35% | +112.48% | +0.24 | 1.19 |
+| 10 | 1Day | breadth | 9 symbols | 8 | — | +0.36% | +112.48% | +0.07 | 1.07 |
 
 Runs 2 and 4 appear to "beat the benchmark" only because the strategy sat in cash
 through a crash. With 1–2 trades they carry no statistical weight, and the
@@ -214,6 +216,54 @@ Three caveats, stated because they are what would make this wrong:
    direction the artefact points.
 3. **Eight folds over one crypto cycle.** Alpaca history starts 2021-01-01. This
    has not been tested across an independent market epoch, and cannot be.
+
+### Experiments 9-10 — the council does not beat its best member
+
+A four-member council was built to test whether combining decorrelated
+strategies produces better decisions than any one of them. Members: the
+cross-sectional ranker, short-horizon mean reversion, a volatility-regime
+state model, and universe breadth. Measured pairwise BUY-signal correlations
+ran between -0.01 and +0.03, so the decorrelation was real.
+
+Run against identical universe, period, folds and gates:
+
+| engine | Sharpe | PF | return | positive folds | stressed |
+|---|---:|---:|---:|---:|---:|
+| **cross alone** | **0.52** | **1.48** | **+2.01%** | 50% | **+1.11%** |
+| council of four | 0.24 | 1.19 | +1.35% | 50% | +0.21% |
+| breadth alone | 0.07 | 1.07 | +0.36% | 25% | -0.76% |
+
+The council beats breadth on every measure and loses to cross-sectional on
+every measure. Since the test was whether it beats its *best* member, it
+fails: combining four decorrelated strategies produced a worse book than the
+single best one, at four times the compute and five times the parameters.
+
+Averaging is the reason, and it is not a defect in the implementation. A
+weighted combination pulls the best member's conviction toward the mean of a
+group whose other members are weaker. Decorrelation guarantees the members
+rarely reinforce each other, so what the council mostly does is dilute. That
+is a general result about combining strategies of unequal quality, not a
+tuning problem, and no amount of reweighting escapes it while three of four
+members are worse than the fourth.
+
+Three design findings from building it are worth keeping even though the
+council is not:
+
+1. **Unanimity is unreachable, not merely strict.** BUY rates of 15.6%, 22.9%,
+   0.76% and 0.40% at near-zero correlation multiply to about one in a
+   million. Unanimous mode took exactly 0 trades end to end.
+2. **A single-member veto is the most aggressive setting available, not the
+   most conservative.** P(at least one of four decorrelated members issues
+   EXIT on a held symbol) is 94.4%. Entry needed two members to agree, exit
+   needed one to dissent, and the book churned at 198 trades against its best
+   member's 69 with profit factor collapsing 3.49 -> 0.51.
+3. **Synthetic data was actively misleading here.** On a regime-switching
+   generator, breadth scored Sharpe 2.23 and looked like the best member by a
+   wide margin. On real data it scored 0.07. The generator's regime structure
+   was exactly what breadth detects, which made the test circular. Only the
+   structural findings above survived contact with real data.
+
+### The sizing question remains the live one
 
 The correct next experiment is therefore a sizing sweep at fixed signal — vary
 `risk_per_trade_pct` and `max_positions` while holding the selected momentum
