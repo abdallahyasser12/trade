@@ -149,6 +149,14 @@ class QuantResearchReport:
     strategy_id: str
     folds: list[QuantFoldResult]
     candidate_count: int
+    # Hypotheses evaluated by THIS run.  Not the grid size: every fold
+    # re-simulates and re-selects the whole grid, so a 6-candidate grid
+    # over 5 folds tests 30 hypotheses, and telling the deflated-Sharpe
+    # correction "6" understates the search by a factor of n_folds.
+    # This is the per-run contribution to the cumulative lineage.
+    trials_this_run: int
+    # trials_this_run + every trial recorded for this strategy before it.
+    # This is the N the deflated Sharpe actually consumed.
     trial_count: int
     compounded_return_pct: float
     benchmark_compounded_return_pct: float
@@ -258,6 +266,12 @@ def run_quant_walk_forward(
         }
 
     folds: list[QuantFoldResult] = []
+    # Diagnostics that used to be invisible. A run that produced few folds
+    # because every candidate kept failing looks identical, from the gates
+    # alone, to a run that simply had a short history.
+    folds_without_candidate = 0
+    skipped_warmup = 0
+    training_errors: list[str] = []
     train_start = 0
     while True:
         train_end = train_start + walk_config.train_bars
@@ -267,11 +281,12 @@ def run_quant_walk_forward(
             break
 
         best_score = -math.inf
-        best_ordinal = 0
+        best_ordinal: Optional[int] = None
         for ordinal, (params, strategy, warmup) in enumerate(
             zip(candidate_params, strategies, warmups)
         ):
             if walk_config.train_bars < warmup + 2:
+                skipped_warmup += 1
                 continue  # candidate cannot complete warmup inside the window
             try:
                 train_result = run_simulation(
@@ -280,17 +295,36 @@ def run_quant_walk_forward(
                     config=sim_config,
                     exit_policy=exit_policy,
                 )
-            except ValueError:
+            except ValueError as error:
+                # Swallowing this silently hid real problems — "Not enough
+                # aligned history", "Benchmark has unusable closes" — behind
+                # a fold that still looked selected. Count and surface them.
+                training_errors.append(f"fold@{train_start}: {error}")
                 continue
             score = _robust_training_score(
                 train_result,
                 min_trades=walk_config.min_train_trades,
                 candidate_count=len(candidate_params),
             )
+            if not math.isfinite(score):
+                # Below min_train_trades. Not a selection, so it must not be
+                # allowed to win by default.
+                continue
             # Deterministic tie-break: earlier ordinal wins.
             if score > best_score:
                 best_score = score
                 best_ordinal = ordinal
+
+        if best_ordinal is None:
+            # No candidate cleared the evidence bar in this window. Previously
+            # `best_ordinal` started at 0 and `-inf > -inf` is False, so grid
+            # ordinal 0 was carried into a full out-of-sample fold that then
+            # counted toward every promotion gate as if it had been chosen on
+            # evidence. Skip the window instead and record why; too many skips
+            # fail the min_folds gate honestly.
+            folds_without_candidate += 1
+            train_start += walk_config.step_bars
+            continue
 
         selected_params = dict(candidate_params[best_ordinal])
         selected_strategy = strategies[best_ordinal]
@@ -395,7 +429,13 @@ def run_quant_walk_forward(
 
     dsr_report = None
     dsr_probability: Optional[float] = None
-    trial_count = len(candidate_params) + prior_trials
+    # Every fold re-simulates and re-selects the ENTIRE grid, so the search
+    # this run performed is candidates x folds, not candidates.  Reporting
+    # the grid size alone understated the multiple-testing burden by a
+    # factor of n_folds and made the deflated-Sharpe gate correspondingly
+    # easier than designed.
+    trials_this_run = len(candidate_params) * max(1, len(folds))
+    trial_count = trials_this_run + prior_trials
     if per_bar_sharpe is not None:
         # The expected-max benchmark needs the variance of the per-trial
         # Sharpe ESTIMATOR, which for near-zero true Sharpe is ~1/(n-1) in
@@ -483,6 +523,7 @@ def run_quant_walk_forward(
         strategy_id=strategy_id,
         folds=folds,
         candidate_count=len(candidate_params),
+        trials_this_run=trials_this_run,
         trial_count=trial_count,
         compounded_return_pct=compounded,
         benchmark_compounded_return_pct=benchmark_compounded,
@@ -507,6 +548,20 @@ def run_quant_walk_forward(
             "exit_policy": asdict(exit_policy) if exit_policy else None,
             "universe": sorted(bars_by_symbol),
             "data_window": f"{common[0].isoformat()}..{common[-1].isoformat()}",
+            # Search accounting, so a run cannot look clean while it was
+            # actually starved. trials_this_run is candidates x folds.
+            "trials_this_run": trials_this_run,
+            "prior_trials": prior_trials,
+            "folds_without_candidate": folds_without_candidate,
+            "candidates_skipped_for_warmup": skipped_warmup,
+            "training_errors": training_errors[:20],
+            "training_error_count": len(training_errors),
+            # The passive benchmark is computed WITHOUT transaction costs
+            # while the strategy pays both legs. That asymmetry makes the
+            # excess-return gate harder, not easier, so it is left in place
+            # deliberately — but the printed comparison is not like-for-like
+            # and must not be read as one.
+            "benchmark_is_cost_free": True,
         },
     )
 
@@ -526,7 +581,10 @@ def record_research_report(
         universe=list(report.protocol.get("universe", [])),
         data_window=str(report.protocol.get("data_window", "")),
         candidate_count=report.candidate_count,
-        trial_count=report.candidate_count,
+        # The PER-RUN contribution, because total_trials() SUMs this column
+        # across runs.  Persisting report.trial_count (which already folds
+        # in prior_trials) would compound the history on every re-run.
+        trial_count=report.trials_this_run,
         passed=report.passed,
         gates=report.gates_dict(),
         cost_assumptions={

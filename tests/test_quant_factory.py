@@ -173,7 +173,65 @@ def test_stressed_costs_never_beat_base():
 
 def test_trial_count_includes_prior_trials():
     report = run_quant_walk_forward(**factory_kwargs(prior_trials=100))
-    assert report.trial_count == 2 + 100
+    # Every fold re-simulates and re-selects the whole grid, so the search
+    # is candidates x folds. Counting the grid alone (2) understated the
+    # multiple-testing burden by a factor of n_folds and made the
+    # deflated-Sharpe gate easier than it was designed to be.
+    assert report.trials_this_run == 2 * len(report.folds)
+    assert report.trial_count == report.trials_this_run + 100
+
+
+def test_trials_this_run_scales_with_the_number_of_folds():
+    few = run_quant_walk_forward(**factory_kwargs())
+    kwargs = factory_kwargs()
+    kwargs["walk_config"] = QuantWalkForwardConfig(
+        train_bars=150, test_bars=60, step_bars=60, embargo_bars=2
+    )
+    many = run_quant_walk_forward(**kwargs)
+    assert len(many.folds) > len(few.folds)
+    assert many.trials_this_run == many.candidate_count * len(many.folds)
+    assert many.trials_this_run > few.trials_this_run
+
+
+def test_a_fold_where_no_candidate_qualifies_is_skipped_not_defaulted():
+    """A window in which every candidate fails must not silently become a
+    fold selected on grid ordinal 0.
+
+    ``best_score`` started at -inf and ``-inf > -inf`` is False, so when no
+    candidate cleared ``min_train_trades`` the untouched ``best_ordinal =
+    0`` was carried into a full out-of-sample fold whose ``training_score``
+    was -inf — and that fold then counted toward every promotion gate as
+    if a candidate had been chosen on evidence.
+    """
+    kwargs = factory_kwargs()
+    # No candidate can produce this many training trades, so every score
+    # is -inf and no selection is legitimate.
+    kwargs["walk_config"] = QuantWalkForwardConfig(
+        train_bars=150, test_bars=80, step_bars=80, embargo_bars=2,
+        min_train_trades=10_000,
+    )
+    with pytest.raises(ValueError, match="walk-forward fold"):
+        run_quant_walk_forward(**kwargs)
+
+
+def test_a_qualifying_fold_never_reports_an_infinite_training_score():
+    report = run_quant_walk_forward(**factory_kwargs())
+    assert report.folds
+    for fold in report.folds:
+        assert np.isfinite(fold.training_score), (
+            "a fold that reached the report must have been selected on a "
+            "real score, never carried in on the -inf default"
+        )
+
+
+def test_search_accounting_is_recorded_in_the_protocol():
+    report = run_quant_walk_forward(**factory_kwargs())
+    protocol = report.protocol
+    assert protocol["trials_this_run"] == report.trials_this_run
+    assert protocol["folds_without_candidate"] == 0
+    assert protocol["training_error_count"] == 0
+    # The benchmark asymmetry is disclosed rather than quietly assumed.
+    assert protocol["benchmark_is_cost_free"] is True
 
 
 def test_candidate_cap_enforced():
@@ -199,8 +257,14 @@ def test_report_recording_accumulates_lineage():
     runs = store.get_research_runs("periodic_test")
     assert len(runs) == 1
     assert runs[0]["git_commit"] == "abc123"
-    assert store.total_trials("periodic_test") == 2
+    # The column stores the PER-RUN contribution because total_trials()
+    # sums it across runs. Persisting report.trial_count instead — which
+    # already folds in prior_trials — would compound the history on every
+    # re-run and inflate the lineage without any new search happening.
+    per_run = report.trials_this_run
+    assert per_run == report.candidate_count * len(report.folds)
+    assert store.total_trials("periodic_test") == per_run
     # A second run keeps growing the recorded trial lineage.
     record_research_report(store, report)
-    assert store.total_trials("periodic_test") == 4
+    assert store.total_trials("periodic_test") == 2 * per_run
     store.close()
