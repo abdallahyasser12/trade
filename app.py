@@ -1609,29 +1609,33 @@ def render_crypto_workspace(store: StateStore) -> None:
     decision_engine_label = st.radio(
         "Decision engine",
         [
-            "Regime ensemble (default)",
+            "Cross-sectional momentum (default)",
+            "Regime ensemble",
             "Base breakout/trend",
-            "Cross-sectional momentum",
         ],
         horizontal=True,
         disabled=engine_active,
         key="crypto_decision_engine",
         help=(
             "Every engine runs through the identical execution, sizing, cost-gate, "
-            "and promotion machinery. The ensemble blends breakout, pullback, and "
-            "mean-reversion sleeves weighted by market regime; the base engine is "
-            "the original breakout/trend model; cross-sectional ranks the universe "
-            "by risk-adjusted momentum and holds the leaders. The selection is part "
-            "of the result fingerprint, so cached research never mixes engines.\n\n"
+            "and promotion machinery. Cross-sectional ranks the universe by "
+            "risk-adjusted momentum and holds the leaders; the ensemble blends "
+            "breakout, pullback, and mean-reversion sleeves weighted by market "
+            "regime; the base engine is the original breakout/trend model. The "
+            "selection is part of the result fingerprint, so cached research "
+            "never mixes engines.\n\n"
             "Selectable is not cleared: all three have FAILED the promotion gates. "
-            "Cross-sectional is the only one with positive out-of-sample "
-            "expectancy, and it still lost to buy-and-hold."
+            "Cross-sectional is the default because it is the only one with "
+            "positive out-of-sample expectancy across eleven walk-forward "
+            "experiments (profit factor 1.48, Sharpe 0.52) — the regime ensemble "
+            "is the worst-measured of the three (Sharpe -1.80) despite formerly "
+            "being the default. Cross-sectional still lost to buy-and-hold."
         ),
     )
     decision_engine = {
-        "Regime ensemble (default)": "ensemble",
+        "Cross-sectional momentum (default)": "cross",
+        "Regime ensemble": "ensemble",
         "Base breakout/trend": "base",
-        "Cross-sectional momentum": "cross",
     }[decision_engine_label]
     use_ensemble = decision_engine == "ensemble"
     ensemble_config = EnsembleConfig() if use_ensemble else None

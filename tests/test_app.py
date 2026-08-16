@@ -31,7 +31,11 @@ def test_dashboard_renders_without_env_and_keeps_start_disabled(tmp_path, monkey
     assert account_mode.value == "Paper"
     assert account_mode.options == ["Paper", "Live"]
     engine_radio = next(radio for radio in page.radio if radio.label == "Decision engine")
-    assert engine_radio.value == "Regime ensemble (default)"
+    # Cross-sectional is the default: it is the only engine with positive
+    # out-of-sample expectancy across eleven walk-forward experiments, while
+    # the regime ensemble it replaced as default is the worst-measured of the
+    # three (Sharpe -1.80).
+    assert engine_radio.value == "Cross-sectional momentum (default)"
 
 
 def test_live_switch_is_fail_closed_when_deployment_flag_is_absent(tmp_path, monkeypatch):
@@ -71,9 +75,9 @@ def test_the_crypto_decision_engine_radio_offers_all_three_engines():
 
     source = Path(app_module.__file__).read_text()
     for label in (
-        "Regime ensemble (default)",
+        "Cross-sectional momentum (default)",
+        "Regime ensemble",
         "Base breakout/trend",
-        "Cross-sectional momentum",
     ):
         assert label in source, f"decision-engine radio is missing {label!r}"
 
