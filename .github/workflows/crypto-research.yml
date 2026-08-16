@@ -26,9 +26,9 @@ on:
         options: ["1Hour", "4Hour", "1Day", "15Min"]
         default: "1Hour"
       engine:
-        description: "Decision engine: base, ensemble, or cross (cross-sectional momentum)"
+        description: "Decision engine. Members run solo (1 candidate, no search) as the council baseline."
         type: choice
-        options: ["base", "ensemble", "cross"]
+        options: ["base", "ensemble", "cross", "council", "breadth", "meanrev", "volregime"]
         default: "base"
       start:
         description: "First research date (UTC, YYYY-MM-DD)"
@@ -54,7 +54,11 @@ on:
         default: false
 
 concurrency:
-  group: crypto-research-${{ github.ref }}
+  # Keyed on the engine as well as the ref, so a council run and the member
+  # runs it is being compared against can proceed in parallel. Keyed on the ref
+  # alone they cancelled each other, which made the head-to-head impossible to
+  # collect in one pass.
+  group: crypto-research-${{ github.ref }}-${{ inputs.engine }}
   cancel-in-progress: true
 
 jobs:

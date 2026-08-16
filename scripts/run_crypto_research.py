@@ -34,8 +34,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 
 from advanced_crypto_research import run_regime_ensemble_walk_forward
+from council import CouncilConfig
+from council_research import run_council_walk_forward
 from cross_sectional import CrossSectionalConfig
 from cross_sectional_research import run_cross_sectional_walk_forward
+from engine_research import SOLO_ENGINES, run_injected_walk_forward
 from config import load_credentials, timeframe_to_timedelta
 from cost_model import break_even_win_rate, cost_to_risk, round_trip_cost_bps
 from crypto_config import (
@@ -77,7 +80,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--engine",
         default="base",
-        choices=["base", "ensemble", "cross"],
+        choices=["base", "ensemble", "cross", "council", "meanrev", "volregime", "breadth"],
         help="Decision engine to walk forward. 'base' is the audited breakout/trend "
              "strategy. 'ensemble' is the regime-aware multi-sleeve blend. 'cross' is "
              "cross-sectional risk-adjusted momentum — a different hypothesis (relative "
@@ -239,6 +242,39 @@ def _aligned_length(bars: dict) -> int:
     for frame in bars.values():
         common = frame.index if common is None else common.intersection(frame.index)
     return 0 if common is None else len(common)
+
+
+def _council_parameter_grid() -> dict:
+    """Search the conviction/turnover axis, because that is where the edge is.
+
+    Every measurement in this repository points the same way: profit factor
+    rises as trade count falls. The highest profit factor observed for the
+    council (4.82) came from its *fewest* trades (31), not its most; the worst
+    (0.51) came from its most (198). So the axis worth searching is how much
+    agreement an entry demands and how wide the hysteresis band is - the two
+    parameters that directly set turnover.
+
+    min_proposers spans "any member may propose" to "three of four agree".
+    Unanimity is deliberately excluded here: it was measured end to end and
+    took exactly zero trades, so spending a candidate slot on it would waste a
+    fold rather than test anything. It stays reachable as a setting.
+
+    Twelve candidates, under the audited thirty-two cap.
+    """
+
+    return {
+        "council": [
+            CouncilConfig(
+                min_proposers=proposers,
+                entry_threshold=entry,
+                exit_threshold=exit_level,
+                top_k=top_k,
+            )
+            for proposers in (1, 2, 3)
+            for entry, exit_level in ((0.25, -0.15), (0.45, -0.45))
+            for top_k in (2, 3)
+        ],
+    }
 
 
 def _json_grid(grid) -> dict:
@@ -481,17 +517,35 @@ def main(argv=None) -> int:
         )
     print(f"    aligned    {len(common):>7} bars across {len(bars)} symbols")
 
-    grid = (
-        _cross_parameter_grid(strategy)
-        if args.engine == "cross"
-        else _parameter_grid(strategy, args.timeframe)
-    )
+    if args.engine == "cross":
+        grid = _cross_parameter_grid(strategy)
+    elif args.engine == "council":
+        grid = _council_parameter_grid()
+    elif args.engine in SOLO_ENGINES and args.engine != "base":
+        # One candidate, no in-sample selection, and therefore no
+        # multiple-testing burden to discount. These runs exist to be the
+        # comparison baseline the council must beat, so they are deliberately
+        # given the cleanest possible protocol rather than the best chance of
+        # looking good.
+        grid = {}
+    else:
+        grid = _parameter_grid(strategy, args.timeframe)
 
     print("\n  Running bounded chronological walk-forward…")
     try:
         if args.engine == "cross":
             result = run_cross_sectional_walk_forward(
                 bars, strategy, risk, backtest, grid, walk, criteria,
+            )
+        elif args.engine == "council":
+            result = run_council_walk_forward(
+                bars, strategy, risk, backtest, grid, walk, criteria,
+            )
+        elif args.engine in SOLO_ENGINES and args.engine != "base":
+            result = run_injected_walk_forward(
+                SOLO_ENGINES[args.engine],
+                bars, strategy, risk, backtest, grid, walk, criteria,
+                engine_name=args.engine,
             )
         elif args.engine == "ensemble":
             result = run_regime_ensemble_walk_forward(
