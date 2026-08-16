@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -238,6 +239,12 @@ def main(argv=None) -> int:
         return _fail(str(exc))
     for symbol, reason in dropped:
         print(f"    dropped {symbol:<10} {reason}")
+    if dropped:
+        # The universe the strategy is told about must match the bars it is
+        # handed. Dropping a symbol from one and not the other is how this
+        # failed in CI: the strategy still demanded nine symbols while eight
+        # remained, and prepare_universe raised from deep inside the study.
+        strategy = replace(strategy, symbols=tuple(bars))
     print(f"    aligned    {aligned:>7} bars across {len(bars)} symbols")
     if aligned < strategy.warmup_bars() + 30:
         return _fail(

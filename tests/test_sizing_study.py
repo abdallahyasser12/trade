@@ -272,3 +272,82 @@ def test_an_unexpected_crash_is_reported_rather_than_swallowed():
         assert module._guarded_main([]) == 2
     finally:
         module.main = original
+
+
+def test_a_universe_mismatch_is_named_before_any_backtest_runs():
+    """The CI failure: bars dropped a symbol, the strategy config did not.
+
+    Without this the error arrives from inside prepare_universe as
+    "Missing bars for AVAX/USD", which points at the strategy rather than at
+    the caller that desynchronised the two.
+    """
+
+    universe = _universe()
+    trimmed = {s: f for s, f in universe.items() if s != "DOGE/USD"}
+    with pytest.raises(ValueError, match="disagree"):
+        run_sizing_study(
+            run_cross_sectional_backtest,
+            trimmed,
+            CryptoStrategyConfig(symbols=SYMBOLS, timeframe="1Day"),
+            CryptoRiskConfig(),
+            CryptoBacktestConfig(),
+            grid=SizingGrid(risk_per_trade_pcts=(0.35,), position_counts=(3,)),
+        )
+    # And the reverse: bars the strategy was never told about.
+    with pytest.raises(ValueError, match="unexpected"):
+        run_sizing_study(
+            run_cross_sectional_backtest,
+            universe,
+            CryptoStrategyConfig(symbols=SYMBOLS[:3], timeframe="1Day"),
+            CryptoRiskConfig(),
+            CryptoBacktestConfig(),
+            grid=SizingGrid(risk_per_trade_pcts=(0.35,), position_counts=(3,)),
+        )
+
+
+def test_dropping_a_late_listing_keeps_the_strategy_universe_in_step():
+    """End-to-end guard on the exact CI failure, through the real CLI."""
+
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "run_sizing_study.py"
+    spec = importlib.util.spec_from_file_location("run_sizing_drop", script)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["run_sizing_drop"] = module
+    spec.loader.exec_module(module)
+
+    frames = {s: _bars(periods=900, seed=i) for i, s in enumerate(SYMBOLS)}
+    # One late listing, exactly as AVAX/USD was in the failing run.
+    frames["DOGE/USD"] = _bars(periods=600, seed=9).set_axis(
+        pd.date_range("2023-11-01", periods=600, freq="D", tz="UTC")
+    )
+
+    class StubFeed:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_bars(self, symbol, timeframe, start=None, end=None):
+            return frames[symbol]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            module, "load_credentials",
+            lambda *a, **k: type("C", (), {"api_key": "k", "secret_key": "s"})(),
+        )
+        mp.setattr(module, "AlpacaCryptoDataFeed", StubFeed)
+        code = module._guarded_main(
+            [
+                "--symbols", ",".join(SYMBOLS),
+                "--benchmark", "BTC/USD",
+                "--timeframe", "1Day",
+                "--engine", "cross",
+                "--start", "2023-01-02",
+                "--end", "2025-05-01",
+                "--drop-late-listings",
+                "--risk-levels", "0.35,1.40",
+                "--position-counts", "3",
+            ]
+        )
+    assert code == 0, "dropping a symbol must not desynchronise the strategy universe"

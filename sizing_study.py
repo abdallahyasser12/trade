@@ -374,6 +374,19 @@ def run_sizing_study(
     if config_errors:
         raise ValueError("Invalid strategy configuration: " + "; ".join(config_errors))
 
+    # Fail here, with the mismatch named, rather than fifteen backtests deep.
+    # A caller that drops a symbol from the universe without also dropping it
+    # from the strategy config produces a "Missing bars" error from inside
+    # prepare_universe that points at the strategy rather than at the caller.
+    missing = set(strategy_config.symbols).difference(bars_by_symbol)
+    extra = set(bars_by_symbol).difference(strategy_config.symbols)
+    if missing or extra:
+        raise ValueError(
+            "The strategy universe and the supplied bars disagree: "
+            f"missing {sorted(missing)}, unexpected {sorted(extra)}. "
+            "A caller that drops symbols must drop them from both."
+        )
+
     points: list[SizingPoint] = []
     benchmark_return = 0.0
     benchmark_sharpe: Optional[float] = None
