@@ -33,6 +33,7 @@ class RegimeAwareCryptoTradeEngine(CryptoTradeEngine):
         *,
         ensemble_config: Optional[EnsembleConfig] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
+        quant_journal=None,
     ):
         kwargs = {}
         if now_fn is not None:
@@ -44,6 +45,7 @@ class RegimeAwareCryptoTradeEngine(CryptoTradeEngine):
             strategy_config,
             risk_config,
             engine_config,
+            quant_journal=quant_journal,
             **kwargs,
         )
         self.ensemble_config = ensemble_config or EnsembleConfig()
@@ -63,6 +65,7 @@ def make_regime_aware_crypto_engine(
     *,
     ensemble_config: Optional[EnsembleConfig] = None,
     now_fn: Optional[Callable[[], datetime]] = None,
+    quant_journal=None,
 ) -> RegimeAwareCryptoTradeEngine:
     """Explicit factory used by deployments that opt into ensemble-v2."""
 
@@ -75,4 +78,5 @@ def make_regime_aware_crypto_engine(
         engine_config,
         ensemble_config=ensemble_config,
         now_fn=now_fn,
+        quant_journal=quant_journal,
     )

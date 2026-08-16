@@ -825,6 +825,9 @@ class CryptoTradeEngine:
                 lowest_close=local.lowest_close,
                 entry_regime=local.entry_regime,
                 exit_timestamp=self._now_fn(),
+                # Same key the executions ledger uses, so a re-reconciled
+                # fill books one attribution row, not two.
+                event_key=event_key,
             )
 
     def _reconcile_position_truth(self, now: datetime, startup: bool = False):

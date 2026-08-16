@@ -39,7 +39,7 @@ from quant.contracts import (
 
 DEFAULT_QUANT_DB_PATH = str(Path("data") / "quant_desk.db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -95,7 +95,12 @@ CREATE TABLE IF NOT EXISTS attributions (
     regime_at_entry         TEXT,
     opportunity_score       REAL,
     shadow                  INTEGER NOT NULL DEFAULT 0,
-    features_json           TEXT
+    features_json           TEXT,
+    -- Idempotency key for one booked exit fill (schema v2).  An engine
+    -- reconciliation that re-books the same fill must not produce a
+    -- second attribution row: duplicates would inflate the marketplace's
+    -- trade count and skew every rolling statistic derived from it.
+    event_key               TEXT
 );
 
 CREATE TABLE IF NOT EXISTS lifecycle (
@@ -206,6 +211,10 @@ CREATE INDEX IF NOT EXISTS idx_features_lookup
     ON features (symbol, market, timeframe, source, feature_version, timestamp);
 CREATE INDEX IF NOT EXISTS idx_research_strategy ON research_runs (strategy_id, run_at);
 CREATE INDEX IF NOT EXISTS idx_drift_subject ON drift_metrics (subject, computed_at);
+-- Partial unique index: rows without a key (shadow fills, backfills) are
+-- unconstrained, but a keyed exit fill can only ever be booked once.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attr_event_key
+    ON attributions (event_key) WHERE event_key IS NOT NULL;
 """
 
 
@@ -248,12 +257,39 @@ class QuantStore:
                     f"(schema v{found}; this build understands v{SCHEMA_VERSION}). "
                     "Upgrade the application rather than downgrading the database."
                 )
+            # Migrations run BEFORE the schema script, not after.  _SCHEMA
+            # uses CREATE TABLE IF NOT EXISTS, which is a no-op on an
+            # existing table and therefore never adds a column to one — so
+            # an index over a v2 column would fail against a v1 database
+            # before any "later" migration got the chance to add it.
+            self._migrate(found)
             self._conn.executescript(_SCHEMA)
-            # Migrations for future versions belong here, gated on ``found``,
-            # exactly like StateStore: additive ALTERs keyed off PRAGMA
-            # table_info so existing databases upgrade in place.
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
+
+    def _migrate(self, found: int) -> None:
+        """Additive, in-place upgrades for databases written by older builds.
+
+        Keyed off ``PRAGMA table_info`` rather than off ``found`` alone, so
+        a database that was partially upgraded (crash between the ALTER and
+        the version bump) converges instead of failing forever.
+        """
+        if not self._table_exists("attributions"):
+            return  # fresh database; _SCHEMA creates it at the current version
+
+        if not self._column_exists("attributions", "event_key"):
+            # v1 -> v2: idempotency key for booked exit fills.
+            self._conn.execute("ALTER TABLE attributions ADD COLUMN event_key TEXT")
+
+    def _table_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        return row is not None
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row["name"] == column for row in rows)
 
     def close(self) -> None:
         with self._lock:
@@ -346,15 +382,33 @@ class QuantStore:
     # ------------------------------------------------------------------
 
     def record_attribution(self, record: AttributionRecord) -> int:
+        """Insert one attribution row; a repeated ``event_key`` is a no-op.
+
+        Booking the same exit fill twice would inflate the marketplace's
+        trade count and skew every statistic derived from it, so a keyed
+        record that already exists returns the existing id instead of
+        writing a duplicate.  Unkeyed records (shadow fills, backfills)
+        are always inserted.
+        """
+        if record.event_key:
+            with self._lock:
+                existing = self._conn.execute(
+                    "SELECT id FROM attributions WHERE event_key = ?",
+                    (record.event_key,),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
+
         cur = self._execute(
             "INSERT INTO attributions (recorded_at, strategy_id, strategy_version,"
             " symbol, market, timeframe, session_id, signal_timestamp,"
             " entry_timestamp, exit_timestamp, qty, entry_price, exit_price,"
             " initial_stop_price, fees, expected_cost_bps, realized_slippage_bps,"
             " gross_pnl, net_pnl, r_multiple, mfe_pct, mae_pct, entry_reason,"
-            " exit_reason, regime_at_entry, opportunity_score, shadow, features_json)"
+            " exit_reason, regime_at_entry, opportunity_score, shadow, features_json,"
+            " event_key)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            " ?, ?, ?, ?, ?, ?, ?, ?)",
+            " ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _to_iso(_utc_now()),
                 record.strategy_id,
@@ -384,6 +438,7 @@ class QuantStore:
                 record.opportunity_score,
                 1 if record.shadow else 0,
                 json.dumps(record.features_at_entry),
+                record.event_key,
             ),
         )
         return int(cur.lastrowid)

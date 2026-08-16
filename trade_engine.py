@@ -470,6 +470,7 @@ class TradeEngine:
                 timestamp=now,
                 event_key=f"fill:{order.client_order_id}:sell",
             )
+            self._journal_exit_attribution(bot_pos, order, reason, now)
         return bot_pos
 
     def _unbooked_pending_sell_qty(self, bot_pos: dict) -> float:
@@ -1133,6 +1134,9 @@ class TradeEngine:
                 timestamp=now,
                 event_key=f"fill:{refreshed.client_order_id}:sell",
             )
+            self._journal_exit_attribution(
+                bot_pos, refreshed, "atr_stop_triggered", now
+            )
             bot_pos.pop(f"stop_accounted_filled_qty:{refreshed.client_order_id}", None)
         bot_pos["stop_client_order_id"] = None
         bot_pos["stop_price"] = None
@@ -1210,6 +1214,9 @@ class TradeEngine:
                 signal_snapshot=None,
                 timestamp=now,
                 event_key=f"fill:{order.client_order_id}:sell",
+            )
+            self._journal_exit_attribution(
+                bot_pos, order, pending.get("reason", "exit"), now
             )
             remaining = float(bot_pos.get("qty", 0))
             if remaining > 1e-9:
@@ -1303,6 +1310,7 @@ class TradeEngine:
                 timestamp=now,
                 event_key=f"fill:{order.client_order_id}:sell",
             )
+            self._journal_exit_attribution(bot_pos, order, "atr_stop_triggered", now)
             remaining = float(bot_pos.get("qty", 0))
             if remaining > 1e-9:
                 bot_pos.pop(f"stop_accounted_filled_qty:{order.client_order_id}", None)
@@ -1407,6 +1415,7 @@ class TradeEngine:
         bot_pos["stop_price"] = stop_price
         bot_pos.setdefault("initial_stop_price", stop_price)
         bot_pos.setdefault("highest_close", entry_price)
+        bot_pos.setdefault("lowest_close", entry_price)
 
         linked_stop_id = bot_pos.get("stop_client_order_id")
         if linked_stop_id:
@@ -1659,6 +1668,12 @@ class TradeEngine:
             self._initiate_exit("trailing_close_breach", bar_ts, signal=decision.to_dict())
             return True
         highest_close = max(float(bot_pos.get("highest_close") or entry_price), close_price)
+        # Excursion low, tracked purely for post-trade attribution (MAE).
+        # Nothing in the risk path reads it, so it cannot change a stop or
+        # an exit; it only stops the desk from reporting MAE as unknown.
+        bot_pos["lowest_close"] = min(
+            float(bot_pos.get("lowest_close") or entry_price), close_price
+        )
         try:
             next_stop = self.risk_manager.calculate_ratchet_stop(
                 entry_price=entry_price,
@@ -1991,6 +2006,58 @@ class TradeEngine:
             self.quant_journal.record_stock_decision(
                 self.symbol, decision, self.session_id, blocked_reason=block
             )
+
+    def _journal_exit_attribution(
+        self,
+        bot_pos: Optional[dict],
+        order,
+        reason: str,
+        now: datetime,
+        qty: Optional[float] = None,
+    ) -> None:
+        """Attribute a booked sell fill to the strategy that caused it.
+
+        Called next to every ``record_trade(action="SELL")`` so the desk's
+        attribution table matches the trade ledger.  Keyed by the broker
+        client order id, so a reconciliation that re-books the same fill
+        produces one row rather than two.
+
+        Skipped when the local position record is already gone: without an
+        entry price there is nothing to attribute, and inventing one would
+        be worse than the missing row.  Purely an observer — it cannot
+        raise into the trading path (``DecisionJournal`` swallows its own
+        errors) and it changes no engine state.
+        """
+        if self.quant_journal is None or bot_pos is None or order is None:
+            return
+        entry_price = float(bot_pos.get("entry_price") or 0.0)
+        if entry_price <= 0:
+            return
+        entry_time = None
+        raw_entry_time = bot_pos.get("entry_time")
+        if raw_entry_time:
+            try:
+                entry_time = datetime.fromisoformat(raw_entry_time)
+            except (TypeError, ValueError):
+                entry_time = None
+        self.quant_journal.record_stock_exit_fill(
+            symbol=self.symbol,
+            session_id=self.session_id,
+            qty=float(qty if qty is not None else order.filled_qty),
+            exit_price=order.fill_price,
+            exit_reason=reason,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            initial_stop_price=bot_pos.get("initial_stop_price"),
+            highest_close=bot_pos.get("highest_close"),
+            lowest_close=bot_pos.get("lowest_close"),
+            # US equities are commission-free on Alpaca; the real cost is
+            # spread and slippage, which the executions ledger measures.
+            # Reporting a fabricated fee here would double-count it.
+            fees=0.0,
+            exit_timestamp=now,
+            event_key=f"fill:{order.client_order_id}:sell",
+        )
 
     def _entry_block_reason(
         self, decision: SignalDecision, bar_ts: datetime, clock, account, now: datetime

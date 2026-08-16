@@ -37,6 +37,8 @@ from advanced_crypto_engine import make_regime_aware_crypto_engine
 from cross_sectional import CrossSectionalConfig
 from cross_sectional_engine import make_cross_sectional_crypto_engine
 from quant_dashboard import render_quant_desk
+from quant.attach import attach_journal
+from quant.contracts import Market
 from cross_sectional_research import (
     run_cross_sectional_backtest,
     run_cross_sectional_walk_forward,
@@ -1096,15 +1098,24 @@ def render_live_tab(store: StateStore, conn: dict, strategy_config: StrategyConf
         )
 
         def factory() -> TradeEngine:
+            strategy = TrendStrategy(strategy_config)
             return TradeEngine(
                 broker=make_broker(),
                 data_feed=make_data_feed(run_cfg.data_feed),
-                strategy=TrendStrategy(strategy_config),
+                strategy=strategy,
                 risk_manager=RiskManager(risk_config),
                 state_store=store,
                 strategy_config=strategy_config,
                 risk_config=risk_config,
                 engine_config=run_cfg,
+                # Observer only: records what the engine decided and what
+                # each exit earned. Returns None if the desk database is
+                # unavailable, which restores the previous behavior exactly.
+                quant_journal=attach_journal(
+                    market=Market.US_EQUITY,
+                    timeframe=strategy_config.timeframe,
+                    strategy=strategy,
+                ),
             )
 
         ok, msg = controller.start_engine(factory)
@@ -2142,7 +2153,7 @@ def render_crypto_workspace(store: StateStore) -> None:
             # recovery are all owned by the parent class. Only the decision
             # layer differs.
             if use_ensemble:
-                return make_regime_aware_crypto_engine(
+                engine = make_regime_aware_crypto_engine(
                     broker,
                     data_feed,
                     store,
@@ -2151,8 +2162,8 @@ def render_crypto_workspace(store: StateStore) -> None:
                     engine_config,
                     ensemble_config=ensemble_config,
                 )
-            if decision_engine == "cross":
-                return make_cross_sectional_crypto_engine(
+            elif decision_engine == "cross":
+                engine = make_cross_sectional_crypto_engine(
                     broker,
                     data_feed,
                     store,
@@ -2161,14 +2172,27 @@ def render_crypto_workspace(store: StateStore) -> None:
                     engine_config,
                     cross_config=cross_config,
                 )
-            return CryptoTradeEngine(
-                broker,
-                data_feed,
-                store,
-                strategy_config,
-                risk_config,
-                engine_config,
+            else:
+                engine = CryptoTradeEngine(
+                    broker,
+                    data_feed,
+                    store,
+                    strategy_config,
+                    risk_config,
+                    engine_config,
+                )
+            # Attached after construction, not passed in: the ensemble and
+            # cross-sectional subclasses build their own strategy inside
+            # __init__, so this is the only point where the real decision
+            # layer is known and the journal can be tagged with the
+            # strategy id the marketplace and lifecycle ladder use.
+            # Observer only — a None here is exactly the old behavior.
+            engine.quant_journal = attach_journal(
+                market=Market.CRYPTO,
+                timeframe=strategy_config.timeframe,
+                strategy=engine.strategy,
             )
+            return engine
 
         started, message = controller.start_engine(factory)
         (st.success if started else st.warning)(message)

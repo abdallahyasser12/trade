@@ -45,6 +45,7 @@ class CrossSectionalCryptoTradeEngine(CryptoTradeEngine):
         *,
         cross_config: Optional[CrossSectionalConfig] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
+        quant_journal=None,
     ):
         kwargs = {}
         if now_fn is not None:
@@ -56,6 +57,7 @@ class CrossSectionalCryptoTradeEngine(CryptoTradeEngine):
             strategy_config,
             risk_config,
             engine_config,
+            quant_journal=quant_journal,
             **kwargs,
         )
         self.cross_config = cross_config or CrossSectionalConfig()
@@ -82,6 +84,7 @@ def make_cross_sectional_crypto_engine(
     *,
     cross_config: Optional[CrossSectionalConfig] = None,
     now_fn: Optional[Callable[[], datetime]] = None,
+    quant_journal=None,
 ) -> CrossSectionalCryptoTradeEngine:
     """Explicit factory used by deployments that opt into cross-sectional."""
 
@@ -94,4 +97,5 @@ def make_cross_sectional_crypto_engine(
         engine_config,
         cross_config=cross_config,
         now_fn=now_fn,
+        quant_journal=quant_journal,
     )

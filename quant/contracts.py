@@ -319,6 +319,11 @@ class AttributionRecord:
     opportunity_score: Optional[float] = None
     shadow: bool = False
     features_at_entry: dict[str, Optional[float]] = field(default_factory=dict)
+    # Stable identity of the booked exit fill (broker client order id plus
+    # side).  Present on engine-sourced rows so a reconciliation that
+    # re-books the same fill cannot double-count it; ``None`` for shadow
+    # and backfilled rows, which are unconstrained.
+    event_key: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

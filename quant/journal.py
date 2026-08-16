@@ -221,6 +221,7 @@ class DecisionJournal:
         lowest_close: Optional[float],
         entry_regime: Optional[str],
         exit_timestamp: Optional[datetime] = None,
+        event_key: Optional[str] = None,
     ) -> None:
         """Attribute one sell fill against its position's entry.
 
@@ -284,6 +285,95 @@ class DecisionJournal:
                     exit_reason=exit_reason,
                     regime_at_entry=entry_regime,
                     shadow=False,
+                    event_key=event_key,
+                )
+            )
+        except Exception as error:
+            self._warn(f"Attribution write failed: {error}")
+
+    def record_stock_exit_fill(
+        self,
+        *,
+        symbol: str,
+        session_id: Optional[str],
+        qty: float,
+        exit_price: Optional[float],
+        exit_reason: str,
+        entry_price: float,
+        entry_time: Optional[datetime] = None,
+        initial_stop_price: Optional[float] = None,
+        highest_close: Optional[float] = None,
+        lowest_close: Optional[float] = None,
+        fees: float = 0.0,
+        exit_timestamp: Optional[datetime] = None,
+        event_key: Optional[str] = None,
+    ) -> None:
+        """Attribute one stock sell fill against its position's entry.
+
+        The stock engine had no attribution path at all: it journaled its
+        decisions but never what those decisions earned, so the
+        marketplace could only ever see crypto.  This is the missing half.
+
+        Alpaca charges no commission on US equities, so ``fees`` defaults
+        to zero and the gross/net split is honest rather than invented —
+        the real equity cost is spread and slippage, which the executions
+        ledger measures separately and attribution must not double count.
+
+        Excursions are close-based for the same reason as the crypto path
+        (live position state tracks completed closes, not intrabar
+        extremes) and are therefore systematically no wider than the truth.
+        """
+        try:
+            if exit_price is None or qty <= 0 or entry_price <= 0:
+                return
+            gross = (exit_price - entry_price) * qty
+            net = gross - fees
+            r_multiple = None
+            stop = _finite(initial_stop_price)
+            if stop is not None and 0 < stop < entry_price:
+                risk = (entry_price - stop) * qty
+                if risk > 0:
+                    r_multiple = net / risk
+            high = _finite(highest_close)
+            low = _finite(lowest_close)
+            mfe = (
+                max(0.0, (high - entry_price) / entry_price * 100.0)
+                if high is not None
+                else None
+            )
+            mae = (
+                max(0.0, (entry_price - low) / entry_price * 100.0)
+                if low is not None
+                else None
+            )
+            self.store.record_attribution(
+                AttributionRecord(
+                    strategy_id=self.strategy_id,
+                    strategy_version=self.strategy_version,
+                    symbol=symbol,
+                    market=Market.US_EQUITY,
+                    timeframe=self.timeframe,
+                    session_id=session_id,
+                    signal_timestamp=entry_time,
+                    entry_timestamp=entry_time,
+                    exit_timestamp=exit_timestamp or datetime.now(timezone.utc),
+                    qty=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    initial_stop_price=stop,
+                    fees=fees,
+                    expected_cost_bps=None,
+                    realized_slippage_bps=None,
+                    gross_pnl=gross,
+                    net_pnl=net,
+                    r_multiple=r_multiple,
+                    max_favorable_excursion_pct=mfe,
+                    max_adverse_excursion_pct=mae,
+                    entry_reason="",
+                    exit_reason=exit_reason,
+                    regime_at_entry=None,
+                    shadow=False,
+                    event_key=event_key,
                 )
             )
         except Exception as error:
