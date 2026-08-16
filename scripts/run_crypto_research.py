@@ -54,6 +54,7 @@ from crypto_research import (
     run_crypto_walk_forward,
 )
 from regime_ensemble import EnsembleConfig
+from universe_alignment import aligned_length, drop_limiting_symbols
 
 RULE = "=" * 78
 
@@ -201,80 +202,13 @@ def _cross_parameter_grid(strategy: CryptoStrategyConfig) -> dict:
 
 
 def _drop_late_listings(bars: dict, benchmark: str, *, min_symbols: int = 3):
-    """Drop whichever symbol most limits the aligned window, repeatedly.
+    """Thin alias; the implementation is shared with the sizing study."""
 
-    Selection is by measured impact, not by start date. A late listing is the
-    obvious way to truncate the common index, but it is not the only one: a
-    symbol that began on day one and is missing 400 scattered days costs just
-    as much, and picking by start date would never touch it. Removing the
-    symbol whose removal recovers the most bars covers both cases with one
-    rule.
-
-    The benchmark is never dropped — it defines the comparison — and the
-    universe never falls below ``min_symbols``, because a cross-sectional
-    ranking over two names is not a ranking.
-    """
-
-    kept = dict(bars)
-    dropped: list[tuple[str, str]] = []
-    while len(kept) > min_symbols:
-        before = _aligned_length(kept)
-        best, recovered = None, before
-        for symbol in kept:
-            if symbol == benchmark:
-                continue
-            length = _aligned_length({s: f for s, f in kept.items() if s != symbol})
-            if length > recovered:
-                best, recovered = symbol, length
-        if best is None:
-            break
-        frame = kept.pop(best)
-        dropped.append((
-            best,
-            f"starts {frame.index[0]:%Y-%m-%d}, {len(frame)} bars; "
-            f"dropping it recovers {recovered - before} aligned bars",
-        ))
-    return kept, dropped
+    return drop_limiting_symbols(bars, benchmark, min_symbols=min_symbols)
 
 
 def _aligned_length(bars: dict) -> int:
-    common = None
-    for frame in bars.values():
-        common = frame.index if common is None else common.intersection(frame.index)
-    return 0 if common is None else len(common)
-
-
-def _council_parameter_grid() -> dict:
-    """Search the conviction/turnover axis, because that is where the edge is.
-
-    Every measurement in this repository points the same way: profit factor
-    rises as trade count falls. The highest profit factor observed for the
-    council (4.82) came from its *fewest* trades (31), not its most; the worst
-    (0.51) came from its most (198). So the axis worth searching is how much
-    agreement an entry demands and how wide the hysteresis band is - the two
-    parameters that directly set turnover.
-
-    min_proposers spans "any member may propose" to "three of four agree".
-    Unanimity is deliberately excluded here: it was measured end to end and
-    took exactly zero trades, so spending a candidate slot on it would waste a
-    fold rather than test anything. It stays reachable as a setting.
-
-    Twelve candidates, under the audited thirty-two cap.
-    """
-
-    return {
-        "council": [
-            CouncilConfig(
-                min_proposers=proposers,
-                entry_threshold=entry,
-                exit_threshold=exit_level,
-                top_k=top_k,
-            )
-            for proposers in (1, 2, 3)
-            for entry, exit_level in ((0.25, -0.15), (0.45, -0.45))
-            for top_k in (2, 3)
-        ],
-    }
+    return aligned_length(bars)
 
 
 def _json_grid(grid) -> dict:

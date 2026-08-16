@@ -47,6 +47,7 @@ from crypto_config import (
 from crypto_data_feed import AlpacaCryptoDataFeed
 from engine_research import SOLO_ENGINES, run_injected_backtest
 from sizing_study import SizingGrid, run_sizing_study
+from universe_alignment import align_to_common_index, drop_limiting_symbols
 
 RULE = "=" * 78
 
@@ -137,21 +138,14 @@ def _backtest_fn(engine: str):
 def _aligned(bars: dict, benchmark: str, drop: bool):
     """Intersect to common timestamps, optionally dropping the worst offender."""
 
-    from run_crypto_research import _aligned_length, _drop_late_listings  # noqa: E402
-
     dropped: list[tuple[str, str]] = []
     if drop:
-        bars, dropped = _drop_late_listings(bars, benchmark)
-    common = None
-    for frame in bars.values():
-        common = frame.index if common is None else common.intersection(frame.index)
-    if common is None or len(common) == 0:
-        raise ValueError("The symbols share no common timestamps.")
-    return {symbol: frame.loc[common] for symbol, frame in bars.items()}, dropped, len(common)
+        bars, dropped = drop_limiting_symbols(bars, benchmark)
+    aligned, common = align_to_common_index(bars)
+    return aligned, dropped, len(common)
 
 
 def main(argv=None) -> int:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     args = _parse_args(argv)
 
     try:
@@ -326,5 +320,23 @@ def main(argv=None) -> int:
     return 0
 
 
+def _guarded_main(argv=None) -> int:
+    """Turn an unexpected crash into a readable report rather than a bare exit.
+
+    CI captures stdout and stderr into the published report, so an uncaught
+    exception here is the difference between a diagnosable failure and 600
+    bytes of banner followed by nothing.
+    """
+
+    try:
+        return main(argv)
+    except Exception:  # noqa: BLE001 - last resort, re-raised as a report
+        import traceback
+
+        print("\nUNEXPECTED FAILURE — full traceback follows:", file=sys.stderr)
+        traceback.print_exc()
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_guarded_main())

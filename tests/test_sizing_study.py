@@ -230,3 +230,45 @@ def test_the_verdict_distinguishes_holding_from_decaying():
     assert synthetic(1.0, 0.95).quality_holds() is True
     assert synthetic(1.0, 0.30).quality_holds() is False
     assert synthetic(1.0, None).quality_holds() is None
+
+
+def test_the_sizing_script_does_not_reach_into_a_sibling_script():
+    """The import that broke a CI run, guarded.
+
+    _aligned used to do `from run_crypto_research import ...`, which only
+    resolved when the scripts directory happened to be on sys.path. That is a
+    dependency on process start-up state rather than on anything declared, and
+    it is why both scripts now share universe_alignment.
+    """
+
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "scripts" / "run_sizing_study.py"
+    ).read_text()
+    assert "from run_crypto_research import" not in source
+    assert "from universe_alignment import" in source
+
+
+def test_an_unexpected_crash_is_reported_rather_than_swallowed():
+    """CI publishes stdout; a bare non-zero exit leaves nothing to diagnose."""
+
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "run_sizing_study.py"
+    spec = importlib.util.spec_from_file_location("run_sizing_study_guard", script)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["run_sizing_study_guard"] = module
+    spec.loader.exec_module(module)
+
+    def boom(argv=None):
+        raise RuntimeError("synthetic failure")
+
+    original = module.main
+    module.main = boom
+    try:
+        assert module._guarded_main([]) == 2
+    finally:
+        module.main = original
