@@ -151,6 +151,14 @@ class CryptoPositionState:
     breached_at: Optional[str] = None
     breach_confirmations: int = 0
     guard_attempt: int = 0
+    # Attribution context, added after the fields above shipped. Optional
+    # with defaults so state persisted by earlier builds loads unchanged
+    # (from_dict drops unknown keys, missing keys take these defaults).
+    # ``lowest_close`` tracks completed closes only, mirroring
+    # ``highest_close`` — the adverse-excursion counterpart.
+    initial_stop_price: Optional[float] = None
+    lowest_close: Optional[float] = None
+    entry_regime: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

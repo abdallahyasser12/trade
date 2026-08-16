@@ -95,9 +95,14 @@ class TradeEngine:
         engine_config: EngineConfig,
         session_id: Optional[str] = None,
         now_fn: Callable[[], datetime] = _utc_now,
+        quant_journal=None,
     ):
         self.broker = broker
         self.data_feed = data_feed
+        # Optional desk journal (quant.journal.DecisionJournal). Purely an
+        # observer of decisions; its own error handling guarantees a failed
+        # journal write can never affect an order.
+        self.quant_journal = quant_journal
         # Own deep-copied collaborators/configs so later Streamlit reruns or
         # caller-side mutation cannot alter a running session mid-flight.
         self.strategy_config = copy.deepcopy(strategy_config)
@@ -731,6 +736,10 @@ class TradeEngine:
             self._status.last_bar_time = last_bar_ts
             self._status.last_signal = decision
         self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
+        if self.quant_journal is not None:
+            self.quant_journal.record_stock_decision(
+                self.symbol, decision, self.session_id
+            )
         self._log(
             "INFO",
             f"Signal on {last_bar_ts.isoformat()}: {decision.action.value} ({decision.reason})",
@@ -1976,6 +1985,12 @@ class TradeEngine:
         with self._lock:
             decision.details["entry_block"] = block
         self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
+        if self.quant_journal is not None:
+            # A blocked BUY is a rejection; the desk journal records it with
+            # its reason exactly like every other rejected opportunity.
+            self.quant_journal.record_stock_decision(
+                self.symbol, decision, self.session_id, blocked_reason=block
+            )
 
     def _entry_block_reason(
         self, decision: SignalDecision, bar_ts: datetime, clock, account, now: datetime

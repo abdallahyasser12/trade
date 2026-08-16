@@ -35,7 +35,7 @@ import pandas as pd
 
 from advanced_crypto_research import run_regime_ensemble_walk_forward
 from council import CouncilConfig
-from council_research import run_council_walk_forward
+from council_research import COUNCIL_GRID_KEY, run_council_walk_forward
 from cross_sectional import CrossSectionalConfig
 from cross_sectional_research import run_cross_sectional_walk_forward
 from engine_research import SOLO_ENGINES, run_injected_walk_forward
@@ -212,6 +212,33 @@ def _cross_parameter_grid(strategy: CryptoStrategyConfig) -> dict:
             for gated in (True, False)
         ],
         "atr_stop_multiplier": sorted({strategy.atr_stop_multiplier, 4.0}),
+    }
+
+
+def _council_parameter_grid() -> dict:
+    """Candidates for the council's own decision surface.
+
+    The council was dispatchable but this builder never existed, so
+    ``--engine council`` died with a NameError before the walk-forward
+    started.  The searched axes are the ones experiments 9-10 identified
+    as decisive: how much independent agreement an entry needs
+    (``min_proposers``) and how strong the combined rank score must be
+    (``entry_threshold``, with the exit threshold moved in lockstep to
+    preserve the hysteresis band).  Member sub-parameters stay at their
+    defaults by design — the council searches how to combine members, not
+    how to retune them.
+    """
+
+    return {
+        COUNCIL_GRID_KEY: [
+            CouncilConfig(
+                min_proposers=proposers,
+                entry_threshold=entry,
+                exit_threshold=entry - 0.40,
+            )
+            for proposers in (2, 3)
+            for entry in (0.15, 0.25, 0.35)
+        ],
     }
 
 

@@ -36,6 +36,7 @@ from advanced_crypto_backtest import run_regime_ensemble_backtest
 from advanced_crypto_engine import make_regime_aware_crypto_engine
 from cross_sectional import CrossSectionalConfig
 from cross_sectional_engine import make_cross_sectional_crypto_engine
+from quant_dashboard import render_quant_desk
 from cross_sectional_research import (
     run_cross_sectional_backtest,
     run_cross_sectional_walk_forward,
@@ -2213,12 +2214,13 @@ def main() -> None:
     if not creds.is_configured:
         render_missing_credentials_box()
 
-    tab_backtest, tab_research, tab_live, tab_crypto, tab_logs = st.tabs(
+    tab_backtest, tab_research, tab_live, tab_crypto, tab_quant, tab_logs = st.tabs(
         [
             "⚙️ Configure & Backtest",
             "🧪 Walk-Forward Research",
             "🟢 Run Live (Paper)",
             "₿ Crypto Research & Trading",
+            "🎛️ Quant Desk",
             "🧾 Logs / State",
         ]
     )
@@ -2239,6 +2241,9 @@ def main() -> None:
 
     with tab_crypto:
         render_crypto_workspace(store)
+
+    with tab_quant:
+        render_quant_desk(store)
 
     with tab_logs:
         render_logs_tab(store)

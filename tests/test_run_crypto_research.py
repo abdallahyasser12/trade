@@ -445,3 +445,18 @@ def test_dropping_late_listings_recovers_the_window_and_keeps_the_benchmark():
     kept, dropped = module._drop_late_listings(three, "BTC/USD")
     assert dropped == []
     assert set(kept) == set(three)
+
+
+def test_council_parameter_grid_exists_and_validates():
+    # Regression: ``--engine council`` used to die with a NameError because
+    # _council_parameter_grid was dispatched but never defined.  The grid
+    # must produce validated CouncilConfig candidates under the reserved
+    # council grid key so the council walk-forward can consume it directly.
+    module = _load()
+    grid = module._council_parameter_grid()
+    candidates = grid[module.COUNCIL_GRID_KEY]
+    assert len(candidates) >= 2
+    for candidate in candidates:
+        assert candidate.validate() == []
+        # The hysteresis band must survive the search: exits strictly below entries.
+        assert candidate.exit_threshold < candidate.entry_threshold
