@@ -34,6 +34,12 @@ from config import (
 )
 from advanced_crypto_backtest import run_regime_ensemble_backtest
 from advanced_crypto_engine import make_regime_aware_crypto_engine
+from cross_sectional import CrossSectionalConfig
+from cross_sectional_engine import make_cross_sectional_crypto_engine
+from cross_sectional_research import (
+    run_cross_sectional_backtest,
+    run_cross_sectional_walk_forward,
+)
 from advanced_crypto_research import run_regime_ensemble_walk_forward
 from cost_model import break_even_win_rate
 from crypto_backtest import run_crypto_backtest
@@ -1602,20 +1608,34 @@ def render_crypto_workspace(store: StateStore) -> None:
 
     decision_engine_label = st.radio(
         "Decision engine",
-        ["Regime ensemble (default)", "Base breakout/trend"],
+        [
+            "Regime ensemble (default)",
+            "Base breakout/trend",
+            "Cross-sectional momentum",
+        ],
         horizontal=True,
         disabled=engine_active,
         key="crypto_decision_engine",
         help=(
-            "Both engines run through the identical execution, sizing, cost-gate, "
+            "Every engine runs through the identical execution, sizing, cost-gate, "
             "and promotion machinery. The ensemble blends breakout, pullback, and "
             "mean-reversion sleeves weighted by market regime; the base engine is "
-            "the original breakout/trend model. The selection is part of the result "
-            "fingerprint, so cached research never mixes engines."
+            "the original breakout/trend model; cross-sectional ranks the universe "
+            "by risk-adjusted momentum and holds the leaders. The selection is part "
+            "of the result fingerprint, so cached research never mixes engines.\n\n"
+            "Selectable is not cleared: all three have FAILED the promotion gates. "
+            "Cross-sectional is the only one with positive out-of-sample "
+            "expectancy, and it still lost to buy-and-hold."
         ),
     )
-    use_ensemble = decision_engine_label.startswith("Regime")
+    decision_engine = {
+        "Regime ensemble (default)": "ensemble",
+        "Base breakout/trend": "base",
+        "Cross-sectional momentum": "cross",
+    }[decision_engine_label]
+    use_ensemble = decision_engine == "ensemble"
     ensemble_config = EnsembleConfig() if use_ensemble else None
+    cross_config = CrossSectionalConfig() if decision_engine == "cross" else None
 
     mode_label = st.radio(
         "Alpaca crypto account",
@@ -1853,7 +1873,7 @@ def render_crypto_workspace(store: StateStore) -> None:
         risk_config,
         engine_config,
         backtest_config,
-        decision_engine="ensemble" if use_ensemble else "base",
+        decision_engine=decision_engine,
     )
     config_errors = (
         strategy_config.validate()
@@ -1901,6 +1921,15 @@ def render_crypto_workspace(store: StateStore) -> None:
                         active_start=pd.Timestamp(activation),
                         ensemble_config=ensemble_config,
                     )
+                elif decision_engine == "cross":
+                    result = run_cross_sectional_backtest(
+                        bars,
+                        strategy_config,
+                        risk_config,
+                        backtest_config,
+                        active_start=pd.Timestamp(activation),
+                        cross_config=cross_config,
+                    )
                 else:
                     result = run_crypto_backtest(
                         bars,
@@ -1944,10 +1973,31 @@ def render_crypto_workspace(store: StateStore) -> None:
                     step_bars=test_bars,
                     min_train_trades=min_trades,
                 )
-                grid = {
-                    "breakout_period": sorted({breakout, max(5, breakout + 10)}),
-                    "min_adx": sorted({min_adx, min(60.0, min_adx + 5.0)}),
-                }
+                if decision_engine == "cross":
+                    # The cross-sectional engine never reads breakout_period or
+                    # min_adx, so the grid below would produce behaviourally
+                    # identical candidates: the argmax would be decided by
+                    # tie-break order, and the reported candidate count would
+                    # size a multiple-testing penalty for a search that never
+                    # happened. Search what this engine actually reads.
+                    grid = {
+                        "cross": [
+                            CrossSectionalConfig(
+                                lookback=window,
+                                vol_lookback=window,
+                                top_k=top_k,
+                                require_benchmark_bull=gated,
+                            )
+                            for window in (20, 30, 45)
+                            for top_k in (2, 3)
+                            for gated in (True, False)
+                        ],
+                    }
+                else:
+                    grid = {
+                        "breakout_period": sorted({breakout, max(5, breakout + 10)}),
+                        "min_adx": sorted({min_adx, min(60.0, min_adx + 5.0)}),
+                    }
                 research_start = pd.Timestamp(
                     datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
                 )
@@ -1966,6 +2016,17 @@ def render_crypto_workspace(store: StateStore) -> None:
                             walk,
                             CryptoPromotionCriteria(),
                             ensemble_config=ensemble_config,
+                        )
+                    elif decision_engine == "cross":
+                        report = run_cross_sectional_walk_forward(
+                            research_bars,
+                            strategy_config,
+                            risk_config,
+                            backtest_config,
+                            grid,
+                            walk,
+                            CryptoPromotionCriteria(),
+                            cross_config=cross_config,
                         )
                     else:
                         report = run_crypto_walk_forward(
@@ -2071,10 +2132,11 @@ def render_crypto_workspace(store: StateStore) -> None:
         def factory():
             broker = _crypto_broker_for(credentials, risk_config)
             data_feed = AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
+            # Same production engine underneath in every branch: broker
+            # verification, mode isolation, loss latch, stop watchdog, and
+            # recovery are all owned by the parent class. Only the decision
+            # layer differs.
             if use_ensemble:
-                # Same production engine underneath: broker verification, mode
-                # isolation, loss latch, stop watchdog, and recovery are all
-                # owned by the parent class. Only the decision layer differs.
                 return make_regime_aware_crypto_engine(
                     broker,
                     data_feed,
@@ -2083,6 +2145,16 @@ def render_crypto_workspace(store: StateStore) -> None:
                     risk_config,
                     engine_config,
                     ensemble_config=ensemble_config,
+                )
+            if decision_engine == "cross":
+                return make_cross_sectional_crypto_engine(
+                    broker,
+                    data_feed,
+                    store,
+                    strategy_config,
+                    risk_config,
+                    engine_config,
+                    cross_config=cross_config,
                 )
             return CryptoTradeEngine(
                 broker,

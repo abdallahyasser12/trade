@@ -62,3 +62,76 @@ def test_live_switch_is_fail_closed_when_deployment_flag_is_absent(tmp_path, mon
     assert unlock.disabled is True
     assert verify.disabled is True
     assert start.disabled is True
+
+
+def test_the_crypto_decision_engine_radio_offers_all_three_engines():
+    """Cross-sectional must be reachable from the dashboard, not research-only."""
+
+    import app as app_module
+
+    source = Path(app_module.__file__).read_text()
+    for label in (
+        "Regime ensemble (default)",
+        "Base breakout/trend",
+        "Cross-sectional momentum",
+    ):
+        assert label in source, f"decision-engine radio is missing {label!r}"
+
+
+def test_each_engine_selection_reaches_its_own_live_factory():
+    """A radio that does not change the engine is worse than no radio."""
+
+    import app as app_module
+
+    source = Path(app_module.__file__).read_text()
+    # Live/paper trading
+    assert "make_regime_aware_crypto_engine(" in source
+    assert "make_cross_sectional_crypto_engine(" in source
+    # Backtest
+    assert "run_regime_ensemble_backtest(" in source
+    assert "run_cross_sectional_backtest(" in source
+    # Walk-forward research
+    assert "run_regime_ensemble_walk_forward(" in source
+    assert "run_cross_sectional_walk_forward(" in source
+
+
+def test_the_engine_choice_is_part_of_the_cache_fingerprint():
+    """Otherwise cached research silently mixes engines."""
+
+    import app as app_module
+    from crypto_config import (
+        CryptoBacktestConfig,
+        CryptoEngineConfig,
+        CryptoRiskConfig,
+        CryptoStrategyConfig,
+    )
+
+    creds = type("C", (), {"fingerprint": "abc"})()
+    args = (
+        creds,
+        CryptoStrategyConfig(),
+        CryptoRiskConfig(),
+        CryptoEngineConfig(),
+        CryptoBacktestConfig(),
+    )
+    prints = {
+        app_module._crypto_context_fingerprint(*args, decision_engine=name)
+        for name in ("base", "ensemble", "cross")
+    }
+    assert len(prints) == 3, "engines share a cache key; results would be mixed"
+
+
+def test_the_cross_engine_research_grid_searches_what_it_reads():
+    """The same no-op-search defect the CLI had must not exist in the app."""
+
+    import app as app_module
+
+    source = Path(app_module.__file__).read_text()
+    marker = source.index('grid = {')
+    block = source[marker - 600:marker + 900]
+    assert '"cross": [' in block
+    assert "CrossSectionalConfig(" in block
+    assert "require_benchmark_bull=gated" in block
+    # And the breakout keys the cross engine never reads stay on the other branch.
+    breakout_grid = source[source.index('"breakout_period": sorted('):]
+    assert "min_adx" in breakout_grid[:200]
