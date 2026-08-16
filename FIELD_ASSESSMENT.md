@@ -1,6 +1,6 @@
 # Field assessment — 15 August 2026
 
-Ten completed out-of-sample experiments against real Alpaca market data, run
+Eleven completed out-of-sample experiments against real Alpaca market data, run
 through promotion gates that were never loosened.
 
 Hosted report: https://claude.ai/code/artifact/ea38f266-e60c-42eb-9af9-12b874dfa2b1
@@ -264,6 +264,79 @@ council is not:
    structural findings above survived contact with real data.
 
 ### The sizing question remains the live one
+
+### Experiment 11 — sizing is not the answer either
+
+The deployment hypothesis above was tested directly and is **refuted**. One
+backtest per deployment level, same signal, same window, nine symbols reduced
+to seven after dropping the listing that most truncated the window:
+
+| risk% | pos | trades | return% | maxDD% | Sharpe | PF | pos% | binding |
+|------:|----:|-------:|--------:|-------:|-------:|-----:|-----:|---------|
+| **0.35** | **3** | **118** | **+2.58** | 2.03 | **0.30** | **1.34** | 2.2 | none |
+| 0.35 | 5 | 147 | +0.88 | 2.40 | 0.10 | 1.10 | 2.2 | none |
+| 0.70 | 3 | 32 | -2.03 | 2.20 | -0.28 | 0.43 | 4.1 | none |
+| 1.05 | 3 | 14 | -2.41 | 2.41 | -0.42 | 0.19 | 6.8 | none |
+| 1.40 | 3 | 8 | -1.49 | 2.04 | -0.40 | 0.13 | 9.2 | none |
+| 2.00 | 3 | 7 | -1.94 | 2.54 | -0.61 | 0.12 | 12.7 | none |
+
+Sharpe falls 0.30 to -0.61 and profit factor 1.34 to 0.12. Risk-adjusted
+quality does not survive deployment; it collapses. The claim that this was an
+edge merely deployed too small was wrong.
+
+**The mechanism is not the exposure caps.** The binding column reads "none" at
+almost every rung and position size scaled exactly as intended, 2.2% to 12.7%,
+proportional to risk. What collapses is trade count: 118, 32, 14, 8, 7.
+
+The cause is visible in the drawdown column, which is pinned at 2.0-2.5% at
+every single risk level. That is `max_session_loss_pct` (2.0) and the drawdown
+throttle (`drawdown_risk_reduction_start_pct` 0.75, `min_risk_scale` 0.25)
+working exactly as designed. Larger positions reach those thresholds sooner, so
+the book spends its time halted or throttled rather than trading. The
+protective machinery makes deployment self-limiting. It is not a defect - it is
+calibrated for 0.35% risk, and it means "just size up" is structurally
+unavailable rather than merely unwise.
+
+Concurrency hurts too: at identical risk, three positions beat five and eight
+(Sharpe 0.30 against 0.10 and 0.09).
+
+**The scale-free comparison, stated carefully.** At its best point the strategy
+shows Sharpe 0.30 against BTC's 0.24 over the identical window. At matched
+volatility that would out-earn holding BTC. It is not actionable: the strategy
+runs at roughly 1.5% annualised volatility against the benchmark's 57.5%, so
+matching would need on the order of 40x leverage - which the risk limits forbid,
+which this repository has never tested, and which the table above shows would
+destroy the signal long before reaching it. The gap is also razor-thin and
+disappears at every other rung.
+
+### Where this leaves it
+
+Every lever the codebase exposes has now been pulled and measured: three
+timeframes, four universe sizes, five decision engines, a council combining
+them, corrected embargo, honest cost accounting, and deployment from the
+current default to the config ceiling. The best configuration found across
+eleven experiments returns +2.58% over 5.6 years against a benchmark that
+returned +114.17%.
+
+The measurement machine is the asset. It has now produced eleven honest
+verdicts, rejected every one, and refuted three of its own author's hypotheses
+- that costs were the cause, that a council would beat its best member, and
+that sizing would close the gap. That is what it is for.
+
+What has *not* been tested, and would be the only remaining honest avenue:
+
+1. **An execution-quality ledger.** Realised slippage is still assumed at 10
+   bps rather than measured. Until it is measured no live result can be
+   attributed to signal versus execution.
+2. **A different asset class or a shorter horizon.** Everything here is
+   long-only daily/hourly crypto over a single market cycle beginning
+   2021-01-01. One cycle is not a sample.
+3. **Stopping.** Keeping the measurement machine, not running any of these
+   engines with capital, and revisiting when there is a genuinely new
+   hypothesis rather than a reparameterisation of a refuted one.
+
+The superseded plan, retained because the reasoning that led to it was sound
+and only the answer was wrong:
 
 The correct next experiment is therefore a sizing sweep at fixed signal — vary
 `risk_per_trade_pct` and `max_positions` while holding the selected momentum
