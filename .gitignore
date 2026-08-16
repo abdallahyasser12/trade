@@ -21,7 +21,10 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.engine.lock
-data/
+# Anchored to the repo root on purpose: this is the local state directory
+# (trading_bot.db, quant_desk.db, the bar cache). An unanchored "data/"
+# also matches source packages at any depth, e.g. quant/data/.
+/data/
 
 # Mobile / Node / Expo
 node_modules/
