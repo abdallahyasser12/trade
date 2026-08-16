@@ -236,3 +236,71 @@ def test_no_attribution_is_invented_without_a_local_position_record(tmp_path):
     h.engine._reconcile_exit_order(NOW)
 
     assert _attributions(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# One signal, one row
+# ---------------------------------------------------------------------------
+
+
+def _decisions(tmp_path):
+    store = QuantStore(str(tmp_path / "desk.db"))
+    try:
+        return store.get_decisions()
+    finally:
+        store.close()
+
+
+def test_a_blocked_buy_records_one_rejection_not_a_contradictory_pair(tmp_path):
+    """A BUY used to be journaled twice with opposite outcomes.
+
+    The raw signal was recorded as EXECUTE before any entry gate ran, and
+    the subsequent block wrote a REJECT for the same signal — so the
+    decisions table said a blocked entry both executed and was rejected.
+    """
+    from models import BotAction, SignalDecision
+
+    h = build_harness(tmp_path)
+    _with_journal(h, tmp_path)
+
+    decision = SignalDecision(
+        action=BotAction.BUY,
+        reason="confirmed_crossover",
+        timestamp=NOW,
+        atr=1.0,
+        filters={"trend": True},
+        details={"close": 100.0},
+    )
+    h.engine._mark_entry_blocked(decision, "position_already_open")
+
+    rows = _decisions(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "REJECT"
+    assert "position_already_open" in (rows[0]["rejection_reasons"] or "")
+
+
+def test_the_attribution_helper_swallows_a_malformed_position_record(tmp_path):
+    """The observer contract covers the engine-side reads too.
+
+    ``DecisionJournal`` swallows its own write errors, but the reads that
+    build the call belong to the engine frame. A corrupt persisted position
+    would otherwise raise inside reconciliation, on the trading thread.
+
+    Scope note: this locks the attribution helper only. The engine's own
+    ``float(bot_pos["entry_price"])`` in ``_book_pending_sell_fills``
+    (trade_engine.py:459) has the same fragility and predates this work; it
+    is reported as a separate finding rather than silently changed here,
+    because it sits on the trade-ledger path, not the observer path.
+    """
+    h = build_harness(tmp_path)
+    _with_journal(h, tmp_path)
+
+    order = OrderRecord(
+        "x", "cid-x", SYMBOL, "exit", "sell", 10.0, 10.0,
+        "filled", 105.0, submitted_at=NOW, updated_at=NOW,
+    )
+    corrupt = {"entry_price": "not-a-number", "entry_time": "garbage"}
+
+    h.engine._journal_exit_attribution(corrupt, order, "exit", NOW)  # must not raise
+
+    assert _attributions(tmp_path) == []

@@ -737,7 +737,12 @@ class TradeEngine:
             self._status.last_bar_time = last_bar_ts
             self._status.last_signal = decision
         self.store.set_kv(LAST_SIGNAL_KEY, json.dumps(decision.to_dict()))
-        if self.quant_journal is not None:
+        if self.quant_journal is not None and decision.action is not BotAction.BUY:
+            # A BUY's outcome is not known here: the entry gates have not run
+            # yet. Journaling it at this point recorded it as EXECUTE, and a
+            # subsequent block wrote a second, contradictory REJECT row for
+            # the same signal. BUYs are journaled exactly once, after the gate
+            # decides — in _mark_entry_blocked when blocked, or at submission.
             self.quant_journal.record_stock_decision(
                 self.symbol, decision, self.session_id
             )
@@ -1979,6 +1984,12 @@ class TradeEngine:
         )
         order = self.broker.submit_market_order(self.symbol, sizing.qty, "buy", client_id)
         self.store.record_order(order, self.session_id)
+        if self.quant_journal is not None:
+            # The BUY cleared every gate and an order is live: this is the
+            # one place a BUY is legitimately an EXECUTE.
+            self.quant_journal.record_stock_decision(
+                self.symbol, decision, self.session_id
+            )
         self._pending_entry = {
             "client_order_id": client_id,
             "atr": float(decision.atr),
@@ -2030,34 +2041,48 @@ class TradeEngine:
         """
         if self.quant_journal is None or bot_pos is None or order is None:
             return
-        entry_price = float(bot_pos.get("entry_price") or 0.0)
-        if entry_price <= 0:
-            return
-        entry_time = None
-        raw_entry_time = bot_pos.get("entry_time")
-        if raw_entry_time:
-            try:
-                entry_time = datetime.fromisoformat(raw_entry_time)
-            except (TypeError, ValueError):
-                entry_time = None
-        self.quant_journal.record_stock_exit_fill(
-            symbol=self.symbol,
-            session_id=self.session_id,
-            qty=float(qty if qty is not None else order.filled_qty),
-            exit_price=order.fill_price,
-            exit_reason=reason,
-            entry_price=entry_price,
-            entry_time=entry_time,
-            initial_stop_price=bot_pos.get("initial_stop_price"),
-            highest_close=bot_pos.get("highest_close"),
-            lowest_close=bot_pos.get("lowest_close"),
-            # US equities are commission-free on Alpaca; the real cost is
-            # spread and slippage, which the executions ledger measures.
-            # Reporting a fabricated fee here would double-count it.
-            fees=0.0,
-            exit_timestamp=now,
-            event_key=f"fill:{order.client_order_id}:sell",
-        )
+        # DecisionJournal swallows its own write errors, but the reads that
+        # build the call do not belong to it. A malformed persisted position
+        # (a string where a float is expected, a corrupt entry_time) would
+        # otherwise raise here — inside reconciliation, on the trading
+        # thread. The observer contract has to cover this frame too.
+        try:
+            entry_price = float(bot_pos.get("entry_price") or 0.0)
+            if entry_price <= 0:
+                return
+            entry_time = None
+            raw_entry_time = bot_pos.get("entry_time")
+            if raw_entry_time:
+                try:
+                    entry_time = datetime.fromisoformat(raw_entry_time)
+                except (TypeError, ValueError):
+                    entry_time = None
+            booked_qty = float(qty if qty is not None else order.filled_qty)
+            self.quant_journal.record_stock_exit_fill(
+                symbol=self.symbol,
+                session_id=self.session_id,
+                # Mirrors the trade ledger exactly: record_trade books the
+                # same cumulative filled_qty under the same event key, so
+                # attribution and the ledger agree row for row. Both share
+                # the ledger's partial-fill convention rather than inventing
+                # a second, divergent accounting of the same exit.
+                qty=booked_qty,
+                exit_price=order.fill_price,
+                exit_reason=reason,
+                entry_price=entry_price,
+                entry_time=entry_time,
+                initial_stop_price=bot_pos.get("initial_stop_price"),
+                highest_close=bot_pos.get("highest_close"),
+                lowest_close=bot_pos.get("lowest_close"),
+                # US equities are commission-free on Alpaca; the real cost is
+                # spread and slippage, which the executions ledger measures.
+                # Reporting a fabricated fee here would double-count it.
+                fees=0.0,
+                exit_timestamp=now,
+                event_key=f"fill:{order.client_order_id}:sell",
+            )
+        except Exception as error:  # never break trading to record it
+            self._log("WARNING", f"Exit attribution skipped: {error}")
 
     def _entry_block_reason(
         self, decision: SignalDecision, bar_ts: datetime, clock, account, now: datetime
