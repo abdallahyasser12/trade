@@ -253,6 +253,13 @@ def run_crypto_backtest(
                     position.qty * float(rows[held]["open"])
                     for held, position in positions.items()
                 )
+                # Same heat definition as the live engine: distance to each
+                # held position's current stop, marked from this bar's open.
+                open_risk = sum(
+                    max(0.0, float(rows[held]["open"]) - position.stop_price)
+                    * position.qty
+                    for held, position in positions.items()
+                )
                 size = risk.size_position(
                     equity=open_equity,
                     cash=cash,
@@ -262,6 +269,7 @@ def run_crypto_backtest(
                     asset=resolved_assets[symbol],
                     current_crypto_exposure=exposure,
                     current_position_count=len(positions),
+                    current_open_risk=open_risk,
                     peak_equity=peak_equity,
                     atr_percentile=float(decision.atr_percentile or 100.0),
                     account_mode=AccountMode.PAPER,

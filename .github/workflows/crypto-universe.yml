@@ -1,0 +1,79 @@
+name: Crypto universe discovery
+
+# Manual only. Probes every Alpaca USD crypto pair for daily-bar history
+# depth and recommends the deepest universe the research protocol can use
+# without one shallow symbol truncating the aligned sample.
+#
+# Asset metadata and market data only: nothing in this workflow can place
+# an order. Requires the same repository secrets as the research workflow:
+#   ALPACA_PAPER_API_KEY
+#   ALPACA_PAPER_SECRET_KEY
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_bars:
+        description: "Minimum daily bars a symbol needs to qualify"
+        default: "1800"
+      candidates:
+        description: "Optional comma-separated pairs to probe (blank = ask the asset API)"
+        default: ""
+
+concurrency:
+  group: crypto-universe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: python -m pip install -r requirements.txt
+
+      - name: Verify credentials are configured
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          if [ -z "$ALPACA_PAPER_API_KEY" ] || [ -z "$ALPACA_PAPER_SECRET_KEY" ]; then
+            echo "::error::Set the ALPACA_PAPER_API_KEY and ALPACA_PAPER_SECRET_KEY repository secrets."
+            exit 1
+          fi
+
+      - name: Probe daily-bar depth
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          python scripts/discover_crypto_universe.py \
+            --min-bars "${{ inputs.min_bars }}" \
+            --candidates "${{ inputs.candidates }}" \
+            --json-out universe.json \
+            2>&1 | tee universe.txt
+
+      - name: Publish the recommendation
+        if: always()
+        run: |
+          {
+            echo "## Crypto universe discovery"
+            echo
+            echo '```'
+            cat universe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crypto-universe
+          path: |
+            universe.txt
+            universe.json
+          if-no-files-found: warn

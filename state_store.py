@@ -15,6 +15,7 @@ Design:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -23,6 +24,11 @@ from typing import Any, Optional
 
 from config import CLIENT_ORDER_PREFIX, DEFAULT_DB_PATH
 from models import OrderRecord
+
+# Bumped whenever a migration is added below. Opening a database written by
+# a NEWER build refuses rather than silently operating on a schema this code
+# does not understand — the database defines what the bot believes it owns.
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -97,6 +103,25 @@ CREATE TABLE IF NOT EXISTS logs (
     context    TEXT
 );
 
+-- Execution quality: what the decision assumed versus what the market gave.
+-- Without this the simulator's slippage assumption is never checked against
+-- reality, and a live shortfall is indistinguishable from a bad signal.
+CREATE TABLE IF NOT EXISTS executions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key       TEXT UNIQUE,
+    session_id      TEXT,
+    client_order_id TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    purpose         TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    reference_price REAL,
+    fill_price      REAL NOT NULL,
+    filled_qty      REAL NOT NULL,
+    slippage_bps    REAL,
+    fees            REAL,
+    timestamp       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -146,20 +171,37 @@ class StateStore:
             # actually be on disk if power is lost right after the submit.
             self._conn.execute("PRAGMA synchronous=FULL;")
             self._conn.executescript(_SCHEMA)
+            found = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            if found > SCHEMA_VERSION:
+                self._conn.close()
+                raise RuntimeError(
+                    f"State database {self.db_path!r} was written by a newer build "
+                    f"(schema v{found}; this build understands v{SCHEMA_VERSION}). "
+                    "Upgrade the application rather than downgrading the database."
+                )
             trade_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
             }
             if "event_key" not in trade_columns:
                 self._conn.execute("ALTER TABLE trades ADD COLUMN event_key TEXT")
+            if "fees" not in trade_columns:
+                # Realized P&L was booked gross of fees, so every stored row and
+                # every rendered total overstated performance by the round trip.
+                self._conn.execute("ALTER TABLE trades ADD COLUMN fees REAL")
             order_columns = {
                 row["name"] for row in self._conn.execute("PRAGMA table_info(orders)").fetchall()
             }
             if "limit_price" not in order_columns:
                 self._conn.execute("ALTER TABLE orders ADD COLUMN limit_price REAL")
+            if "reference_price" not in order_columns:
+                # The price the decision was made against, kept so realized
+                # slippage can be measured against what the model assumed.
+                self._conn.execute("ALTER TABLE orders ADD COLUMN reference_price REAL")
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_event_key "
                 "ON trades (event_key) WHERE event_key IS NOT NULL"
             )
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
 
     def close(self) -> None:
@@ -359,8 +401,8 @@ class StateStore:
         self._execute(
             "INSERT INTO orders (client_order_id, broker_order_id, session_id, symbol,"
             " purpose, side, requested_qty, filled_qty, status, fill_price, stop_price,"
-            " limit_price, submitted_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " limit_price, submitted_at, updated_at, reference_price)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(client_order_id) DO UPDATE SET"
             " broker_order_id = excluded.broker_order_id,"
             " requested_qty = excluded.requested_qty,"
@@ -369,7 +411,10 @@ class StateStore:
             " fill_price = excluded.fill_price,"
             " stop_price = excluded.stop_price,"
             " limit_price = excluded.limit_price,"
-            " updated_at = excluded.updated_at",
+            " updated_at = excluded.updated_at,"
+            # The broker's own record carries no reference price, so a later
+            # overwrite must never erase what the intent recorded.
+            " reference_price = COALESCE(excluded.reference_price, orders.reference_price)",
             (
                 order.client_order_id,
                 order.broker_order_id,
@@ -385,6 +430,7 @@ class StateStore:
                 order.limit_price,
                 _to_iso(order.submitted_at),
                 _to_iso(order.updated_at or _utc_now()),
+                order.reference_price,
             ),
         )
 
@@ -418,6 +464,9 @@ class StateStore:
             fill_price=row["fill_price"],
             stop_price=row["stop_price"],
             limit_price=row["limit_price"],
+            reference_price=(
+                row["reference_price"] if "reference_price" in row.keys() else None
+            ),
             submitted_at=_from_iso(row["submitted_at"]),
             updated_at=_from_iso(row["updated_at"]),
         )
@@ -478,12 +527,17 @@ class StateStore:
         signal_snapshot: Optional[dict[str, Any]],
         timestamp: Optional[datetime] = None,
         event_key: Optional[str] = None,
+        fees: Optional[float] = None,
     ) -> bool:
-        """Record one fill event, idempotently when ``event_key`` is supplied."""
+        """Record one fill event, idempotently when ``event_key`` is supplied.
+
+        ``realized_pnl`` is NET of fees; ``fees`` carries the amount charged on
+        this fill so the deduction stays auditable.
+        """
         cursor = self._execute(
             "INSERT OR IGNORE INTO trades (event_key, session_id, symbol, action, qty, fill_price,"
-            " realized_pnl, reason, signal_json, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " realized_pnl, reason, signal_json, timestamp, fees) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_key,
                 session_id,
@@ -495,9 +549,102 @@ class StateStore:
                 reason,
                 json.dumps(signal_snapshot) if signal_snapshot is not None else None,
                 _to_iso(timestamp or _utc_now()),
+                fees,
             ),
         )
         return cursor.rowcount == 1
+
+    def record_execution(
+        self,
+        session_id: Optional[str],
+        client_order_id: str,
+        symbol: str,
+        purpose: str,
+        side: str,
+        reference_price: Optional[float],
+        fill_price: float,
+        filled_qty: float,
+        fees: Optional[float] = None,
+        timestamp: Optional[datetime] = None,
+        event_key: Optional[str] = None,
+    ) -> bool:
+        """Record one fill's execution quality, idempotently by event key.
+
+        ``slippage_bps`` is signed against the trade's own direction: positive
+        always means the fill was worse than the reference price, for a buy and
+        a sell alike, so the column can be averaged without sign bookkeeping.
+        """
+
+        slippage_bps: Optional[float] = None
+        if (
+            reference_price is not None
+            and math.isfinite(reference_price)
+            and reference_price > 0
+            and math.isfinite(fill_price)
+        ):
+            raw = (fill_price - reference_price) / reference_price * 10_000.0
+            slippage_bps = raw if side == "buy" else -raw
+        cursor = self._execute(
+            "INSERT OR IGNORE INTO executions (event_key, session_id, client_order_id,"
+            " symbol, purpose, side, reference_price, fill_price, filled_qty,"
+            " slippage_bps, fees, timestamp)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_key,
+                session_id,
+                client_order_id,
+                symbol,
+                purpose,
+                side,
+                reference_price,
+                fill_price,
+                filled_qty,
+                slippage_bps,
+                fees,
+                _to_iso(timestamp or _utc_now()),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def execution_quality(self, session_id: Optional[str] = None) -> dict[str, Any]:
+        """Realized slippage versus the modeled assumption, in bps.
+
+        Returns ``samples == 0`` when nothing has filled yet; callers must not
+        present an average drawn from an empty set as a measurement.
+        """
+
+        clause = " WHERE session_id = ?" if session_id else ""
+        params: tuple = (session_id,) if session_id else ()
+        row = self._query(
+            "SELECT COUNT(slippage_bps) AS samples, AVG(slippage_bps) AS avg_bps,"
+            " MAX(slippage_bps) AS worst_bps, SUM(fees) AS total_fees,"
+            " SUM(filled_qty * fill_price) AS notional"
+            f" FROM executions{clause}",
+            params,
+        )[0]
+        return {
+            "samples": int(row["samples"] or 0),
+            "avg_slippage_bps": row["avg_bps"],
+            "worst_slippage_bps": row["worst_bps"],
+            "total_fees": row["total_fees"] or 0.0,
+            "total_notional": row["notional"] or 0.0,
+        }
+
+    def get_executions(
+        self, session_id: Optional[str] = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        if session_id:
+            rows = self._query(
+                "SELECT * FROM executions WHERE session_id = ?"
+                " ORDER BY timestamp DESC, id DESC LIMIT ?",
+                (session_id, limit),
+            )
+        else:
+            rows = self._query(
+                "SELECT * FROM executions ORDER BY timestamp DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+        return [dict(row) for row in rows]
 
     def get_trades(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
         if session_id:

@@ -78,6 +78,7 @@ class CryptoPositionSizeResult:
     quantity_by_buying_power: float
     position_notional: float
     risk_scale: float
+    quantity_by_heat: float = 0.0
     rejection_reason: Optional[str] = None
 
     @property

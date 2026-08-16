@@ -542,3 +542,66 @@ def test_entry_blocked_when_round_trip_cost_eats_the_risk_unit(tmp_path):
         [decision], prepared, bar_ts, {"BTC/USD": quote}, account, {}, now
     )
     assert [call for call in broker.market_calls if call[2] == "buy"]
+
+
+def test_stock_positions_do_not_consume_the_crypto_exposure_cap(tmp_path):
+    """A shared account's equity holdings must not throttle crypto sizing."""
+
+    engine, broker, store, _ = make_engine(tmp_path)
+    # A large stock position: under the old unfiltered exposure sum this
+    # consumed the entire 30% crypto cap and blocked every entry.
+    broker.positions["AAPL"] = BrokerPosition(
+        "AAPL", 100, 500, 500, 50_000, 0, 0, asset_class="us_equity"
+    )
+    engine._startup()
+    engine.run_iteration()
+    buys = [call for call in broker.market_calls if call[2] == "buy"]
+    assert len(buys) == 1
+
+
+def test_realized_pnl_is_net_of_both_fee_legs(tmp_path):
+    """Booking a sell gross of fees overstated every realized figure."""
+
+    engine, broker, store, now = make_engine(tmp_path)
+    engine._assets = {"BTC/USD": asset()}
+    local = CryptoPositionState("BTC/USD", 1, 100.0, now.isoformat(), 2, 95, 100)
+    store.set_bot_position("BTC/USD", local.to_dict())
+
+    previous = OrderRecord("x", "trendbot-s-BTCUSD-exit-1", "BTC/USD", "exit",
+                           "sell", 1.0, 0.0, "intent", reference_price=110.0)
+    current = OrderRecord("x", "trendbot-s-BTCUSD-exit-1", "BTC/USD", "exit",
+                          "sell", 1.0, 1.0, "filled", fill_price=110.0)
+    store.record_order(previous, engine.session_id)
+    engine._record_fill_delta(previous, current, None)
+
+    trade = store.get_trades()[0]
+    fee_rate = engine.engine_config.taker_fee_bps / 10_000.0
+    gross = (110.0 - 100.0) * 1.0
+    expected = gross - (110.0 * fee_rate) - (100.0 * fee_rate)
+    assert trade["realized_pnl"] == pytest.approx(expected)
+    assert trade["realized_pnl"] < gross
+    assert trade["fees"] == pytest.approx(110.0 * fee_rate)
+
+
+def test_every_fill_records_execution_quality_against_the_decision_price(tmp_path):
+    """Without this the simulator's slippage assumption is never checked."""
+
+    engine, broker, store, now = make_engine(tmp_path)
+    engine._assets = {"BTC/USD": asset()}
+
+    intent = OrderRecord("", "trendbot-s-BTCUSD-entry-1", "BTC/USD", "entry",
+                         "buy", 1.0, 0.0, "intent", reference_price=100.0)
+    store.record_order(intent, engine.session_id)
+    # Broker records carry no reference price; the store must preserve it.
+    filled = OrderRecord("b1", "trendbot-s-BTCUSD-entry-1", "BTC/USD", "entry",
+                         "buy", 1.0, 1.0, "filled", fill_price=100.5)
+    store.record_order(filled, engine.session_id)
+    engine._record_fill_delta(intent, filled, None)
+
+    executions = store.get_executions()
+    assert len(executions) == 1
+    assert executions[0]["reference_price"] == pytest.approx(100.0)
+    assert executions[0]["fill_price"] == pytest.approx(100.5)
+    # Bought 50bps above the decision price: adverse, so positive.
+    assert executions[0]["slippage_bps"] == pytest.approx(50.0)
+    assert store.execution_quality()["samples"] == 1

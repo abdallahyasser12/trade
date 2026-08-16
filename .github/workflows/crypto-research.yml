@@ -1,5 +1,16 @@
 name: Crypto walk-forward research
 
+# Two modes, one registered entry point.
+#
+#   research  the chronological walk-forward protocol and its promotion verdict
+#   sizing    one backtest per deployment level, measuring whether a signal's
+#             risk-adjusted quality survives being given more capital
+#
+# Both live here rather than in separate files because GitHub only registers a
+# workflow_dispatch workflow that exists on the default branch, so a new file
+# on a feature branch cannot be dispatched until it merges. A second entry
+# point that cannot be run is worse than a mode flag on one that can.
+#
 # Manual only. Runs the chronological walk-forward protocol against real
 # Alpaca market data and reports what a round trip costs and whether the
 # strategy beat simply holding the benchmark.
@@ -23,32 +34,56 @@ on:
       timeframe:
         description: "Bar size — widen this if cost per trade is high"
         type: choice
-        options: ["1Hour", "1Day", "15Min"]
+        options: ["1Hour", "4Hour", "1Day", "15Min"]
         default: "1Hour"
+      engine:
+        description: "Decision engine. Members run solo (1 candidate, no search) as the council baseline."
+        type: choice
+        options: ["base", "ensemble", "cross", "council", "breadth", "meanrev", "volregime"]
+        default: "base"
       start:
         description: "First research date (UTC, YYYY-MM-DD)"
         default: "2023-01-01"
       end:
         description: "Last research date (UTC, blank = yesterday)"
         default: ""
-      max_cost_to_risk:
-        description: "Cost admission gate in units of R (1.0 = config default, 0.25 = strict)"
-        default: "1.0"
+      # Replaced the max_cost_to_risk input, which was left at its 1.0 default
+      # on every run to date; the script still applies that default, it is
+      # simply no longer overridable from CI. Inputs are capped at ten.
+      mode:
+        description: "research = walk-forward verdict; sizing = deployment ladder"
+        type: choice
+        options: ["research", "sizing"]
+        default: "research"
       train_bars:
         description: "Training bars per fold"
         default: "1500"
       test_bars:
         description: "Out-of-sample bars per fold"
         default: "500"
+      # workflow_dispatch allows at most 10 inputs. --min-train-trades held the
+      # last slot and was set to 5 on every run; this toggle is needed on most
+      # of them, because one late listing silently truncates the whole universe.
+      drop_late_listings:
+        description: "Drop the symbols that most truncate the aligned window (reports each drop)"
+        type: boolean
+        default: false
 
 concurrency:
-  group: crypto-research-${{ github.ref }}
+  # Keyed on the engine as well as the ref, so a council run and the member
+  # runs it is being compared against can proceed in parallel. Keyed on the ref
+  # alone they cancelled each other, which made the head-to-head impossible to
+  # collect in one pass.
+  group: crypto-research-${{ github.ref }}-${{ inputs.engine }}
   cancel-in-progress: true
 
 jobs:
   research:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The regime ensemble recomputes benchmark context per candidate
+    # evaluation, so wide-grid multi-fold runs on 4Hour bars need hours,
+    # not minutes.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
@@ -69,8 +104,29 @@ jobs:
             exit 1
           fi
 
+      - name: Run the sizing study
+        id: sizing
+        if: inputs.mode == 'sizing'
+        env:
+          ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+          ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+        run: |
+          set +e
+          python scripts/run_sizing_study.py \
+            --symbols "${{ inputs.symbols }}" \
+            --benchmark "${{ inputs.benchmark }}" \
+            --timeframe "${{ inputs.timeframe }}" \
+            --engine "${{ inputs.engine }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            ${{ inputs.drop_late_listings && '--drop-late-listings' || '' }} \
+            --json-out verdict.json \
+            2>&1 | tee report.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
       - name: Run walk-forward research
         id: research
+        if: inputs.mode == 'research'
         env:
           ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
           ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
@@ -80,11 +136,13 @@ jobs:
             --symbols "${{ inputs.symbols }}" \
             --benchmark "${{ inputs.benchmark }}" \
             --timeframe "${{ inputs.timeframe }}" \
+            --engine "${{ inputs.engine }}" \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
-            --max-cost-to-risk "${{ inputs.max_cost_to_risk }}" \
             --train-bars "${{ inputs.train_bars }}" \
             --test-bars "${{ inputs.test_bars }}" \
+            --min-train-trades 5 \
+            ${{ inputs.drop_late_listings && '--drop-late-listings' || '' }} \
             --json-out verdict.json \
             2>&1 | tee report.txt
           echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
@@ -93,6 +151,20 @@ jobs:
         if: always()
         run: |
           {
+            if [ "${{ inputs.mode }}" = "sizing" ]; then
+              echo "## Sizing study"
+              echo
+              echo "Read the **Sharpe** column, not the return column. Sizing scales a signal"
+              echo "rather than improving one, so the highest risk level shows the highest"
+              echo "return whenever expectancy is positive at all. A flat Sharpe as risk rises"
+              echo "means the edge was merely under-deployed; a decaying one means more capital"
+              echo "makes it worse. This mode cannot promote anything."
+              echo
+              echo '```'
+              cat report.txt
+              echo '```'
+              exit 0
+            fi
             echo "## Crypto walk-forward verdict"
             echo
             case "${{ steps.research.outputs.code }}" in
@@ -117,6 +189,11 @@ jobs:
 
       # A promotion FAIL (exit 1) is a legitimate research outcome and must not
       # look like a broken pipeline. Only a run that could not complete fails.
+      # A promotion FAIL (exit 1) is a legitimate research outcome. The sizing
+      # study has no promotion verdict at all, so any non-zero exit is a real
+      # failure there.
       - name: Fail only when the run could not complete
-        if: steps.research.outputs.code != '0' && steps.research.outputs.code != '1'
+        if: |
+          (inputs.mode == 'research' && steps.research.outputs.code != '0' && steps.research.outputs.code != '1')
+          || (inputs.mode == 'sizing' && steps.sizing.outputs.code != '0')
         run: exit 1

@@ -1,0 +1,69 @@
+name: Python CI
+
+# Runs on every push and pull request touching Python or dependencies.
+# The repository previously had no automated gate on the trading code at
+# all: only mobile-ci.yml ran on pull requests, and its path filter
+# excludes every engine, risk and research module.
+#
+# No credentials are used. Every test in the suite is hermetic — the data
+# feed and broker are stubbed — so this workflow can never reach a market
+# data API or place an order.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**.py"
+      - "requirements.txt"
+      - "requirements-mobile-api.txt"
+      - ".github/workflows/python-ci.yml"
+  pull_request:
+    paths:
+      - "**.py"
+      - "requirements.txt"
+      - "requirements-mobile-api.txt"
+      - ".github/workflows/python-ci.yml"
+
+concurrency:
+  group: python-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the documented minimum; 3.13 is what a current Kali or
+        # rolling-release install actually ships.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-mobile-api.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q .
+
+      - name: Run the test suite
+        run: python -m pytest -q --durations=10
+
+      - name: Confirm no credential-shaped literal is committed
+        run: |
+          # Alpaca key ids are PK/AK followed by uppercase alphanumerics.
+          # .env.example has carried a real pair twice; this fails the build
+          # rather than relying on review to catch a third.
+          if git grep -nIE '\b(PK|AK)[A-Z0-9]{16,}\b' -- . ':(exclude).github/workflows/python-ci.yml'; then
+            echo "::error::A credential-shaped literal is committed. Rotate the key and remove it."
+            exit 1
+          fi
+          echo "No credential-shaped literals found."

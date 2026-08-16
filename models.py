@@ -240,6 +240,10 @@ class OrderRecord:
     limit_price: Optional[float] = None
     submitted_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Price the decision was made against. Set on the locally-created intent;
+    # broker-returned records leave it None and the store preserves the
+    # original, so realized slippage stays measurable.
+    reference_price: Optional[float] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -271,6 +275,9 @@ class BrokerPosition:
     market_value: Optional[float]
     unrealized_pl: Optional[float]
     unrealized_plpc: Optional[float]
+    # None means unknown; exposure gates treat unknown as crypto so they can
+    # only fail conservative on a shared stock-and-crypto account.
+    asset_class: Optional[str] = None
 
 
 @dataclass

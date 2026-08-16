@@ -342,6 +342,13 @@ class AlpacaBroker:
 
     @staticmethod
     def _position_to_model(pos) -> BrokerPosition:
+        raw_class = getattr(pos, "asset_class", None)
+        if raw_class is None:
+            asset_class = None
+        elif hasattr(raw_class, "value"):
+            asset_class = raw_class.value
+        else:
+            asset_class = str(raw_class)
         return BrokerPosition(
             symbol=pos.symbol,
             qty=_float_or_none(pos.qty) or 0.0,
@@ -350,6 +357,7 @@ class AlpacaBroker:
             market_value=_float_or_none(pos.market_value),
             unrealized_pl=_float_or_none(pos.unrealized_pl),
             unrealized_plpc=_float_or_none(pos.unrealized_plpc),
+            asset_class=asset_class,
         )
 
     # ------------------------------------------------------------------

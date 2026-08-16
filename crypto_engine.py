@@ -427,7 +427,30 @@ class CryptoTradeEngine:
         }
         positions = dict(broker_positions)
         all_account_positions = self.broker.list_positions()
-        exposure = portfolio_market_value(all_account_positions)
+        # Broker truth includes every asset class on a shared account. Only
+        # crypto counts toward the crypto exposure cap; an unknown class still
+        # counts, so the gate can only fail conservative.
+        exposure = portfolio_market_value(
+            [
+                position
+                for position in all_account_positions
+                if position.asset_class in (None, "crypto")
+            ]
+        )
+        # Portfolio heat: the sum of distance-to-stop across held positions,
+        # marked from the latest completed close. This is what the heat cap
+        # in sizing measures new candidates against.
+        open_risk = 0.0
+        for held_symbol, held_position in positions.items():
+            local = self._load_position(held_symbol)
+            frame = prepared.get(held_symbol)
+            if local is None or frame is None:
+                continue
+            marks = frame["close"].loc[:bar_timestamp]
+            if marks.empty:
+                continue
+            mark = float(marks.iloc[-1])
+            open_risk += max(0.0, mark - local.stop_price) * held_position.qty
         newly_submitted = 0
         remaining_cash = account.cash
         remaining_buying_power = account.buying_power
@@ -497,6 +520,7 @@ class CryptoTradeEngine:
                 asset=asset,
                 current_crypto_exposure=exposure,
                 current_position_count=len(positions) + newly_submitted,
+                current_open_risk=open_risk,
                 peak_equity=self._peak_equity or account.equity,
                 atr_percentile=(
                     decision.atr_percentile
@@ -522,6 +546,7 @@ class CryptoTradeEngine:
                 status="intent",
                 submitted_at=now,
                 updated_at=now,
+                reference_price=entry_price,
             )
             self.store.record_order(intent, self.session_id)
             self.store.set_kv(
@@ -553,6 +578,7 @@ class CryptoTradeEngine:
             self._record_fill_delta(intent, order, decision)
             pending_buy_symbols.add(symbol)
             exposure += size.position_notional
+            open_risk += size.qty * size.risk_per_unit
             remaining_cash = max(0.0, remaining_cash - size.position_notional)
             remaining_buying_power = max(
                 0.0, remaining_buying_power - size.position_notional
@@ -727,9 +753,16 @@ class CryptoTradeEngine:
         else:
             incremental_price = current.fill_price
         local = self._load_position(current.symbol)
+        # Fees are charged on both legs. Booking a sell gross of them
+        # overstated every realized figure by the full round trip.
+        fee_rate = self.engine_config.taker_fee_bps / 10_000.0
+        fees = incremental_price * delta * fee_rate
         realized = None
         if current.side == "sell" and local is not None:
-            realized = (incremental_price - local.entry_price) * delta
+            gross = (incremental_price - local.entry_price) * delta
+            entry_fee_share = local.entry_price * delta * fee_rate
+            realized = gross - fees - entry_fee_share
+        event_key = f"{current.client_order_id}:{current.filled_qty:.12f}"
         self.store.record_trade(
             self.session_id,
             current.symbol,
@@ -739,7 +772,27 @@ class CryptoTradeEngine:
             realized,
             current.purpose,
             decision.to_dict() if decision else None,
-            event_key=f"{current.client_order_id}:{current.filled_qty:.12f}",
+            event_key=event_key,
+            fees=fees,
+        )
+        # Execution quality against the price the decision was made at. The
+        # simulator assumes a fixed slippage; this is the only thing that can
+        # ever tell us whether that assumption is true.
+        stored = self.store.get_order_by_client_id(current.client_order_id)
+        reference = current.reference_price or (
+            stored.reference_price if stored is not None else None
+        )
+        self.store.record_execution(
+            self.session_id,
+            current.client_order_id,
+            current.symbol,
+            current.purpose,
+            current.side,
+            reference,
+            incremental_price,
+            delta,
+            fees=fees,
+            event_key=event_key,
         )
 
     def _reconcile_position_truth(self, now: datetime, startup: bool = False):
@@ -1112,7 +1165,7 @@ class CryptoTradeEngine:
             asset = self._assets[symbol]
             intent = OrderRecord(
                 "", client_id, symbol, "guard", "sell", current.qty, 0.0, "intent",
-                submitted_at=now, updated_at=now,
+                submitted_at=now, updated_at=now, reference_price=quote.bid_price,
             )
             self.store.record_order(intent, self.session_id)
             order = self._submit_idempotent(

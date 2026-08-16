@@ -29,14 +29,15 @@ DEFAULT_DB_PATH = str(Path("data") / "trading_bot.db")
 
 # UI-facing timeframe strings.  This is the single mapping layer between the
 # UI and Alpaca timeframe objects — do not convert timeframes anywhere else.
-TIMEFRAMES: list[str] = ["1Min", "5Min", "15Min", "1Hour", "1Day"]
-INTRADAY_TIMEFRAMES = frozenset({"1Min", "5Min", "15Min", "1Hour"})
+TIMEFRAMES: list[str] = ["1Min", "5Min", "15Min", "1Hour", "4Hour", "1Day"]
+INTRADAY_TIMEFRAMES = frozenset({"1Min", "5Min", "15Min", "1Hour", "4Hour"})
 
 _TIMEFRAME_SECONDS: dict[str, int] = {
     "1Min": 60,
     "5Min": 5 * 60,
     "15Min": 15 * 60,
     "1Hour": 60 * 60,
+    "4Hour": 4 * 60 * 60,
     "1Day": 24 * 60 * 60,
 }
 
@@ -47,6 +48,7 @@ _BARS_PER_YEAR: dict[str, float] = {
     "5Min": 252 * 78.0,
     "15Min": 252 * 26.0,
     "1Hour": 252 * 7.0,  # 6.5h session produces 7 hourly bars (last is short)
+    "4Hour": 252 * 2.0,  # 6.5h session produces 2 four-hour bars (last is short)
     "1Day": 252.0,
 }
 
@@ -57,6 +59,7 @@ _POLL_INTERVAL_SECONDS: dict[str, float] = {
     "5Min": 30.0,
     "15Min": 60.0,
     "1Hour": 120.0,
+    "4Hour": 180.0,
     "1Day": 300.0,
 }
 
@@ -103,6 +106,7 @@ def timeframe_to_alpaca(timeframe: str):
         "5Min": TimeFrame(5, TimeFrameUnit.Minute),
         "15Min": TimeFrame(15, TimeFrameUnit.Minute),
         "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
+        "4Hour": TimeFrame(4, TimeFrameUnit.Hour),
         "1Day": TimeFrame(1, TimeFrameUnit.Day),
     }
     if timeframe not in mapping:
@@ -425,7 +429,10 @@ class RiskConfig:
     max_daily_loss_pct: float = 3.0
     min_position_value: float = 100.0
     min_shares: int = 1
-    enable_adaptive_risk: bool = False
+    # On by default and matching the dashboard default: drawdown throttling
+    # and volatility scaling apply unless an operator deliberately disables
+    # them. Programmatic configs and UI configs now agree.
+    enable_adaptive_risk: bool = True
     min_risk_scale: float = 0.25
     drawdown_risk_reduction_start_pct: float = 1.0
     volatility_target_percentile: float = 50.0
