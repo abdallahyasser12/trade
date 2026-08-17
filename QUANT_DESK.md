@@ -11,8 +11,17 @@ strategy is in `RESEARCH` state and deploys no capital.
 
 ## Architecture
 
+This diagram is the *intended* data flow, not a claim that every arrow is
+live. `quant/providers.py`'s Protocol layer has no production call site,
+and several stages below are reachable only through `QuantScanner`, which
+nothing constructs. See "What is wired into the running system" for the
+component-by-component status before relying on any stage here.
+
 ```
-stocks + ETFs + crypto bars (Alpaca feeds, provider-agnostic Protocols)
+stocks + ETFs + crypto bars
+  live:     data_feed.AlpacaDataFeed / crypto_data_feed.AlpacaCryptoDataFeed
+  research: quant/data/ (equities: chunked, cached, calendar-aware)
+  NOTE: quant/providers.py's provider-agnostic Protocols are unused
     │
     ▼
 quant/features.py        multi-timeframe causal features, session-anchored
@@ -175,17 +184,52 @@ rows only.
 
 ## What is wired into the running system
 
-* `CryptoTradeEngine` and `TradeEngine` accept an optional
-  `quant_journal`; when attached they journal every decision (including
-  block reasons) and write attribution rows on sell fills. Journal failures
-  can never affect trading (observer contract, tested).
+This section used to describe what the code *supports*. Support is not
+wiring, and the gap between the two was the largest source of drift
+between this document and the repository. It is now split into what
+actually executes and what does not.
+
+### Reachable at runtime
+
+* **The desk journal is attached.** `app.py` builds one via
+  `quant.attach.attach_journal` for both engines, so decisions and
+  attribution rows are written to `data/quant_desk.db` during real paper
+  sessions. Previously it was constructed only in tests: both engines
+  accepted a `quant_journal` and had call sites behind it, but nothing
+  ever passed one, so every call site was a permanently-`None` guard and
+  the desk observed nothing. Journal failures can never affect trading
+  (observer contract, tested).
+* **Attribution covers both markets.** `record_stock_exit_fill` did not
+  exist, so equity strategies would have shown zero closed trades in the
+  marketplace no matter how many they took. Attribution rows are
+  idempotent on the executions ledger's `event_key` (schema v2), so a
+  re-reconciled fill books one row instead of inflating the trade count.
+* **Equity research runs.** `scripts/run_equity_research.py` drives the
+  walk-forward factory over `quant/data`, using the equity annualization
+  factor and the NYSE session calendar.
+* **The Quant Desk dashboard tab** reads the store.
+
+### Present but NOT reachable at runtime
+
+Nothing constructs `QuantScanner`, and it is the only component that wires
+the decision pipeline together. Everything below is exercised by tests and
+by nothing else:
+
+* `quant/scanner.py`, `quant/shadow.py` — the decision cycle and shadow
+  execution.
+* `quant/regime.py`, `quant/opportunity.py`, `quant/portfolio.py`,
+  `quant/abstention.py` — reached only through the scanner.
+* `quant/drift.py`, `quant/universe.py`, `quant/providers.py`,
+  `quant/ml/*` — no runtime importer at all.
+* `QuantStore.record_features` has no caller, so the point-in-time feature
+  store is never written outside tests.
+
+The dashboard's market-state, drift and risk-event panels therefore cannot
+populate: their only writer lives inside the scanner.
+
 * `CryptoPositionState` gained three optional fields
   (`initial_stop_price`, `lowest_close`, `entry_regime`) with defaults, so
   state persisted by earlier builds loads unchanged.
-* The dashboard gained a **Quant Desk** tab (`quant_dashboard.py`):
-  market state, opportunity board with rejection reasons, strategy
-  marketplace with lifecycle states, research runs with per-gate verdicts,
-  measured execution quality, drift findings and risk events.
 * `scripts/run_crypto_research.py --engine council` was repaired (it
   previously crashed with a NameError before the walk-forward started).
 
@@ -199,22 +243,69 @@ rows only.
   strategy until ablation runs on real data say so.
 * Live trading remains exactly as gated as before; nothing here changes
   the crypto live unlock or the stock paper-only boundary.
+* **Recorded research runs from before the multiple-testing fix are
+  stale.** The trial count fed to the deflated Sharpe was the grid size
+  when the real search is grid x folds, so N was understated by a factor
+  of the fold count and that gate was easier than designed. Any prior
+  recorded PASS should be re-run before it is cited as promotion evidence.
 
 ## Operating the research loop
 
 ```bash
-# 1. Research a strategy family on real data (requires credentials):
-python - <<'PY'
-from quant.research.factory import run_quant_walk_forward, record_research_report
-# fetch bars via data_feed / crypto_data_feed, build candidate params,
-# then run and record; see tests/test_quant_factory.py for the exact shape.
-PY
+# 1a. Crypto research on real data (requires credentials):
+python scripts/run_crypto_research.py --help
+python scripts/run_quant_research.py --engine donchian --timeframe 1Hour \
+    --symbols BTC/USD ETH/USD SOL/USD --days 730
+
+# 1b. Equity research on real data (requires credentials):
+python scripts/run_equity_research.py --help
+python scripts/run_equity_research.py --engine orb --timeframe 15Min \
+    --symbols SPY QQQ IWM --start 2023-01-01 --end 2024-12-31 \
+    --json research-orb.json
+
+#     Without credentials, --synthetic runs the identical pipeline on
+#     deterministic session-shaped data. That validates the machinery and
+#     is NEVER evidence of edge; such runs are recorded under a strategy id
+#     suffixed `_synthetic` so they cannot satisfy a promotion request.
+
+#     Exit codes: 0 = all gates PASS (eligible for SHADOW only),
+#     1 = gates FAIL, 2 = could not run.
 
 # 2. Promote to SHADOW only through the lifecycle manager, citing the run:
 #    LifecycleManager.request_promotion(strategy_id, PromotionEvidence(research_run=row))
 
-# 3. Run the scanner on a schedule; SHADOW strategies accumulate virtual
-#    attributions; the dashboard's marketplace shows the record build up.
+# 3. NOT YET AVAILABLE. The operating loop below depends on QuantScanner,
+#    which nothing constructs — there is no scanner CLI and no scheduled
+#    entry point, so SHADOW strategies cannot accumulate virtual
+#    attributions today. See "Present but NOT reachable at runtime".
 
 # 4. PAPER and beyond follow the evidence gates in quant/lifecycle.py.
 ```
+
+## Equity data
+
+Research-grade equity history lives in `quant/data`, separate from the
+live feed (`data_feed.AlpacaDataFeed.get_recent_bars`), which fetches a
+short trailing window per poll and is the wrong shape for research.
+
+* `calendar.py` derives the NYSE session calendar from the published
+  rules — holidays, weekend observance, Good Friday from Easter,
+  Juneteenth from 2022, early closes — so it stays correct for future
+  years and adds no dependency.
+* `equity_history.py` chunks on stable calendar boundaries so two
+  differently-framed requests covering the same month share a cache entry.
+* `provenance.py` records what was requested, what arrived, and how
+  complete it is against the real calendar. A symbol with no data is
+  `MISSING`, not an empty frame that reads downstream as "no signals".
+* Nothing is interpolated. A gap stays a gap and is reported.
+
+Two details that are easy to get wrong and silent when you do: daily bars
+are attributed by their **UTC** date (the 00:00-UTC stamping convention
+converts to the previous evening in ET, which would shift a whole daily
+history back a day for the EST half of the year), and intraday session
+membership is decided by **overlap**, not containment (hourly buckets do
+not align to the 09:30 open, so containment drops the first and last
+bucket of every session).
+
+`4Hour` is unsupported for equities: a 6.5-hour session does not divide
+into 4-hour buckets.
