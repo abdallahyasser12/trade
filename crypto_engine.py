@@ -195,6 +195,33 @@ class CryptoTradeEngine:
             self._finalize(reason)
 
     def _startup(self) -> None:
+        """Verify environment, reconcile prior state, open the session.
+
+        Takes the cross-process engine lock first, exactly as TradeEngine
+        does. Without it a second `streamlit run`, a dev auto-reload
+        orphan, or the mobile-API host could each run a crypto engine
+        against the same account and state database: two engines sizing
+        against the same equity, each blind to the other's open risk, both
+        arming protective stops on the same positions.
+
+        Order recovery is idempotent, so this is not the only thing between
+        the bot and a duplicate order. But portfolio heat, exposure caps
+        and correlation gates are computed per-engine and are simply wrong
+        when two engines share an account.
+        """
+        if not self.store.acquire_engine_lock():
+            raise BrokerError(
+                "Another trading engine already holds the lock on this state "
+                "database (a second app instance, or an orphaned engine from "
+                "a source reload). Exactly one engine may trade per database."
+            )
+        try:
+            self._startup_locked()
+        except BaseException:
+            self.store.release_engine_lock()
+            raise
+
+    def _startup_locked(self) -> None:
         mode = AccountMode(self.engine_config.account_mode)
         broker_mode = getattr(self.broker, "account_mode", None)
         if broker_mode != mode:
@@ -263,6 +290,12 @@ class CryptoTradeEngine:
                 self.store.end_session(self.session_id, now, reason.value)
         except Exception:
             logger.exception("Could not finalize crypto session")
+        finally:
+            # Released even when session finalization fails, so a bad
+            # shutdown cannot leave the lock held and block the next start.
+            # The OS drops it on process death regardless, so a crash can
+            # never wedge it either.
+            self.store.release_engine_lock()
         with self._lock:
             if not self._fatal:
                 self._status.state = (

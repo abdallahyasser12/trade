@@ -98,3 +98,51 @@ def test_exit_and_hold_decisions_are_still_journaled_at_signal_time(tmp_path):
 
     rows = _decisions(tmp_path)
     assert rows, "non-BUY decisions must still be recorded"
+
+
+# ---------------------------------------------------------------------------
+# Cross-process engine exclusion
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_crypto_engine_on_the_same_database_refuses_to_start(tmp_path):
+    """Exactly one engine may trade one state database.
+
+    TradeEngine has always taken this lock; CryptoTradeEngine never did, so
+    a second `streamlit run`, a dev auto-reload orphan, or the mobile-API
+    host could each run a crypto engine against the same account. Portfolio
+    heat, exposure caps and correlation gates are computed per-engine and
+    are simply wrong when two engines share an account.
+    """
+    from broker import BrokerError
+
+    first, _, _, _ = make_engine(tmp_path)
+    first._startup()
+
+    second, _, _, _ = make_engine(tmp_path)
+    with pytest.raises(BrokerError, match="already holds the lock"):
+        second._startup()
+
+
+def test_the_lock_is_released_when_the_engine_finalizes(tmp_path):
+    from models import StopReason
+
+    first, _, _, _ = make_engine(tmp_path)
+    first._startup()
+    first._finalize(StopReason.USER_STOP)
+
+    second, _, _, _ = make_engine(tmp_path)
+    second._startup()  # must not raise now that the first released it
+
+
+def test_a_failed_startup_does_not_leave_the_lock_held(tmp_path):
+    """A startup that blows up after acquiring must not wedge the database."""
+    from broker import BrokerError
+
+    first, broker, _, _ = make_engine(tmp_path)
+    broker.account_mode = None  # forces the frozen-mode check to fail
+    with pytest.raises(BrokerError):
+        first._startup()
+
+    second, _, _, _ = make_engine(tmp_path)
+    second._startup()  # the lock was released on the failure path
