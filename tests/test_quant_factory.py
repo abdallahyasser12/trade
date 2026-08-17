@@ -210,8 +210,14 @@ def test_a_fold_where_no_candidate_qualifies_is_skipped_not_defaulted():
         train_bars=150, test_bars=80, step_bars=80, embargo_bars=2,
         min_train_trades=10_000,
     )
-    with pytest.raises(ValueError, match="walk-forward fold"):
+    with pytest.raises(ValueError) as excinfo:
         run_quant_walk_forward(**kwargs)
+    message = str(excinfo.value)
+    # It must not blame missing history for a selection problem: there were
+    # plenty of bars, no candidate qualified in any of them.
+    assert "is enough history" in message, message
+    assert "min_train_trades" in message, message
+    assert "starved run, not a passing one" in message, message
 
 
 def test_a_qualifying_fold_never_reports_an_infinite_training_score():

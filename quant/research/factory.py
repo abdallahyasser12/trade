@@ -364,10 +364,33 @@ def run_quant_walk_forward(
         train_start += walk_config.step_bars
 
     if not folds:
+        needed = (
+            walk_config.train_bars + walk_config.embargo_bars + walk_config.test_bars
+        )
+        if len(common) < needed:
+            raise ValueError(
+                "Not enough aligned history for a single walk-forward fold: "
+                f"{len(common)} bars, need at least {needed}."
+            )
+        # There WAS enough history — every window was rejected instead.
+        # Reporting "not enough history" here sent the operator looking for
+        # more data when the real fix is a wider training window or a
+        # cheaper candidate.
+        if skipped_warmup and not training_errors:
+            widest = max(warmups) if warmups else 0
+            raise ValueError(
+                f"{len(common)} bars is enough history, but no candidate fits "
+                f"the training window: train_bars={walk_config.train_bars} and "
+                f"the widest candidate warmup is {widest} bars. Raise "
+                "train_bars above the warmup, or use shorter lookbacks."
+            )
         raise ValueError(
-            "Not enough aligned history for a single walk-forward fold: "
-            f"{len(common)} bars, need at least "
-            f"{walk_config.train_bars + walk_config.embargo_bars + walk_config.test_bars}."
+            f"{len(common)} bars is enough history, but no window produced a "
+            f"qualifying candidate ({folds_without_candidate} window(s) had "
+            f"none clear min_train_trades={walk_config.min_train_trades}; "
+            f"{len(training_errors)} training simulation(s) failed"
+            + (f": {training_errors[0]}" if training_errors else "")
+            + "). This is a starved run, not a passing one."
         )
 
     fold_returns = [fold.test_result.total_return_pct for fold in folds]
