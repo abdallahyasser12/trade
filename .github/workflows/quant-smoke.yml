@@ -35,6 +35,7 @@ jobs:
             cross_sectional_engine.py \
             advanced_crypto_engine.py \
             intraday_crypto_engine.py \
+            quant/adaptive_manifest.py \
             quant/evidence_scanner.py \
             quant/intraday.py \
             quant/intraday_lifecycle.py \
@@ -60,6 +61,7 @@ jobs:
             tests/test_intraday_momentum.py \
             tests/test_intraday_adaptive.py \
             tests/test_intraday_engine_policy_boundary.py \
+            tests/test_adaptive_manifest.py \
             tests/test_adaptive_evidence_bridge.py \
             tests/test_adaptive_intraday_lifecycle_cli.py \
             tests/test_adaptive_intraday_registry.py \
