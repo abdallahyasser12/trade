@@ -68,7 +68,12 @@ def _strategy_factory(engine: str, symbols: tuple[str, ...], timeframe: str):
 
         def build(params):
             return DonchianTrendStrategy(
-                DonchianTrendConfig(symbols=symbols, market=Market.CRYPTO, timeframe=timeframe, **params)
+                DonchianTrendConfig(
+                    symbols=symbols,
+                    market=Market.CRYPTO,
+                    timeframe=timeframe,
+                    **params,
+                )
             )
 
         grid = [
@@ -79,11 +84,19 @@ def _strategy_factory(engine: str, symbols: tuple[str, ...], timeframe: str):
         return build, grid
 
     if engine == "squeeze":
-        from quant.strategies.volatility_squeeze import VolatilitySqueezeConfig, VolatilitySqueezeStrategy
+        from quant.strategies.volatility_squeeze import (
+            VolatilitySqueezeConfig,
+            VolatilitySqueezeStrategy,
+        )
 
         def build(params):
             return VolatilitySqueezeStrategy(
-                VolatilitySqueezeConfig(symbols=symbols, market=Market.CRYPTO, timeframe=timeframe, **params)
+                VolatilitySqueezeConfig(
+                    symbols=symbols,
+                    market=Market.CRYPTO,
+                    timeframe=timeframe,
+                    **params,
+                )
             )
 
         grid = [
@@ -94,11 +107,19 @@ def _strategy_factory(engine: str, symbols: tuple[str, ...], timeframe: str):
         return build, grid
 
     if engine == "vwap":
-        from quant.strategies.vwap_reversion import VwapReversionConfig, VwapReversionStrategy
+        from quant.strategies.vwap_reversion import (
+            VwapReversionConfig,
+            VwapReversionStrategy,
+        )
 
         def build(params):
             return VwapReversionStrategy(
-                VwapReversionConfig(symbols=symbols, market=Market.CRYPTO, timeframe=timeframe, **params)
+                VwapReversionConfig(
+                    symbols=symbols,
+                    market=Market.CRYPTO,
+                    timeframe=timeframe,
+                    **params,
+                )
             )
 
         grid = [
@@ -108,13 +129,18 @@ def _strategy_factory(engine: str, symbols: tuple[str, ...], timeframe: str):
         ]
         return build, grid
 
-    from quant.strategies.intraday_momentum import IntradayMomentumConfig, IntradayMomentumStrategy
+    from quant.strategies.intraday_momentum import (
+        IntradayMomentumConfig,
+        IntradayMomentumStrategy,
+    )
 
     base = make_high_velocity_strategy_config(symbols=symbols, timeframe=timeframe)
 
     def build(params):
         return IntradayMomentumStrategy(base, IntradayMomentumConfig(**params))
 
+    # Bounded grid: enough structural variation to test the hypothesis without
+    # turning the run into a search for a lucky 5-minute parameter combination.
     top_k = min(3, len(symbols))
     grid = [
         {
@@ -177,17 +203,24 @@ def _real_bars(symbols: tuple[str, ...], timeframe: str, days: int) -> dict:
 
     credentials = load_credentials()
     if not credentials.is_configured:
-        raise RuntimeError("No Alpaca credentials configured; use --synthetic only for machinery validation.")
+        raise RuntimeError(
+            "No Alpaca credentials configured; use --synthetic only for machinery validation."
+        )
     feed = AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    return {symbol: feed.get_bars(symbol, timeframe, start, end) for symbol in symbols}
+    return {
+        symbol: feed.get_bars(symbol, timeframe, start, end)
+        for symbol in symbols
+    }
 
 
 def _research_policy(engine: str):
     if engine != "intraday":
         return (
             0.35,
+            5,
+            60.0,
             QuantWalkForwardConfig(),
             QuantPromotionCriteria(),
             10.0,
@@ -196,6 +229,8 @@ def _research_policy(engine: str):
         )
     return (
         0.15,
+        6,
+        30.0,
         QuantWalkForwardConfig(
             train_bars=2_016,
             test_bars=576,
@@ -205,7 +240,7 @@ def _research_policy(engine: str):
             max_candidates=32,
             stress_slippage_bps=20.0,
             stress_spread_bps=20.0,
-            stress_fee_bps=25.0,
+            stress_fee_bps=50.0,
         ),
         QuantPromotionCriteria(
             min_folds=5,
@@ -233,9 +268,15 @@ def _intraday_oos_diagnostics(report):
             (fold.test_end - fold.test_start).total_seconds() / 86_400.0,
             1.0 / 288.0,
         )
-    trades_per_day = report.total_oos_trades / test_days if test_days > 0 else 0.0
+    trades_per_day = (
+        report.total_oos_trades / test_days if test_days > 0 else 0.0
+    )
     growth = max(0.0, 1.0 + report.compounded_return_pct / 100.0)
-    daily = (growth ** (1.0 / test_days) - 1.0) * 100.0 if growth > 0 and test_days > 0 else -100.0
+    daily = (
+        (growth ** (1.0 / test_days) - 1.0) * 100.0
+        if growth > 0 and test_days > 0
+        else -100.0
+    )
     return test_days, trades_per_day, daily
 
 
@@ -256,15 +297,23 @@ def main() -> int:
     parser.add_argument("--no-record", action="store_true")
     args = parser.parse_args()
 
-    timeframe = args.timeframe or ("5Min" if args.engine == "intraday" else "1Hour")
+    timeframe = args.timeframe or (
+        "5Min" if args.engine == "intraday" else "1Hour"
+    )
     days = args.days or (90 if args.engine == "intraday" else 730)
-    synthetic_bars = args.synthetic_bars or (10_000 if args.engine == "intraday" else 2_500)
+    synthetic_bars = args.synthetic_bars or (
+        10_000 if args.engine == "intraday" else 2_500
+    )
     default_symbols = (
-        HIGH_VELOCITY_CRYPTO_UNIVERSE if args.engine == "intraday" else DEFAULT_UNIVERSE
+        HIGH_VELOCITY_CRYPTO_UNIVERSE
+        if args.engine == "intraday"
+        else DEFAULT_UNIVERSE
     )
     symbols = tuple(args.symbols) if args.symbols else tuple(default_symbols)
     if args.engine == "intraday" and len(symbols) < 3:
-        return _fail("Intraday cross-sectional research requires at least three symbols.")
+        return _fail(
+            "Intraday cross-sectional research requires at least three symbols."
+        )
 
     try:
         bars = (
@@ -285,7 +334,16 @@ def main() -> int:
     if args.synthetic:
         strategy_id += "_synthetic"
 
-    risk_pct, walk, criteria, slippage, spread, fee = _research_policy(args.engine)
+    (
+        risk_pct,
+        max_positions,
+        max_total_exposure_pct,
+        walk,
+        criteria,
+        slippage,
+        spread,
+        fee,
+    ) = _research_policy(args.engine)
     store = QuantStore(args.db)
     try:
         report = run_quant_walk_forward(
@@ -295,12 +353,17 @@ def main() -> int:
             bars_by_symbol=bars,
             sim_config=SimulationConfig(
                 risk_per_trade_pct=risk_pct,
+                max_positions=max_positions,
+                max_total_exposure_pct=max_total_exposure_pct,
                 slippage_bps=slippage,
                 spread_bps=spread,
                 fee_bps=fee,
                 annualization_factor=crypto_bars_per_year(timeframe),
             ),
-            exit_policy=ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True),
+            exit_policy=ExitPolicyConfig(
+                enable_trailing_stop=True,
+                enable_runner=True,
+            ),
             walk_config=walk,
             criteria=criteria,
             prior_trials=store.total_trials(strategy_id),
@@ -313,7 +376,8 @@ def main() -> int:
     print(f"\n=== Quant walk-forward: {strategy_id} [{label}] ===")
     print(
         f"folds={len(report.folds)} candidates={report.candidate_count} "
-        f"cumulative_trials={report.trial_count} oos_trades={report.total_oos_trades}"
+        f"cumulative_trials={report.trial_count} "
+        f"oos_trades={report.total_oos_trades}"
     )
     print(
         f"compounded={report.compounded_return_pct:+.2f}% "
@@ -324,8 +388,8 @@ def main() -> int:
         test_days, trades_per_day, daily = _intraday_oos_diagnostics(report)
         objective = DEFAULT_INTRADAY_OBJECTIVE
         print(
-            f"intraday OOS: {test_days:.1f} test-days, {trades_per_day:.2f} trades/day, "
-            f"geometric {daily:+.3f}%/day"
+            f"intraday OOS: {test_days:.1f} test-days, "
+            f"{trades_per_day:.2f} trades/day, geometric {daily:+.3f}%/day"
         )
         print(
             f"activity target {objective.target_trades_per_day_min:.0f}-"
@@ -342,15 +406,29 @@ def main() -> int:
     for gate in report.gates:
         verdict = "PASS" if gate.passed else "FAIL"
         value = "unmeasured" if gate.value is None else f"{gate.value:.4f}"
-        print(f"  [{verdict}] {gate.name:<38} value={value:<12} threshold={gate.threshold:.4f}")
+        print(
+            f"  [{verdict}] {gate.name:<38} "
+            f"value={value:<12} threshold={gate.threshold:.4f}"
+        )
 
     if not args.no_record:
-        run_id = record_research_report(store, report, git_commit=_git_commit(), seed=None)
-        print(f"\nRecorded research run #{run_id}; cumulative trials={store.total_trials(strategy_id)}")
+        run_id = record_research_report(
+            store,
+            report,
+            git_commit=_git_commit(),
+            seed=None,
+        )
+        print(
+            f"\nRecorded research run #{run_id}; "
+            f"cumulative trials={store.total_trials(strategy_id)}"
+        )
     store.close()
 
     if report.passed:
-        print("\nVERDICT: PASS — eligible for SHADOW only; not a live unlock or profit claim.")
+        print(
+            "\nVERDICT: PASS — eligible for SHADOW only; "
+            "not a live unlock or profit claim."
+        )
         return 0
     print("\nVERDICT: FAIL — do not promote. Gates above are authoritative.")
     return 1
