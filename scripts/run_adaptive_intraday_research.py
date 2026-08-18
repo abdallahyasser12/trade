@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Research the adaptive v2 intraday strategy on real Alpaca data.
 
-The runner is intentionally harder to pass than the generic research command.  It
-adds breadth/concentration/activity gates on top of chronological walk-forward,
-stressed execution costs, DSR multiple-testing correction and Monte Carlo ruin.
+The runner is intentionally harder to pass than the generic research command. It
+adds breadth, concentration, activity and trade-expectancy gates on top of
+chronological walk-forward, stressed execution costs, DSR multiple-testing
+correction and Monte Carlo ruin.
 
-The 2%/day objective is diagnostic only.  A run may pass because it demonstrates
+The 2%/day objective is diagnostic only. A run may pass because it demonstrates
 robust positive expectancy even when 2%/day is not observed; conversely, a run that
 prints 2%/day but fails robustness cannot promote.
+
+Base execution-cost assumptions are CLI inputs so PAPER -> LIVE_CANARY research can
+be rerun with slippage at least as adverse as the broker's measured execution. Stress
+costs are always at least as severe as the configured base costs.
 """
 
 from __future__ import annotations
@@ -27,7 +32,11 @@ from crypto_config import crypto_bars_per_year
 from crypto_data_feed import AlpacaCryptoDataFeed
 from intraday_crypto_engine import ADAPTIVE_STRATEGY_ID
 from quant.exits import ExitPolicyConfig
-from quant.intraday import DEFAULT_INTRADAY_OBJECTIVE, HIGH_VELOCITY_CRYPTO_UNIVERSE, make_high_velocity_strategy_config
+from quant.intraday import (
+    DEFAULT_INTRADAY_OBJECTIVE,
+    HIGH_VELOCITY_CRYPTO_UNIVERSE,
+    make_high_velocity_strategy_config,
+)
 from quant.research.factory import (
     GateResult,
     QuantPromotionCriteria,
@@ -37,7 +46,10 @@ from quant.research.factory import (
 )
 from quant.research.simulator import SimulationConfig
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
-from quant.strategies.intraday_adaptive import AdaptiveIntradayConfig, AdaptiveIntradayStrategy
+from quant.strategies.intraday_adaptive import (
+    AdaptiveIntradayConfig,
+    AdaptiveIntradayStrategy,
+)
 
 
 def _git_commit() -> str | None:
@@ -60,10 +72,7 @@ def _real_bars(symbols: tuple[str, ...], timeframe: str, days: int):
     feed = AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    bars = {
-        symbol: feed.get_bars(symbol, timeframe, start, end)
-        for symbol in symbols
-    }
+    bars = {symbol: feed.get_bars(symbol, timeframe, start, end) for symbol in symbols}
     empty = [symbol for symbol, frame in bars.items() if frame is None or frame.empty]
     if empty:
         raise RuntimeError(f"No historical bars returned for: {empty}")
@@ -76,8 +85,8 @@ def _factory(symbols: tuple[str, ...], timeframe: str):
     def build(params):
         return AdaptiveIntradayStrategy(base, AdaptiveIntradayConfig(**params))
 
-    # Structural grid only.  Eighteen hypotheses are enough to test robustness
-    # without turning the optimizer into a parameter-mining engine.
+    # Structural grid only: 18 hypotheses. Do not expand this just to make an old
+    # data set look better; cumulative trial count is carried into DSR.
     structures = (
         (2, 9, 30, 16, 48),
         (3, 12, 36, 18, 54),
@@ -115,7 +124,10 @@ def _factory(symbols: tuple[str, ...], timeframe: str):
 
 def _diagnostics(report, universe_size: int):
     test_days = sum(
-        max((fold.test_end - fold.test_start).total_seconds() / 86_400.0, 1.0 / 288.0)
+        max(
+            (fold.test_end - fold.test_start).total_seconds() / 86_400.0,
+            1.0 / 288.0,
+        )
         for fold in report.folds
     )
     trades_per_day = report.total_oos_trades / test_days if test_days > 0 else 0.0
@@ -129,15 +141,20 @@ def _diagnostics(report, universe_size: int):
     symbol_pnl = defaultdict(float)
     traded_symbols = set()
     positive_fold_profit = []
+    r_values = []
     for fold in report.folds:
         positive_fold_profit.append(max(0.0, fold.test_result.total_return_pct))
         for trade in fold.test_result.trades:
-            if trade.net_pnl is None:
-                continue
-            symbol_pnl[trade.symbol] += float(trade.net_pnl)
-            traded_symbols.add(trade.symbol)
+            if trade.net_pnl is not None:
+                symbol_pnl[trade.symbol] += float(trade.net_pnl)
+                traded_symbols.add(trade.symbol)
+            r = trade.r_multiple
+            if r is not None and math.isfinite(r):
+                r_values.append(float(r))
 
-    positive_symbol_pnl = {symbol: max(0.0, pnl) for symbol, pnl in symbol_pnl.items()}
+    positive_symbol_pnl = {
+        symbol: max(0.0, pnl) for symbol, pnl in symbol_pnl.items()
+    }
     positive_total = sum(positive_symbol_pnl.values())
     symbol_concentration = (
         max(positive_symbol_pnl.values()) / positive_total
@@ -150,6 +167,7 @@ def _diagnostics(report, universe_size: int):
         if fold_profit_total > 0 and positive_fold_profit
         else 1.0
     )
+    expectancy_r = sum(r_values) / len(r_values) if r_values else None
     min_active_symbols = min(6, max(3, math.ceil(universe_size / 2)))
     return {
         "test_days": test_days,
@@ -159,16 +177,31 @@ def _diagnostics(report, universe_size: int):
         "min_active_symbols": min_active_symbols,
         "symbol_profit_concentration": symbol_concentration,
         "fold_profit_concentration": fold_concentration,
+        "expectancy_r": expectancy_r,
     }
 
 
 def _add_robustness_gates(report, diagnostics):
+    objective = DEFAULT_INTRADAY_OBJECTIVE
+    expectancy_r = diagnostics["expectancy_r"]
     extras = [
         GateResult(
             "min_trades_per_day",
             diagnostics["trades_per_day"],
-            4.0,
-            diagnostics["trades_per_day"] >= 4.0,
+            objective.target_trades_per_day_min,
+            diagnostics["trades_per_day"] >= objective.target_trades_per_day_min,
+        ),
+        GateResult(
+            "max_trades_per_day",
+            diagnostics["trades_per_day"],
+            50.0,
+            diagnostics["trades_per_day"] <= 50.0,
+        ),
+        GateResult(
+            "min_oos_expectancy_r",
+            expectancy_r,
+            0.03,
+            expectancy_r is not None and expectancy_r >= 0.03,
         ),
         GateResult(
             "min_active_symbols",
@@ -194,18 +227,37 @@ def _add_robustness_gates(report, diagnostics):
     report.passed = report.passed and all(gate.passed for gate in extras)
 
 
+def _finite_nonnegative(label: str, value: float) -> str | None:
+    if not math.isfinite(value) or value < 0:
+        return f"{label} must be finite and non-negative."
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=120)
     parser.add_argument("--timeframe", choices=("5Min", "15Min"), default="5Min")
     parser.add_argument("--symbols", nargs="+", default=None)
     parser.add_argument("--db", default=DEFAULT_QUANT_DB_PATH)
+    parser.add_argument("--slippage-bps", type=float, default=10.0)
+    parser.add_argument("--spread-bps", type=float, default=8.0)
+    parser.add_argument("--fee-bps", type=float, default=25.0)
     parser.add_argument("--no-record", action="store_true")
     args = parser.parse_args()
 
     if args.days < 45:
         print("Adaptive research requires at least 45 calendar days.", file=sys.stderr)
         return 2
+    for label, value in (
+        ("slippage-bps", args.slippage_bps),
+        ("spread-bps", args.spread_bps),
+        ("fee-bps", args.fee_bps),
+    ):
+        error = _finite_nonnegative(label, value)
+        if error:
+            print(error, file=sys.stderr)
+            return 2
+
     symbols = tuple(args.symbols or HIGH_VELOCITY_CRYPTO_UNIVERSE)
     if len(symbols) < 6:
         print("Adaptive research requires at least six symbols for breadth evidence.", file=sys.stderr)
@@ -229,12 +281,15 @@ def main() -> int:
                 risk_per_trade_pct=0.15,
                 max_positions=6,
                 max_total_exposure_pct=30.0,
-                slippage_bps=10.0,
-                spread_bps=8.0,
-                fee_bps=25.0,
+                slippage_bps=args.slippage_bps,
+                spread_bps=args.spread_bps,
+                fee_bps=args.fee_bps,
                 annualization_factor=crypto_bars_per_year(args.timeframe),
             ),
-            exit_policy=ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True),
+            exit_policy=ExitPolicyConfig(
+                enable_trailing_stop=True,
+                enable_runner=True,
+            ),
             walk_config=QuantWalkForwardConfig(
                 train_bars=4_032,
                 test_bars=1_152,
@@ -242,9 +297,9 @@ def main() -> int:
                 embargo_bars=36,
                 min_train_trades=40,
                 max_candidates=32,
-                stress_slippage_bps=25.0,
-                stress_spread_bps=25.0,
-                stress_fee_bps=50.0,
+                stress_slippage_bps=max(25.0, args.slippage_bps * 1.5),
+                stress_spread_bps=max(25.0, args.spread_bps * 1.5),
+                stress_fee_bps=max(50.0, args.fee_bps * 1.5),
             ),
             criteria=QuantPromotionCriteria(
                 min_folds=8,
@@ -276,7 +331,8 @@ def main() -> int:
         )
         print(
             f"activity={diagnostics['trades_per_day']:.2f}/day across "
-            f"{diagnostics['active_symbols']} symbols; symbol concentration="
+            f"{diagnostics['active_symbols']} symbols; E[R]="
+            f"{diagnostics['expectancy_r']}R; symbol concentration="
             f"{diagnostics['symbol_profit_concentration']:.3f}; fold concentration="
             f"{diagnostics['fold_profit_concentration']:.3f}"
         )
@@ -284,6 +340,10 @@ def main() -> int:
             f"geometric OOS={diagnostics['geometric_daily_return_pct']:+.3f}%/day; "
             f"2% aspiration="
             f"{'OBSERVED OOS' if diagnostics['geometric_daily_return_pct'] >= DEFAULT_INTRADAY_OBJECTIVE.aspirational_daily_return_pct else 'NOT OBSERVED'}"
+        )
+        print(
+            f"cost model: slippage={args.slippage_bps:.2f}bps, "
+            f"spread={args.spread_bps:.2f}bps, fee={args.fee_bps:.2f}bps"
         )
         print("\nGates:")
         for gate in report.gates:
