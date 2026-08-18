@@ -12,7 +12,11 @@ on:
       - "intraday_crypto_engine.py"
       - "scripts/run_quant_research.py"
       - "scripts/run_intraday_runtime.py"
+      - "scripts/run_adaptive_intraday_research.py"
+      - "scripts/run_adaptive_intraday_runtime.py"
       - "scripts/manage_strategy_lifecycle.py"
+      - "tests/test_intraday_adaptive.py"
+      - "tests/test_adaptive_intraday_lifecycle_cli.py"
       - ".github/workflows/quant-smoke.yml"
 
 jobs:
@@ -41,13 +45,19 @@ jobs:
             quant/research/factory.py \
             quant/scanner.py \
             quant/strategies/intraday_momentum.py \
+            quant/strategies/intraday_adaptive.py \
+            quant/strategies/registry.py \
             scripts/run_quant_research.py \
             scripts/run_intraday_runtime.py \
+            scripts/run_adaptive_intraday_research.py \
+            scripts/run_adaptive_intraday_runtime.py \
             scripts/manage_strategy_lifecycle.py
       - name: Byte-compile new regression tests
         run: |
           python -m py_compile \
             tests/test_intraday_momentum.py \
+            tests/test_intraday_adaptive.py \
+            tests/test_adaptive_intraday_lifecycle_cli.py \
             tests/test_quant_evidence_scanner.py \
             tests/test_quant_factory_fail_closed.py \
             tests/test_quant_intraday_profile.py \
