@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the market-wide US-equity Quant Desk runtime.
+"""Run the manifest-locked market-wide US-equity Quant Desk runtime.
 
-Broker-backed equity execution remains paper-only.  Strategy lifecycle state controls
+Broker-backed equity execution remains paper-only. Strategy lifecycle state controls
 whether each hypothesis is skipped (RESEARCH), virtual-only (SHADOW), or allowed to
-reach the paper broker (PAPER).  Ctrl-C requests a graceful stop and leaves protective
-GTC stops in place for any still-open bot-owned position.
+reach the paper broker (PAPER). Any forward-state strategy must match its promoted
+research commit/config/universe exactly. Ctrl-C requests a graceful stop and leaves
+protective GTC stops in place for still-open bot-owned positions.
 """
 
 from __future__ import annotations
@@ -22,10 +23,8 @@ if str(ROOT) not in sys.path:
 from broker import AlpacaPaperBroker
 from config import AccountMode, load_credentials
 from equity_market_data import AlpacaEquityMarketData, EquityMarketDataConfig
-from equity_marketwide_engine import (
-    MarketWideEquityTradeEngine,
-    clear_marketwide_equity_kill_switch,
-)
+from equity_marketwide_deployment import ManifestLockedMarketWideEquityTradeEngine
+from equity_marketwide_engine import clear_marketwide_equity_kill_switch
 from quant.equity_marketwide import MarketWideEquityConfig
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
@@ -33,11 +32,16 @@ from state_store import StateStore
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Market-wide US-equity intraday scanner + guarded paper execution."
+        description="Manifest-locked US-equity intraday scanner + guarded paper execution."
     )
     parser.add_argument("--timeframe", choices=("5Min", "15Min"), default="15Min")
     parser.add_argument("--feed", choices=("iex", "sip"), default="iex")
-    parser.add_argument("--max-scan-symbols", type=int, default=192)
+    parser.add_argument(
+        "--max-scan-symbols",
+        type=int,
+        default=48,
+        help="Must exactly match the promoted research configuration in SHADOW/PAPER.",
+    )
     parser.add_argument("--max-positions", type=int, default=6)
     parser.add_argument("--risk-per-trade-pct", type=float, default=0.15)
     parser.add_argument("--max-session-loss-pct", type=float, default=2.0)
@@ -73,6 +77,7 @@ def main() -> int:
     config = MarketWideEquityConfig(
         timeframe=args.timeframe,
         max_scan_symbols=args.max_scan_symbols,
+        shard_size=min(48, args.max_scan_symbols),
         max_positions=args.max_positions,
         risk_per_trade_pct=args.risk_per_trade_pct,
         max_session_loss_pct=args.max_session_loss_pct,
@@ -94,7 +99,7 @@ def main() -> int:
             credentials.secret_key,
             EquityMarketDataConfig(feed=args.feed),
         )
-        engine = MarketWideEquityTradeEngine(
+        engine = ManifestLockedMarketWideEquityTradeEngine(
             broker,
             market_data,
             store,
