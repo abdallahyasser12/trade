@@ -9,12 +9,14 @@ on:
       - "quant/equity_marketwide.py"
       - "quant/equity_manifest.py"
       - "quant/equity_attribution.py"
+      - "quant/equity_lifecycle.py"
       - "scripts/run_marketwide_equity_runtime.py"
       - "scripts/run_marketwide_equity_research.py"
       - "scripts/manage_marketwide_equity_lifecycle.py"
       - "tests/test_equity_marketwide*.py"
       - "tests/test_equity_manifest.py"
       - "tests/test_equity_attribution.py"
+      - "tests/test_equity_lifecycle.py"
       - ".github/workflows/marketwide-equity-ci.yml"
   push:
     branches: ["feature/marketwide-equity-opportunity-engine"]
@@ -48,13 +50,15 @@ jobs:
             quant/equity_marketwide.py \
             quant/equity_manifest.py \
             quant/equity_attribution.py \
+            quant/equity_lifecycle.py \
             scripts/run_marketwide_equity_runtime.py \
             scripts/run_marketwide_equity_research.py \
             scripts/manage_marketwide_equity_lifecycle.py \
             tests/test_equity_marketwide.py \
             tests/test_equity_manifest.py \
             tests/test_equity_marketwide_recovery.py \
-            tests/test_equity_attribution.py >> marketwide-ci.log 2>&1
+            tests/test_equity_attribution.py \
+            tests/test_equity_lifecycle.py >> marketwide-ci.log 2>&1
           compile_status=$?
 
           echo "=== install ===" >> marketwide-ci.log
@@ -70,7 +74,8 @@ jobs:
               tests/test_equity_marketwide.py \
               tests/test_equity_manifest.py \
               tests/test_equity_marketwide_recovery.py \
-              tests/test_equity_attribution.py >> marketwide-ci.log 2>&1
+              tests/test_equity_attribution.py \
+              tests/test_equity_lifecycle.py >> marketwide-ci.log 2>&1
             test_status=$?
           else
             echo "=== pytest skipped because compile/install failed ===" >> marketwide-ci.log
