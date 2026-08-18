@@ -20,6 +20,7 @@ from crypto_engine import CryptoTradeEngine
 from crypto_risk import CryptoRiskManager
 from models import BotAction
 from quant.contracts import Market, StrategyState
+from quant.evidence_scanner import EvidenceQuantScanner
 from quant.execution import ExecutionQualityEngine
 from quant.journal import DecisionJournal
 from quant.lifecycle import DegradationMonitor, LifecycleManager
@@ -49,9 +50,6 @@ class _AttributionOnlyJournal:
         self.delegate = delegate
 
     def record_crypto_decisions(self, _decisions, _session_id) -> None:
-        # QuantScanner already journals ranked/rejected decisions with measured
-        # alpha and execution estimates; duplicating raw engine decisions would
-        # corrupt counts and strategy health.
         return None
 
     def record_crypto_exit_fill(self, **kwargs) -> None:
@@ -80,10 +78,6 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
                 "scanner decisions cannot be written to different stores."
             )
 
-        # LIVE CryptoEngineConfig intentionally fails normal validation. The
-        # process-local capability is minted here, immediately before the audited
-        # parent validates the config. This makes a legacy CryptoTradeEngine LIVE
-        # construction physically impossible while keeping PAPER unchanged.
         if len(args) > 5:
             mutable_args = list(args)
             mutable_args[5] = _authorize_quant_live_engine_config(mutable_args[5])
@@ -117,7 +111,7 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         self._owns_quant_store = quant_store is None
         self.lifecycle = lifecycle or LifecycleManager(self.quant_store)
         self.execution_quality = ExecutionQualityEngine(state_store=self.store)
-        self.quant_scanner = scanner or QuantScanner(
+        self.quant_scanner = scanner or EvidenceQuantScanner(
             store=self.quant_store,
             lifecycle=self.lifecycle,
             execution_engine=self.execution_quality,
@@ -125,12 +119,6 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         self.degradation_monitor = degradation_monitor or DegradationMonitor()
 
     def _has_historical_live_ack(self) -> bool:
-        """A live startup needs evidence that a human explicitly armed a live rung.
-
-        REDUCED_RISK is a demotion state and its current row normally has
-        ``operator_ack=False``. In that case a prior acknowledged transition into
-        LIVE_CANARY/LIVE is required in immutable promotion history.
-        """
         row = self.quant_store.get_strategy_state(self.strategy_id)
         if row and row.get("operator_ack"):
             return True
@@ -175,7 +163,6 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         super()._startup()
 
     def run_iteration(self) -> None:
-        """Run audited trading cycle, then evaluate real-performance degradation."""
         super().run_iteration()
         self._supervise_strategy_health()
 
@@ -280,7 +267,6 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         broker_positions,
         now: datetime,
     ) -> None:
-        """Require QuantScanner approval, then delegate execution to parent."""
         buy_decisions = [
             decision for decision in decisions if decision.action is BotAction.BUY
         ]
