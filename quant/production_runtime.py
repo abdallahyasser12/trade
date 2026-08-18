@@ -1,26 +1,14 @@
 """Production bridge between the audited crypto execution engine and Quant Desk.
 
-This module deliberately does *not* reimplement broker/order/stop/recovery logic.
-It subclasses :class:`crypto_engine.CryptoTradeEngine` and makes the Quant Desk
-an authoritative PRE-TRADE layer while the parent remains authoritative for
-execution and position protection.
-
-Guarantees
-----------
-* broker-backed PAPER requires lifecycle state PAPER or higher;
-* LIVE requires LIVE_CANARY/LIVE/REDUCED_RISK;
-* every BUY must also be approved by QuantScanner (measured expectancy,
-  execution-quality, abstention, portfolio limits and lifecycle risk scaling);
-* EXIT decisions remain owned by the parent engine, so a quant ranking failure
-  can never block a risk-reducing exit;
-* Quant Desk can only reduce per-trade risk. It can never raise the risk manager's
-  configured risk_per_trade_pct;
-* no synthetic or RESEARCH/SHADOW strategy can reach a broker order through this
-  runtime.
+The parent ``CryptoTradeEngine`` remains authoritative for broker truth, order
+idempotency, protective stops, watchdog exits and recovery. This subclass makes
+strategy evidence authoritative for broker-backed ENTRY privilege and closes the
+feedback loop from real fills back into the Quant Desk.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime
 from typing import Optional
@@ -32,7 +20,9 @@ from crypto_risk import CryptoRiskManager
 from models import BotAction
 from quant.contracts import Market, StrategyState
 from quant.execution import ExecutionQualityEngine
-from quant.lifecycle import LifecycleManager
+from quant.journal import DecisionJournal
+from quant.lifecycle import DegradationMonitor, LifecycleManager
+from quant.marketplace import compute_strategy_health
 from quant.portfolio import BookPosition, PortfolioBook
 from quant.scanner import QuantScanner, ScanStrategy
 from quant.store import QuantStore
@@ -51,13 +41,24 @@ _LIVE_EXECUTION_STATES = frozenset(
 )
 
 
-class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
-    """CryptoTradeEngine with evidence/lifecycle/portfolio gates on entries.
+class _AttributionOnlyJournal:
+    """Let the scanner own decisions while parent-engine fills own attribution."""
 
-    Adapters may replace ``self.strategy`` after ``super().__init__`` exactly as
-    the legacy cross-sectional/ensemble adapters already do. The scanner reads
-    the current strategy at decision time, so that replacement remains safe.
-    """
+    def __init__(self, delegate: DecisionJournal):
+        self.delegate = delegate
+
+    def record_crypto_decisions(self, _decisions, _session_id) -> None:
+        # QuantScanner already journals ranked/rejected decisions with measured
+        # alpha and execution estimates; duplicating raw engine decisions would
+        # corrupt counts and strategy health.
+        return None
+
+    def record_crypto_exit_fill(self, **kwargs) -> None:
+        self.delegate.record_crypto_exit_fill(**kwargs)
+
+
+class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
+    """CryptoTradeEngine with evidence/lifecycle/portfolio gates on entries."""
 
     def __init__(
         self,
@@ -67,21 +68,68 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         quant_store: Optional[QuantStore] = None,
         lifecycle: Optional[LifecycleManager] = None,
         scanner: Optional[QuantScanner] = None,
+        degradation_monitor: Optional[DegradationMonitor] = None,
         **kwargs,
     ) -> None:
         if not strategy_id or not strategy_id.strip():
             raise ValueError("Quant-controlled execution requires a strategy_id.")
+        if "quant_journal" in kwargs:
+            raise ValueError(
+                "QuantControlledCryptoTradeEngine owns quant_journal so fills and "
+                "scanner decisions cannot be written to different stores."
+            )
+
+        desk_store = quant_store or QuantStore()
+        identity = strategy_id.strip()
+        journal = DecisionJournal(
+            desk_store,
+            market=Market.CRYPTO,
+            timeframe=args[3].timeframe if len(args) > 3 else kwargs["strategy_config"].timeframe,
+            strategy_id=identity,
+            strategy_version=strategy_version,
+        )
+        kwargs["quant_journal"] = _AttributionOnlyJournal(journal)
         super().__init__(*args, **kwargs)
-        self.strategy_id = strategy_id.strip()
+
+        self.strategy_id = identity
         self.strategy_version = strategy_version
-        self.quant_store = quant_store or QuantStore()
+        self.quant_store = desk_store
         self._owns_quant_store = quant_store is None
         self.lifecycle = lifecycle or LifecycleManager(self.quant_store)
+        self.execution_quality = ExecutionQualityEngine(state_store=self.store)
         self.quant_scanner = scanner or QuantScanner(
             store=self.quant_store,
             lifecycle=self.lifecycle,
-            execution_engine=ExecutionQualityEngine(state_store=self.store),
+            execution_engine=self.execution_quality,
         )
+        self.degradation_monitor = degradation_monitor or DegradationMonitor()
+
+    def _has_historical_live_ack(self) -> bool:
+        """A live startup needs evidence that a human explicitly armed a live rung.
+
+        REDUCED_RISK is a demotion state and its current row normally has
+        ``operator_ack=False``. In that case a prior acknowledged transition into
+        LIVE_CANARY/LIVE is required in immutable promotion history.
+        """
+        row = self.quant_store.get_strategy_state(self.strategy_id)
+        if row and row.get("operator_ack"):
+            return True
+        for event in self.quant_store.get_promotion_history(self.strategy_id, limit=500):
+            if event.get("to_state") not in {
+                StrategyState.LIVE_CANARY.value,
+                StrategyState.LIVE.value,
+            }:
+                continue
+            raw = event.get("evidence_json")
+            if not raw:
+                continue
+            try:
+                evidence = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if evidence.get("operator_ack") is True:
+                return True
+        return False
 
     def _startup(self) -> None:
         state = self.lifecycle.state(self.strategy_id)
@@ -95,7 +143,59 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
                 "risk-reduced state derived from it. Run research/shadow promotion "
                 "instead of bypassing the evidence ladder."
             )
+        if mode is AccountMode.LIVE and not self._has_historical_live_ack():
+            raise BrokerError(
+                f"Strategy {self.strategy_id!r} has no recorded operator-acknowledged "
+                "LIVE_CANARY/LIVE promotion; refusing real-money startup."
+            )
         super()._startup()
+
+    def run_iteration(self) -> None:
+        """Run audited trading cycle, then evaluate real-performance degradation."""
+        super().run_iteration()
+        self._supervise_strategy_health()
+
+    def _supervise_strategy_health(self) -> None:
+        state = self.lifecycle.state(self.strategy_id)
+        if state in {StrategyState.RESEARCH, StrategyState.SHADOW, StrategyState.QUARANTINE}:
+            return
+        health = compute_strategy_health(
+            self.quant_store,
+            self.strategy_id,
+            state,
+            include_shadow=False,
+        )
+        verdict = self.degradation_monitor.evaluate(health)
+        if verdict.action == "none":
+            return
+        reason = "automatic_degradation:" + ",".join(verdict.reasons)
+        if verdict.action == "quarantine":
+            self.lifecycle.demote(
+                self.strategy_id,
+                StrategyState.QUARANTINE,
+                reason,
+                evidence={"health": health.to_dict(), "verdict": verdict.action},
+            )
+            self._log("CRITICAL", f"Quant Desk quarantined {self.strategy_id}: {reason}")
+            return
+        if verdict.action == "reduce_risk":
+            target = (
+                StrategyState.REDUCED_RISK
+                if state in {
+                    StrategyState.LIVE_CANARY,
+                    StrategyState.LIVE,
+                    StrategyState.REDUCED_RISK,
+                }
+                else StrategyState.SHADOW
+            )
+            if state is not target:
+                self.lifecycle.demote(
+                    self.strategy_id,
+                    target,
+                    reason,
+                    evidence={"health": health.to_dict(), "verdict": verdict.action},
+                )
+                self._log("WARNING", f"Quant Desk demoted {self.strategy_id} to {target.value}: {reason}")
 
     def _portfolio_book(self, broker_positions, prepared, equity: float) -> PortfolioBook:
         positions: list[BookPosition] = []
@@ -104,8 +204,6 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
                 continue
             local = self._load_position(symbol)
             if local is None:
-                # Parent reconciliation should make this impossible. Failing closed
-                # here avoids understating portfolio heat if state is inconsistent.
                 raise BrokerError(
                     f"Cannot construct Quant Desk book for {symbol}: local stop state is missing."
                 )
@@ -134,19 +232,11 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         broker_positions,
         now: datetime,
     ) -> None:
-        """Require QuantScanner approval, then delegate execution to the parent.
-
-        The parent remains the final authority for quote validation, correlation,
-        sizing, asset increments, cost-to-risk, idempotent order submission and
-        protection. The scanner is therefore an additional gate, never a bypass.
-        """
-
+        """Require QuantScanner approval, then delegate execution to parent."""
         buy_decisions = [decision for decision in decisions if decision.action is BotAction.BUY]
         if not buy_decisions:
             return
 
-        # Scanner prepares strategies itself. Strip indicator columns so we do not
-        # accidentally make a strategy depend on an earlier preparation pass.
         raw_bars = {
             symbol: frame[["open", "high", "low", "close", "volume"]].copy()
             for symbol, frame in prepared.items()
@@ -182,27 +272,19 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
         if not grants:
             return
 
-        # Execute one candidate at a time so each subsequent candidate sees fresh
-        # broker exposure. Quant risk can only shrink the configured risk budget.
         original_risk = self.risk
         original_config = self.risk_config
         try:
             for decision in buy_decisions:
-                grant = min(
-                    original_config.risk_per_trade_pct,
-                    grants.get(decision.symbol, 0.0),
-                )
+                grant = min(original_config.risk_per_trade_pct, grants.get(decision.symbol, 0.0))
                 if grant <= 0:
                     continue
                 scaled_config = replace(
                     original_config,
                     risk_per_trade_pct=grant,
-                    # Validation requires heat >= per-trade risk. Never increase
-                    # the original heat ceiling; grant itself is already <= base risk.
                     max_portfolio_heat_pct=max(grant, original_config.max_portfolio_heat_pct),
                 )
                 scaled_risk = CryptoRiskManager(scaled_config)
-                # Preserve the session-loss latch across the temporary sizing view.
                 scaled_risk._session_halted = original_risk.session_halted
                 scaled_risk._halt_reason = original_risk.halt_reason
                 self.risk_config = scaled_config
@@ -216,8 +298,6 @@ class QuantControlledCryptoTradeEngine(CryptoTradeEngine):
                     broker_positions,
                     now,
                 )
-                # Refresh before the next candidate so total exposure/heat cannot
-                # be computed from a pre-fill snapshot.
                 broker_positions = self._reconcile_position_truth(now)
                 account = self.broker.get_account()
         finally:
