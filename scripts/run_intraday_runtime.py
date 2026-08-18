@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Run the high-velocity strategy in real-time SHADOW or broker PAPER mode.
+"""Run high-velocity intraday strategy in SHADOW, PAPER, or guarded LIVE mode.
 
-The runtime is deliberately promotion-aware:
+LIVE is available only through this Quant-controlled runner. The legacy Streamlit
+crypto LIVE config is rejected before construction. LIVE additionally requires:
+separate live credentials, ENABLE_LIVE_TRADING=true, lifecycle state
+LIVE_CANARY/LIVE/REDUCED_RISK, historical operator-acknowledged promotion, and the
+explicit CLI phrase ``--live-ack I_ACCEPT_LIVE_RISK``.
 
-* SHADOW requires the strategy lifecycle to already be SHADOW (earned by a
-  passing real-data research run + explicit promotion).
-* PAPER requires lifecycle PAPER and uses the production broker engine.
-* LIVE is intentionally not exposed by this CLI. Real-money startup remains a
-  separate, operator-acknowledged LIVE_CANARY/LIVE action.
-
-Quotes refresh every five seconds in SHADOW and every five seconds while flat /
-one second while exposed in PAPER. Completed OHLCV history is cached until a new
-5-minute bar is safely complete, avoiding API pressure.
+Quotes refresh every five seconds while flat and every one second while broker
+capital is exposed. Completed OHLCV history is cached until a new 5-minute bar is
+safely complete, so responsiveness does not multiply historical-data requests.
 """
 
 from __future__ import annotations
@@ -26,12 +24,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pandas as pd
-
-from broker import AlpacaPaperBroker, BrokerError
+from broker import AlpacaLiveBroker, AlpacaPaperBroker, BrokerError
 from config import AccountMode, load_credentials
 from crypto_data_feed import AlpacaCryptoDataFeed
-from intraday_crypto_engine import STRATEGY_ID, STRATEGY_VERSION, make_intraday_momentum_crypto_engine
+from intraday_crypto_engine import (
+    STRATEGY_ID,
+    STRATEGY_VERSION,
+    make_intraday_momentum_crypto_engine,
+)
 from quant.contracts import Market, StrategyState
 from quant.execution import ExecutionQualityEngine
 from quant.intraday import (
@@ -40,7 +40,7 @@ from quant.intraday import (
     make_high_velocity_risk_config,
     make_high_velocity_strategy_config,
 )
-from quant.lifecycle import LifecycleManager
+from quant.lifecycle import LifecycleManager, PromotionRequirements
 from quant.portfolio import PortfolioBook
 from quant.realtime_feed import CompletedBarCachingCryptoFeed
 from quant.scanner import QuantScanner, ScanStrategy
@@ -49,7 +49,24 @@ from quant.strategies.intraday_momentum import IntradayMomentumStrategy
 from state_store import StateStore
 
 DEFAULT_STATE_DB = str(Path("data") / "intraday_trading.db")
+DEFAULT_LIVE_STATE_DB = str(Path("data") / "intraday_live_trading.db")
 REALTIME_QUOTES_KEY = "intraday_realtime_quotes"
+LIVE_ACK = "I_ACCEPT_LIVE_RISK"
+
+
+def _intraday_lifecycle(store: QuantStore) -> LifecycleManager:
+    return LifecycleManager(
+        store,
+        requirements=PromotionRequirements(
+            min_research_trades=100,
+            min_shadow_trades=100,
+            max_shadow_drawdown_r=6.0,
+            min_paper_trades=200,
+            min_measured_execution_samples=50,
+            min_canary_trades=100,
+            max_open_operational_defects=0,
+        ),
+    )
 
 
 def _quote_snapshot(quotes) -> str:
@@ -65,19 +82,26 @@ def _quote_snapshot(quotes) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
-def _make_market_stack(symbols):
-    credentials = load_credentials(account_mode=AccountMode.PAPER)
+def _make_market_stack(mode: AccountMode, risk_config):
+    credentials = load_credentials(account_mode=mode)
     if not credentials.is_configured:
         raise RuntimeError(
-            "Alpaca paper credentials are required for real-time market data."
+            f"Separate Alpaca {mode.value} credentials are required for this runtime."
         )
-    broker = AlpacaPaperBroker(credentials.api_key, credentials.secret_key)
+    if mode is AccountMode.LIVE:
+        broker = AlpacaLiveBroker(
+            credentials.api_key,
+            credentials.secret_key,
+            max_live_order_notional=risk_config.max_live_order_notional,
+        )
+    else:
+        broker = AlpacaPaperBroker(credentials.api_key, credentials.secret_key)
     backend = AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
     return broker, CompletedBarCachingCryptoFeed(backend)
 
 
 def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
-    lifecycle = LifecycleManager(quant_store)
+    lifecycle = _intraday_lifecycle(quant_store)
     state = lifecycle.state(STRATEGY_ID)
     if state is not StrategyState.SHADOW:
         print(
@@ -87,7 +111,8 @@ def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
         )
         return 2
 
-    broker, feed = _make_market_stack(symbols)
+    risk_config = make_high_velocity_risk_config()
+    broker, feed = _make_market_stack(AccountMode.PAPER, risk_config)
     account = broker.verify_account()
     strategy_config = make_high_velocity_strategy_config(symbols=symbols)
     strategy = IntradayMomentumStrategy(strategy_config)
@@ -102,7 +127,7 @@ def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
         market=Market.CRYPTO,
         timeframe=strategy_config.timeframe,
         version=STRATEGY_VERSION,
-        base_risk_pct=make_high_velocity_risk_config().risk_per_trade_pct,
+        base_risk_pct=risk_config.risk_per_trade_pct,
     )
     last_bar = None
     print(
@@ -144,7 +169,9 @@ def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
                         counts = report.shadow_counts.get(STRATEGY_ID, {})
                         print(
                             f"{bar.isoformat()} shadow cycle: "
-                            + ", ".join(f"{key}={value}" for key, value in counts.items())
+                            + ", ".join(
+                                f"{key}={value}" for key, value in counts.items()
+                            )
                         )
                         last_bar = bar
             time.sleep(poll_seconds)
@@ -153,31 +180,43 @@ def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
         return 0
 
 
-def _paper_loop(
+def _broker_loop(
+    *,
     symbols,
     quant_store: QuantStore,
     state_db: str,
+    account_mode: AccountMode,
     max_runtime_hours: float | None,
 ) -> int:
-    lifecycle = LifecycleManager(quant_store)
+    lifecycle = _intraday_lifecycle(quant_store)
     state = lifecycle.state(STRATEGY_ID)
-    if state not in {
-        StrategyState.PAPER,
-        StrategyState.LIVE_CANARY,
-        StrategyState.LIVE,
-        StrategyState.REDUCED_RISK,
-    }:
+    if account_mode is AccountMode.PAPER:
+        allowed = {
+            StrategyState.PAPER,
+            StrategyState.LIVE_CANARY,
+            StrategyState.LIVE,
+            StrategyState.REDUCED_RISK,
+        }
+        required = "PAPER"
+    else:
+        allowed = {
+            StrategyState.LIVE_CANARY,
+            StrategyState.LIVE,
+            StrategyState.REDUCED_RISK,
+        }
+        required = "LIVE_CANARY/LIVE"
+    if state not in allowed:
         print(
-            f"Refusing PAPER runtime: {STRATEGY_ID} is {state.value}; "
-            "complete SHADOW evidence and promote to PAPER first.",
+            f"Refusing {account_mode.value.upper()} runtime: {STRATEGY_ID} is "
+            f"{state.value}; lifecycle state {required} is required.",
             file=sys.stderr,
         )
         return 2
 
-    broker, feed = _make_market_stack(symbols)
-    strategy_config = make_high_velocity_strategy_config(symbols=symbols)
     risk_config = make_high_velocity_risk_config()
-    engine_config = make_high_velocity_engine_config(account_mode=AccountMode.PAPER)
+    broker, feed = _make_market_stack(account_mode, risk_config)
+    strategy_config = make_high_velocity_strategy_config(symbols=symbols)
+    engine_config = make_high_velocity_engine_config(account_mode=account_mode)
     if max_runtime_hours is not None:
         engine_config = replace(
             engine_config,
@@ -194,9 +233,13 @@ def _paper_loop(
         quant_store=quant_store,
         lifecycle=lifecycle,
     )
+    label = account_mode.value.upper()
+    multiplier = lifecycle.risk_multiplier(STRATEGY_ID)
+    effective_risk = risk_config.risk_per_trade_pct * multiplier
     print(
-        f"PAPER {STRATEGY_ID}: {len(symbols)} symbols, risk/trade "
-        f"{risk_config.risk_per_trade_pct:.2f}%, quote loop 5s flat / 1s exposed."
+        f"{label} {STRATEGY_ID}: {len(symbols)} symbols, configured risk/trade "
+        f"{risk_config.risk_per_trade_pct:.3f}%, lifecycle effective risk <= "
+        f"{effective_risk:.3f}%, quote loop 5s flat / 1s exposed."
     )
     engine.start()
     try:
@@ -206,22 +249,26 @@ def _paper_loop(
                 print(f"Engine error: {status.error}", file=sys.stderr)
             engine.join(1.0)
     except KeyboardInterrupt:
-        print("\nGraceful PAPER stop requested...")
+        print(f"\nGraceful {label} stop requested...")
         engine.stop()
         engine.join(10.0)
     status = engine.status
-    print(f"PAPER stopped: state={status.state.value}, reason={status.stop_reason}")
+    print(f"{label} stopped: state={status.state.value}, reason={status.stop_reason}")
     return 1 if status.error else 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("shadow", "paper"), default="shadow")
+    parser.add_argument(
+        "--mode", choices=("shadow", "paper", "live"), default="shadow"
+    )
     parser.add_argument("--symbols", nargs="+", default=None)
     parser.add_argument("--quant-db", default=DEFAULT_QUANT_DB_PATH)
     parser.add_argument("--state-db", default=DEFAULT_STATE_DB)
+    parser.add_argument("--live-state-db", default=DEFAULT_LIVE_STATE_DB)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--max-runtime-hours", type=float, default=None)
+    parser.add_argument("--live-ack", default="")
     args = parser.parse_args()
 
     if args.poll_seconds < 1.0:
@@ -229,6 +276,12 @@ def main() -> int:
         return 2
     if args.max_runtime_hours is not None and args.max_runtime_hours <= 0:
         print("max-runtime-hours must be positive.", file=sys.stderr)
+        return 2
+    if args.mode == "live" and args.live_ack != LIVE_ACK:
+        print(
+            f"LIVE requires the explicit phrase: --live-ack {LIVE_ACK}",
+            file=sys.stderr,
+        )
         return 2
     symbols = tuple(args.symbols or HIGH_VELOCITY_CRYPTO_UNIVERSE)
     if len(symbols) < 3 or len(symbols) > 12:
@@ -239,11 +292,20 @@ def main() -> int:
     try:
         if args.mode == "shadow":
             return _shadow_loop(symbols, quant_store, args.poll_seconds)
-        return _paper_loop(
-            symbols,
-            quant_store,
-            args.state_db,
-            args.max_runtime_hours,
+        if args.mode == "paper":
+            return _broker_loop(
+                symbols=symbols,
+                quant_store=quant_store,
+                state_db=args.state_db,
+                account_mode=AccountMode.PAPER,
+                max_runtime_hours=args.max_runtime_hours,
+            )
+        return _broker_loop(
+            symbols=symbols,
+            quant_store=quant_store,
+            state_db=args.live_state_db,
+            account_mode=AccountMode.LIVE,
+            max_runtime_hours=args.max_runtime_hours,
         )
     except (BrokerError, RuntimeError, ValueError) as error:
         print(f"Runtime refused/failed: {error}", file=sys.stderr)
