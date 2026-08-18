@@ -1,15 +1,4 @@
-"""Central strategy registry: one place that knows every strategy family.
-
-The dashboard, the research factory, the lifecycle manager, and the shadow
-executor all resolve strategies through this registry, so a strategy that
-is not registered here does not exist as far as the desk is concerned.
-
-Registration is explicit and import-light: factories import their strategy
-module lazily so importing the registry never drags in every strategy's
-dependencies.  Each entry couples the factory with ``StrategyMetadata``
-(the identity used by persistence) — the metadata's ``strategy_id`` is the
-registry key.
-"""
+"""Central strategy registry: one place that knows every strategy family."""
 
 from __future__ import annotations
 
@@ -30,8 +19,6 @@ class StrategySpec:
 
 
 class StrategyRegistry:
-    """Explicit, validating registry of strategy families."""
-
     def __init__(self) -> None:
         self._specs: dict[str, StrategySpec] = {}
 
@@ -68,62 +55,57 @@ class StrategyRegistry:
         return len(self._specs)
 
 
-def _make_regime_breakout(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_regime_breakout(config):
     from crypto_strategy import CryptoRegimeStrategy
-
     return CryptoRegimeStrategy(config)
 
 
-def _make_cross_sectional(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_cross_sectional(config):
     from cross_sectional import CrossSectionalMomentumStrategy, resolve_cross_config
-
     return CrossSectionalMomentumStrategy(config, resolve_cross_config(config))
 
 
-def _make_mean_reversion(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_mean_reversion(config):
     from mean_reversion import MeanReversionStrategy, resolve_mean_reversion_config
-
     return MeanReversionStrategy(config, resolve_mean_reversion_config(config))
 
 
-def _make_volatility_regime(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_volatility_regime(config):
     from volatility_regime import VolatilityRegimeStrategy, resolve_volatility_config
-
     return VolatilityRegimeStrategy(config, resolve_volatility_config(config))
 
 
-def _make_donchian_trend(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_donchian_trend(config):
     from quant.strategies.donchian_trend import DonchianTrendStrategy
-
     return DonchianTrendStrategy(config)
 
 
-def _make_opening_range_breakout(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_opening_range_breakout(config):
     from quant.strategies.opening_range import OpeningRangeBreakoutStrategy
-
     return OpeningRangeBreakoutStrategy(config)
 
 
-def _make_vwap_reversion(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_vwap_reversion(config):
     from quant.strategies.vwap_reversion import VwapReversionStrategy
-
     return VwapReversionStrategy(config)
 
 
-def _make_volatility_squeeze(config: CryptoStrategyConfig) -> UniverseStrategy:
+def _make_volatility_squeeze(config):
     from quant.strategies.volatility_squeeze import VolatilitySqueezeStrategy
-
     return VolatilitySqueezeStrategy(config)
 
 
+def _make_intraday_momentum(config):
+    from quant.strategies.intraday_momentum import IntradayMomentumStrategy
+    return IntradayMomentumStrategy(config)
+
+
+def _make_intraday_adaptive(config):
+    from quant.strategies.intraday_adaptive import AdaptiveIntradayStrategy
+    return AdaptiveIntradayStrategy(config)
+
+
 def build_default_registry() -> StrategyRegistry:
-    """The production registry: every strategy family the desk knows.
-
-    States are NOT stored here — deployment state lives in the lifecycle
-    store.  Every entry starts life as a hypothesis; the research notes in
-    each hypothesis string record what has already been measured.
-    """
-
     registry = StrategyRegistry()
     registry.register(
         StrategyMetadata(
@@ -149,9 +131,8 @@ def build_default_registry() -> StrategyRegistry:
             version="1.0.0",
             hypothesis=(
                 "Ranking the universe by risk-adjusted momentum and holding the "
-                "strongest names beats holding any fixed subset. Measured: best "
-                "expectancy of the family (PF 1.48, Sharpe 0.52) but loses to "
-                "buy-and-hold on compounded return because sizing stays mostly in cash."
+                "strongest names earns positive net expectancy. Existing real-data "
+                "evidence is positive but insufficient for promotion."
             ),
             markets=(Market.CRYPTO,),
             natural_timeframes=("4Hour", "1Day"),
@@ -162,12 +143,55 @@ def build_default_registry() -> StrategyRegistry:
     )
     registry.register(
         StrategyMetadata(
+            strategy_id="crypto_intraday_adaptive",
+            name="Adaptive intraday alpha ensemble v2",
+            version="2.0.0",
+            hypothesis=(
+                "Routing causal momentum, breakout, pullback and range-reversion "
+                "sleeves by current cross-sectional regime captures more independent "
+                "intraday opportunities than one always-on signal while stress, "
+                "execution-cost and evidence gates suppress adverse conditions."
+            ),
+            markets=(Market.CRYPTO,),
+            natural_timeframes=("5Min", "15Min"),
+            horizon_bars=12,
+            tags=(
+                "intraday",
+                "adaptive",
+                "ensemble",
+                "momentum",
+                "breakout",
+                "mean_reversion",
+                "high_velocity",
+            ),
+        ),
+        _make_intraday_adaptive,
+    )
+    registry.register(
+        StrategyMetadata(
+            strategy_id="crypto_intraday_momentum",
+            name="Intraday cross-sectional momentum (legacy v1)",
+            version="1.0.0",
+            hypothesis=(
+                "On liquid crypto pairs, short-horizon risk-adjusted momentum leaders "
+                "with non-degenerate volume persist long enough on 5-15 minute bars "
+                "to cover spread, slippage and fees; rank hysteresis limits churn."
+            ),
+            markets=(Market.CRYPTO,),
+            natural_timeframes=("5Min", "15Min"),
+            horizon_bars=12,
+            tags=("intraday", "momentum", "cross_sectional", "high_velocity", "legacy"),
+        ),
+        _make_intraday_momentum,
+    )
+    registry.register(
+        StrategyMetadata(
             strategy_id="crypto_mean_reversion",
             name="Oversold mean reversion",
             version="1.0.0",
             hypothesis=(
-                "Sharp short-term dislocations below a rising long-term trend "
-                "revert often enough to pay their costs."
+                "Sharp short-term dislocations below a rising long-term trend revert "
+                "often enough to pay their costs."
             ),
             markets=(Market.CRYPTO,),
             natural_timeframes=("1Hour", "4Hour"),
@@ -182,8 +206,8 @@ def build_default_registry() -> StrategyRegistry:
             name="Volatility-regime trend",
             version="1.0.0",
             hypothesis=(
-                "Trend entries filtered by a volatility-regime classifier avoid "
-                "the chop that destroys unfiltered trend systems."
+                "Trend entries filtered by a volatility-regime classifier avoid the "
+                "chop that destroys unfiltered trend systems."
             ),
             markets=(Market.CRYPTO,),
             natural_timeframes=("4Hour", "1Day"),
@@ -198,8 +222,8 @@ def build_default_registry() -> StrategyRegistry:
             name="Volatility-adjusted Donchian trend",
             version="1.0.0",
             hypothesis=(
-                "New N-bar highs with ATR-scaled stops capture the fat right "
-                "tail of trends; volatility scaling keeps risk per trade level."
+                "New N-bar highs with ATR-scaled stops capture the fat right tail of "
+                "trends; volatility scaling keeps risk per trade level."
             ),
             markets=(Market.CRYPTO, Market.US_EQUITY),
             natural_timeframes=("4Hour", "1Day"),
@@ -214,8 +238,8 @@ def build_default_registry() -> StrategyRegistry:
             name="Opening-range breakout",
             version="1.0.0",
             hypothesis=(
-                "A break of the first-hour range on elevated relative volume "
-                "continues intraday more often than it reverses, net of spread."
+                "A break of the first-hour range on elevated relative volume continues "
+                "intraday more often than it reverses, net of spread."
             ),
             markets=(Market.US_EQUITY,),
             natural_timeframes=("5Min", "15Min"),
@@ -230,8 +254,8 @@ def build_default_registry() -> StrategyRegistry:
             name="VWAP overextension reversion",
             version="1.0.0",
             hypothesis=(
-                "Intraday stretches far below session VWAP in a non-trending "
-                "tape revert toward VWAP with enough frequency to pay costs."
+                "Intraday stretches far below session VWAP in a non-trending tape "
+                "revert toward VWAP with enough frequency to pay costs."
             ),
             markets=(Market.US_EQUITY, Market.CRYPTO),
             natural_timeframes=("5Min", "15Min"),

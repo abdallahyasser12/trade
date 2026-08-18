@@ -1,29 +1,20 @@
-"""Strategy marketplace: rolling statistics from attribution rows (spec §23).
+"""Strategy marketplace: rolling statistics from attribution rows.
 
-Strategies are internal portfolio managers; the marketplace is their
-performance record.  Everything is computed from persisted attribution
-rows so the numbers survive restarts and are auditable back to trades.
-Statistics below the minimum sample are None — a None is "unmeasured",
-and no consumer may present it as a measurement.
-
-Regime buckets (spec §9) are the measured answer to "which strategy works
-in which environment": per-regime expectancy from actual attributed
-trades, buckets under five trades excluded rather than reported.
+Lifecycle callers may scope health to ``since`` a state transition. This is
+critical for rung-specific evidence: PAPER trades must not count as CANARY trades,
+and old favorable history must not hide degradation in the current deployment.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from quant.contracts import StrategyHealth, StrategyState
 from quant.store import QuantStore
 
-# Below this many clean trades every statistic except counts and net P&L
-# is reported as None (unmeasured).
 MIN_SAMPLE = 10
-# Regime buckets need their own floor; five trades is already thin but
-# enough to stop single-trade buckets from masquerading as evidence.
 MIN_REGIME_SAMPLE = 5
 
 
@@ -35,6 +26,18 @@ def _finite(value: Any) -> Optional[float]:
     return converted if math.isfinite(converted) else None
 
 
+def _parse_utc(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
 def compute_strategy_health(
     store: QuantStore,
     strategy_id: str,
@@ -42,11 +45,26 @@ def compute_strategy_health(
     *,
     include_shadow: bool = False,
     limit: int = 1000,
+    since: Optional[datetime] = None,
 ) -> StrategyHealth:
+    """Compute strategy statistics, optionally only from rows recorded since ``since``."""
+    if since is not None:
+        if since.tzinfo is None:
+            raise ValueError("Strategy-health 'since' must be timezone-aware.")
+        since = since.astimezone(timezone.utc)
+
     rows = store.get_attributions(
         strategy_id=strategy_id, include_shadow=include_shadow, limit=limit
     )
-    # Chronological order for the drawdown curve (rows arrive newest-first).
+    if since is not None:
+        filtered = []
+        for row in rows:
+            recorded = _parse_utc(row.get("recorded_at"))
+            if recorded is not None and recorded >= since:
+                filtered.append(row)
+        rows = filtered
+
+    # Store returns newest first; drawdown must be computed chronologically.
     rows = list(reversed(rows))
     r_values: list[float] = []
     net_pnl = 0.0
@@ -96,8 +114,6 @@ def compute_strategy_health(
     negative = abs(sum(r for r in r_values if r <= 0))
     profit_factor = positive / negative if negative > 0 else None
 
-    # Max drawdown of the cumulative R curve, in R units (the contract the
-    # lifecycle's shadow-drawdown gate reads).
     cumulative = 0.0
     peak = 0.0
     max_drawdown = 0.0
@@ -117,7 +133,7 @@ def compute_strategy_health(
         regime_performance[regime] = {
             "trades": float(len(values)),
             "avg_r": sum(values) / len(values),
-            "hit_rate": sum(1 for v in values if v > 0) / len(values),
+            "hit_rate": sum(1 for value in values if value > 0) / len(values),
         }
 
     return StrategyHealth(
@@ -142,13 +158,6 @@ def compute_strategy_health(
 def regime_compatibility(
     health: StrategyHealth, regime_label: str
 ) -> Optional[float]:
-    """Measured strategy-regime fit in (0, 1); None when unmeasured.
-
-    A logistic squash of the bucket's average R: 0R -> 0.5 (neutral),
-    strongly positive expectancy saturates toward 1, strongly negative
-    toward 0.  The ranker treats None as neutral rather than punishing
-    the absence of evidence.
-    """
     bucket = health.regime_performance.get(regime_label)
     if not bucket:
         return None

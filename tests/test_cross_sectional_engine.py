@@ -1,9 +1,4 @@
-"""The cross-sectional live adapter must inherit every audited safety property.
-
-Swapping a decision layer is the only difference this engine is permitted to
-make. If any of these fail, the adapter has quietly forked the execution path
-that the rest of the test suite exists to protect.
-"""
+"""Cross-sectional adapter safety and Quant Desk lifecycle integration tests."""
 
 from datetime import timedelta
 
@@ -12,22 +7,31 @@ import pytest
 from config import AccountMode
 from cross_sectional import CrossSectionalConfig, CrossSectionalMomentumStrategy
 from cross_sectional_engine import (
+    STRATEGY_ID,
     CrossSectionalCryptoTradeEngine,
     make_cross_sectional_crypto_engine,
 )
 from crypto_config import CryptoEngineConfig, CryptoRiskConfig
 from crypto_engine import CRYPTO_KILL_SWITCH_KEY, CryptoTradeEngine
 from models import AccountInfo
+from quant.contracts import StrategyState
+from quant.production_runtime import QuantControlledCryptoTradeEngine
+from quant.store import QuantStore
 from state_store import StateStore
 from tests.crypto_helpers import breakout_bars, compact_crypto_config
-from tests.test_crypto_engine import FakeBroker, FakeFeed, asset
+from tests.test_crypto_engine import FakeBroker, FakeFeed
 
 
-def _make(tmp_path, cross_config=None, broker=None):
+def _make(tmp_path, cross_config=None, broker=None, lifecycle_state=StrategyState.PAPER):
     frame = breakout_bars(periods=31)
     now = frame.index[-1].to_pydatetime() + timedelta(hours=1, seconds=10)
     broker = broker or FakeBroker()
     store = StateStore(str(tmp_path / "crypto.db"))
+    quant_store = QuantStore(str(tmp_path / "quant.db"))
+    if lifecycle_state is not StrategyState.RESEARCH:
+        quant_store.set_strategy_state(
+            STRATEGY_ID, StrategyState.RESEARCH, lifecycle_state, reason="test"
+        )
     feed = FakeFeed({"BTC/USD": frame}, now)
     engine = make_cross_sectional_crypto_engine(
         broker,
@@ -38,23 +42,19 @@ def _make(tmp_path, cross_config=None, broker=None):
         CryptoEngineConfig(poll_interval_seconds=5),
         cross_config=cross_config,
         now_fn=lambda: now,
+        quant_store=quant_store,
     )
-    return engine, broker, store, now
+    return engine, broker, store, quant_store, now
 
 
-def test_it_is_the_production_engine_with_only_the_strategy_replaced(tmp_path):
-    engine, _, _, _ = _make(tmp_path)
+def test_it_uses_audited_execution_engine_plus_quant_gate(tmp_path):
+    engine, _, _, _, _ = _make(tmp_path)
     assert isinstance(engine, CryptoTradeEngine)
+    assert isinstance(engine, QuantControlledCryptoTradeEngine)
     assert isinstance(engine.strategy, CrossSectionalMomentumStrategy)
 
 
-def test_every_execution_method_is_inherited_not_overridden(tmp_path):
-    """The adapter must not fork the audited execution path.
-
-    Anything it redefines is code the rest of the suite is no longer testing,
-    so the set of overrides is pinned to exactly the constructor.
-    """
-
+def test_adapter_itself_does_not_fork_execution_methods(tmp_path):
     overridden = {
         name
         for name, value in vars(CrossSectionalCryptoTradeEngine).items()
@@ -64,8 +64,6 @@ def test_every_execution_method_is_inherited_not_overridden(tmp_path):
 
 
 def test_an_invalid_configuration_is_refused_at_construction(tmp_path):
-    """A bad config must fail before an engine exists, not mid-session."""
-
     with pytest.raises(ValueError, match="cross-sectional"):
         _make(tmp_path, cross_config=CrossSectionalConfig(top_k=0))
     with pytest.raises(ValueError, match="falling assets"):
@@ -73,15 +71,26 @@ def test_an_invalid_configuration_is_refused_at_construction(tmp_path):
 
 
 def test_it_carries_the_configuration_it_was_given(tmp_path):
-    engine, _, _, _ = _make(tmp_path, cross_config=CrossSectionalConfig(top_k=1, lookback=12))
+    engine, _, _, _, _ = _make(
+        tmp_path, cross_config=CrossSectionalConfig(top_k=1, lookback=12)
+    )
     assert engine.strategy.cross_config.top_k == 1
     assert engine.strategy.cross_config.lookback == 12
 
 
-def test_the_session_loss_latch_still_arms_the_kill_switch(tmp_path):
-    """Inherited, but worth proving: this is the last line before a bad day."""
+def test_research_state_cannot_start_broker_backed_adapter(tmp_path):
+    engine, _, _, quant_store, _ = _make(
+        tmp_path, lifecycle_state=StrategyState.RESEARCH
+    )
+    try:
+        with pytest.raises(Exception, match="requires lifecycle state PAPER"):
+            engine._startup()
+    finally:
+        quant_store.close()
 
-    engine, broker, store, _ = _make(tmp_path)
+
+def test_the_session_loss_latch_still_arms_the_kill_switch(tmp_path):
+    engine, broker, store, _, _ = _make(tmp_path)
     engine._startup()
     engine._starting_equity = 100_000
     broker.account = AccountInfo(97_000, 97_000, 97_000, "ACTIVE", "USD", False, 0, False)
@@ -92,15 +101,13 @@ def test_the_session_loss_latch_still_arms_the_kill_switch(tmp_path):
 
 
 def test_it_is_hardwired_to_the_same_paper_isolation(tmp_path):
-    engine, broker, _, _ = _make(tmp_path)
+    engine, broker, _, _, _ = _make(tmp_path)
     assert broker.account_mode is AccountMode.PAPER
     assert engine.engine_config.account_mode is AccountMode.PAPER
 
 
-def test_the_stop_watchdog_is_the_audited_one(tmp_path):
-    """Reached through the adapter, the watchdog must behave identically."""
-
-    engine, _, _, _ = _make(tmp_path)
+def test_stop_watchdog_remains_the_audited_parent_implementation(tmp_path):
+    engine, _, _, _, _ = _make(tmp_path)
     assert (
         CrossSectionalCryptoTradeEngine._run_stop_watchdogs
         is CryptoTradeEngine._run_stop_watchdogs

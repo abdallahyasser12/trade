@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from typing import Any, Optional
 
@@ -14,11 +14,12 @@ from config import AccountMode, TIMEFRAMES, default_poll_interval
 DEFAULT_CRYPTO_UNIVERSE = ("BTC/USD", "ETH/USD", "SOL/USD")
 CRYPTO_SESSION_SYMBOL = "CRYPTO_PORTFOLIO"
 _CRYPTO_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,10}/USD$")
+# Process-local capability token. A normal UI/config/env value cannot accidentally
+# turn a legacy CryptoTradeEngine into a real-money engine.
+_QUANT_LIVE_SENTINEL = object()
 
 
 def validate_crypto_symbol(symbol: str) -> Optional[str]:
-    """Return a validation error for a non-USD Alpaca crypto pair."""
-
     if not isinstance(symbol, str) or not symbol:
         return "Crypto symbol is required."
     if not _CRYPTO_SYMBOL_RE.fullmatch(symbol):
@@ -32,8 +33,6 @@ def validate_crypto_symbol(symbol: str) -> Optional[str]:
 
 
 def crypto_bars_per_year(timeframe: str) -> float:
-    """Annualization factor for a market that trades continuously."""
-
     factors = {
         "1Min": 365.25 * 24 * 60,
         "5Min": 365.25 * 24 * 12,
@@ -50,8 +49,6 @@ def crypto_bars_per_year(timeframe: str) -> float:
 
 @dataclass(frozen=True)
 class CryptoStrategyConfig:
-    """Causal multi-factor regime and breakout decision model."""
-
     symbols: tuple[str, ...] = DEFAULT_CRYPTO_UNIVERSE
     timeframe: str = "1Hour"
     benchmark_symbol: str = "BTC/USD"
@@ -173,8 +170,6 @@ class CryptoStrategyConfig:
 
 @dataclass(frozen=True)
 class CryptoRiskConfig:
-    """Portfolio, loss, and fractional-sizing constraints."""
-
     risk_per_trade_pct: float = 0.35
     max_position_pct: float = 10.0
     max_total_exposure_pct: float = 30.0
@@ -188,16 +183,7 @@ class CryptoRiskConfig:
     volatility_target_percentile: float = 50.0
     max_live_order_notional: float = 1_000.0
     max_live_total_exposure_pct: float = 10.0
-    # Round-trip friction as a fraction of the trade's own risk unit. The
-    # default rejects only the indefensible case of paying at least a whole
-    # 1R in costs; tighten it toward 0.25 once walk-forward has been re-run
-    # with the honest number in view.
     max_cost_to_risk: float = 1.0
-    # Enforced ceiling on the SUM of open risk (distance to each protective
-    # stop, marked from the latest price) as a percent of equity. Previously
-    # total heat was only an emergent product of max_positions multiplied by
-    # risk_per_trade_pct; the default equals that product so behaviour is
-    # unchanged until an operator raises positions or per-trade risk.
     max_portfolio_heat_pct: float = 1.05
 
     def validate(self) -> list[str]:
@@ -250,8 +236,6 @@ class CryptoRiskConfig:
 
 @dataclass(frozen=True)
 class CryptoEngineConfig:
-    """Immutable 24/7 engine and execution policy."""
-
     account_mode: AccountMode = AccountMode.PAPER
     poll_interval_seconds: Optional[float] = None
     max_runtime_seconds: Optional[float] = None
@@ -263,20 +247,28 @@ class CryptoEngineConfig:
     stop_watchdog_grace_seconds: float = 15.0
     stop_watchdog_min_confirmations: int = 2
     position_open_poll_interval_seconds: float = 5.0
-    # Live-path friction assumptions. The spread is measured from the live
-    # quote; these cover the parts a quote cannot show. Keep them aligned
-    # with the backtest cost settings or simulation and live will disagree.
     taker_fee_bps: float = 25.0
     expected_slippage_bps: float = 10.0
     entry_order_timeout_seconds: float = 120.0
     fill_poll_attempts: int = 3
+    # Private capability minted only by QuantControlledCryptoTradeEngine.
+    _quant_live_authorization: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def validate(self) -> list[str]:
         errors: list[str] = []
         try:
-            AccountMode(self.account_mode)
+            mode = AccountMode(self.account_mode)
         except ValueError:
+            mode = None
             errors.append("Account mode must be paper or live.")
+        if mode is AccountMode.LIVE and self._quant_live_authorization is not _QUANT_LIVE_SENTINEL:
+            errors.append(
+                "LIVE crypto execution is restricted to the Quant-controlled lifecycle runtime."
+            )
         for label, value in {
             "polling interval": self.poll_interval_seconds,
             "maximum runtime": self.max_runtime_seconds,
@@ -326,14 +318,6 @@ class CryptoEngineConfig:
         return self.poll_interval_seconds or default_poll_interval(timeframe)
 
     def exposed_poll_interval(self, timeframe: str) -> float:
-        """Polling cadence while capital is exposed.
-
-        Requiring repeated breach confirmations is only safe if the engine also
-        looks more often while it has something to protect; at the 1Hour default
-        of 120s a two-poll confirmation would delay a real stop escalation by
-        four minutes.  Never slower than the idle cadence.
-        """
-
         return min(
             self.resolved_poll_interval(timeframe),
             self.position_open_poll_interval_seconds,
@@ -341,14 +325,21 @@ class CryptoEngineConfig:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data.pop("_quant_live_authorization", None)
         data["account_mode"] = AccountMode(self.account_mode).value
         return data
 
 
+
+def _authorize_quant_live_engine_config(config: CryptoEngineConfig) -> CryptoEngineConfig:
+    """Mint the private LIVE capability for the lifecycle-controlled runtime only."""
+    if AccountMode(config.account_mode) is not AccountMode.LIVE:
+        return config
+    return replace(config, _quant_live_authorization=_QUANT_LIVE_SENTINEL)
+
+
 @dataclass(frozen=True)
 class CryptoBacktestConfig:
-    """Realistic percentage-cost portfolio simulation settings."""
-
     start_date: date = field(default_factory=lambda: date(2023, 1, 1))
     end_date: date = field(default_factory=lambda: date(2025, 12, 31))
     initial_capital: float = 100_000.0

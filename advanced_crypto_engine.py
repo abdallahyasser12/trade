@@ -1,4 +1,8 @@
-"""Live/paper engine adapter for the regime-aware ensemble."""
+"""Live/paper engine adapter for the regime-aware ensemble.
+
+Broker execution/protection still comes from the audited crypto engine. Quant Desk
+is now authoritative for lifecycle, measured-alpha and pre-trade portfolio gates.
+"""
 
 from __future__ import annotations
 
@@ -8,19 +12,19 @@ from typing import Callable, Optional
 from broker import AlpacaBroker
 from crypto_config import CryptoEngineConfig, CryptoRiskConfig, CryptoStrategyConfig
 from crypto_data_feed import AlpacaCryptoDataFeed
-from crypto_engine import CryptoTradeEngine
+from quant.lifecycle import LifecycleManager
+from quant.production_runtime import QuantControlledCryptoTradeEngine
+from quant.scanner import QuantScanner
+from quant.store import QuantStore
 from regime_ensemble import EnsembleConfig, RegimeAwareEnsembleStrategy
 from state_store import StateStore
 
 
-class RegimeAwareCryptoTradeEngine(CryptoTradeEngine):
-    """Use the production execution engine with the ensemble decision layer.
+STRATEGY_ID = "crypto_regime_ensemble"
 
-    The parent class still owns broker verification, account-mode isolation,
-    session-loss latching, quote/spread validation, correlation gates,
-    fractional sizing, deterministic client IDs, partial-fill reconciliation,
-    protective stop-limit management, watchdog exits, and crash recovery.
-    """
+
+class RegimeAwareCryptoTradeEngine(QuantControlledCryptoTradeEngine):
+    """Regime ensemble using the production execution path plus Quant Desk gate."""
 
     def __init__(
         self,
@@ -33,8 +37,16 @@ class RegimeAwareCryptoTradeEngine(CryptoTradeEngine):
         *,
         ensemble_config: Optional[EnsembleConfig] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
+        quant_store: Optional[QuantStore] = None,
+        lifecycle: Optional[LifecycleManager] = None,
+        scanner: Optional[QuantScanner] = None,
     ):
-        kwargs = {}
+        kwargs = {
+            "strategy_id": STRATEGY_ID,
+            "quant_store": quant_store,
+            "lifecycle": lifecycle,
+            "scanner": scanner,
+        }
         if now_fn is not None:
             kwargs["now_fn"] = now_fn
         super().__init__(
@@ -47,10 +59,7 @@ class RegimeAwareCryptoTradeEngine(CryptoTradeEngine):
             **kwargs,
         )
         self.ensemble_config = ensemble_config or EnsembleConfig()
-        self.strategy = RegimeAwareEnsembleStrategy(
-            strategy_config,
-            self.ensemble_config,
-        )
+        self.strategy = RegimeAwareEnsembleStrategy(strategy_config, self.ensemble_config)
 
 
 def make_regime_aware_crypto_engine(
@@ -63,9 +72,10 @@ def make_regime_aware_crypto_engine(
     *,
     ensemble_config: Optional[EnsembleConfig] = None,
     now_fn: Optional[Callable[[], datetime]] = None,
+    quant_store: Optional[QuantStore] = None,
+    lifecycle: Optional[LifecycleManager] = None,
+    scanner: Optional[QuantScanner] = None,
 ) -> RegimeAwareCryptoTradeEngine:
-    """Explicit factory used by deployments that opt into ensemble-v2."""
-
     return RegimeAwareCryptoTradeEngine(
         broker,
         data_feed,
@@ -75,4 +85,7 @@ def make_regime_aware_crypto_engine(
         engine_config,
         ensemble_config=ensemble_config,
         now_fn=now_fn,
+        quant_store=quant_store,
+        lifecycle=lifecycle,
+        scanner=scanner,
     )

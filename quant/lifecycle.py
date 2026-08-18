@@ -1,17 +1,9 @@
-"""Evidence-based strategy lifecycle (spec §§24-27, 45, 66).
+"""Evidence-based strategy lifecycle.
 
-The ladder RESEARCH -> SHADOW -> PAPER -> LIVE_CANARY -> LIVE is climbed
-one rung at a time, each rung demanding its own evidence; demotion is
-allowed to be abrupt (any state can fall to REDUCED_RISK, QUARANTINE,
-SHADOW, or RESEARCH at any time).  Two structural rules can never be
-configured away:
-
-* No strategy promotes itself.  Promotion evaluates recorded evidence —
-  research runs, shadow/paper/canary health, measured execution samples —
-  and recent P&L alone is not evidence.
-* Any transition INTO a live state (LIVE_CANARY, LIVE) additionally
-  requires an explicit operator acknowledgement.  The platform can
-  recommend; only a human can arm.
+RESEARCH -> SHADOW -> PAPER -> LIVE_CANARY -> LIVE advances one rung at a
+time. Every forward rung must demonstrate both adequate sample size *and* acceptable
+health; accumulating enough losing trades is never sufficient for promotion.
+Any live transition also requires an explicit operator acknowledgement.
 """
 
 from __future__ import annotations
@@ -29,8 +21,6 @@ from quant.contracts import (
 )
 from quant.store import QuantStore
 
-# Capital multiplier per state.  PAPER's 1.0 applies to paper capital
-# only; LIVE_CANARY deliberately trades a fraction of normal size.
 _STATE_RISK_MULTIPLIER = {
     StrategyState.RESEARCH: 0.0,
     StrategyState.SHADOW: 0.0,
@@ -41,7 +31,6 @@ _STATE_RISK_MULTIPLIER = {
     StrategyState.QUARANTINE: 0.0,
 }
 
-# Risk ordering used to refuse "demotions" that would raise privilege.
 _PRIVILEGE_ORDER = {
     StrategyState.RESEARCH: 0,
     StrategyState.QUARANTINE: 0,
@@ -56,11 +45,23 @@ _PRIVILEGE_ORDER = {
 @dataclass(frozen=True)
 class PromotionRequirements:
     min_research_trades: int = 15
+
     min_shadow_trades: int = 20
+    min_shadow_expectancy_r: float = 0.0
+    min_shadow_profit_factor: float = 1.0
     max_shadow_drawdown_r: float = 6.0
+
     min_paper_trades: int = 30
+    min_paper_expectancy_r: float = 0.0
+    min_paper_profit_factor: float = 1.0
+    max_paper_drawdown_r: float = 8.0
     min_measured_execution_samples: int = 20
+
     min_canary_trades: int = 20
+    min_canary_expectancy_r: float = 0.0
+    min_canary_profit_factor: float = 1.0
+    max_canary_drawdown_r: float = 6.0
+
     max_open_operational_defects: int = 0
 
     def validate(self) -> list[str]:
@@ -75,8 +76,26 @@ class PromotionRequirements:
         for label, value in counts.items():
             if value < 1:
                 errors.append(f"Minimum {label} must be at least 1.")
-        if not math.isfinite(self.max_shadow_drawdown_r) or self.max_shadow_drawdown_r <= 0:
-            errors.append("Shadow drawdown ceiling must be finite and positive.")
+
+        for label, value in {
+            "shadow expectancy floor": self.min_shadow_expectancy_r,
+            "paper expectancy floor": self.min_paper_expectancy_r,
+            "canary expectancy floor": self.min_canary_expectancy_r,
+        }.items():
+            if not math.isfinite(value):
+                errors.append(f"{label} must be finite.")
+
+        for label, value in {
+            "shadow profit-factor floor": self.min_shadow_profit_factor,
+            "paper profit-factor floor": self.min_paper_profit_factor,
+            "canary profit-factor floor": self.min_canary_profit_factor,
+            "shadow drawdown ceiling": self.max_shadow_drawdown_r,
+            "paper drawdown ceiling": self.max_paper_drawdown_r,
+            "canary drawdown ceiling": self.max_canary_drawdown_r,
+        }.items():
+            if not math.isfinite(value) or value <= 0:
+                errors.append(f"{label} must be finite and positive.")
+
         if self.max_open_operational_defects < 0:
             errors.append("Operational-defect ceiling cannot be negative.")
         return errors
@@ -84,9 +103,6 @@ class PromotionRequirements:
 
 @dataclass
 class PromotionEvidence:
-    """Everything a promotion request may cite.  Absent evidence fails
-    the rung that needs it — never defaults in its favor."""
-
     research_run: Optional[dict[str, Any]] = None
     shadow_health: Optional[StrategyHealth] = None
     paper_health: Optional[StrategyHealth] = None
@@ -118,13 +134,54 @@ def _research_run_trades(run: dict[str, Any]) -> Optional[int]:
 
 
 def _run_passed(run: Optional[dict[str, Any]]) -> bool:
-    if not isinstance(run, dict):
-        return False
-    return bool(run.get("passed"))
+    return isinstance(run, dict) and bool(run.get("passed"))
+
+
+def _health_failures(
+    prefix: str,
+    health: Optional[StrategyHealth],
+    *,
+    min_trades: int,
+    min_expectancy_r: float,
+    min_profit_factor: float,
+    max_drawdown_r: float,
+) -> list[str]:
+    """Fail closed on every forward-health dimension required for promotion."""
+    if health is None:
+        return [f"{prefix}_health_missing"]
+
+    failures: list[str] = []
+    if health.trades < min_trades:
+        failures.append(f"{prefix}_trades_{health.trades}_below_{min_trades}")
+
+    expectancy = health.expectancy_r
+    if expectancy is None or not math.isfinite(expectancy):
+        failures.append(f"{prefix}_expectancy_unmeasured")
+    elif expectancy < min_expectancy_r:
+        failures.append(
+            f"{prefix}_expectancy_{expectancy:.4f}R_below_{min_expectancy_r:.4f}R"
+        )
+
+    profit_factor = health.profit_factor
+    if profit_factor is None or not math.isfinite(profit_factor):
+        failures.append(f"{prefix}_profit_factor_unmeasured")
+    elif profit_factor < min_profit_factor:
+        failures.append(
+            f"{prefix}_profit_factor_{profit_factor:.4f}_below_{min_profit_factor:.4f}"
+        )
+
+    drawdown = health.max_drawdown_pct
+    if drawdown is None or not math.isfinite(drawdown):
+        failures.append(f"{prefix}_drawdown_unmeasured")
+    elif drawdown > max_drawdown_r:
+        failures.append(
+            f"{prefix}_drawdown_{drawdown:.2f}R_above_{max_drawdown_r:.2f}R"
+        )
+    return failures
 
 
 class LifecycleManager:
-    """Owns every state transition; persistence through the quant store."""
+    """Own every legal state transition and persist its evidence."""
 
     def __init__(
         self,
@@ -139,9 +196,7 @@ class LifecycleManager:
 
     def state(self, strategy_id: str) -> StrategyState:
         row = self.store.get_strategy_state(strategy_id)
-        if row is None:
-            return StrategyState.RESEARCH
-        return StrategyState(row["state"])
+        return StrategyState.RESEARCH if row is None else StrategyState(row["state"])
 
     def risk_multiplier(self, strategy_id: str) -> float:
         return _STATE_RISK_MULTIPLIER[self.state(strategy_id)]
@@ -191,29 +246,28 @@ class LifecycleManager:
                     failures.append("research_run_missing_trial_count")
 
         elif target is StrategyState.PAPER:
-            health = evidence.shadow_health
-            if health is None:
-                failures.append("shadow_health_missing")
-            else:
-                if health.trades < req.min_shadow_trades:
-                    failures.append(
-                        f"shadow_trades_{health.trades}_below_{req.min_shadow_trades}"
-                    )
-                # Shadow drawdown is measured on the cumulative R curve, in
-                # R units (marketplace contract for max_drawdown_pct).
-                if health.max_drawdown_pct is None:
-                    failures.append("shadow_drawdown_unmeasured")
-                elif health.max_drawdown_pct > req.max_shadow_drawdown_r:
-                    failures.append(
-                        f"shadow_drawdown_{health.max_drawdown_pct:.2f}R_above_"
-                        f"{req.max_shadow_drawdown_r}R"
-                    )
+            failures.extend(
+                _health_failures(
+                    "shadow",
+                    evidence.shadow_health,
+                    min_trades=req.min_shadow_trades,
+                    min_expectancy_r=req.min_shadow_expectancy_r,
+                    min_profit_factor=req.min_shadow_profit_factor,
+                    max_drawdown_r=req.max_shadow_drawdown_r,
+                )
+            )
 
         elif target is StrategyState.LIVE_CANARY:
-            health = evidence.paper_health
-            if health is None or health.trades < req.min_paper_trades:
-                observed = 0 if health is None else health.trades
-                failures.append(f"paper_trades_{observed}_below_{req.min_paper_trades}")
+            failures.extend(
+                _health_failures(
+                    "paper",
+                    evidence.paper_health,
+                    min_trades=req.min_paper_trades,
+                    min_expectancy_r=req.min_paper_expectancy_r,
+                    min_profit_factor=req.min_paper_profit_factor,
+                    max_drawdown_r=req.max_paper_drawdown_r,
+                )
+            )
             if evidence.measured_execution_samples < req.min_measured_execution_samples:
                 failures.append(
                     f"measured_execution_samples_{evidence.measured_execution_samples}"
@@ -227,20 +281,34 @@ class LifecycleManager:
                 failures.append("operator_ack_required_for_live_states")
 
         elif target is StrategyState.LIVE:
-            health = evidence.canary_health
-            if health is None or health.trades < req.min_canary_trades:
-                observed = 0 if health is None else health.trades
-                failures.append(f"canary_trades_{observed}_below_{req.min_canary_trades}")
+            failures.extend(
+                _health_failures(
+                    "canary",
+                    evidence.canary_health,
+                    min_trades=req.min_canary_trades,
+                    min_expectancy_r=req.min_canary_expectancy_r,
+                    min_profit_factor=req.min_canary_profit_factor,
+                    max_drawdown_r=req.max_canary_drawdown_r,
+                )
+            )
             if not operator_ack:
                 failures.append("operator_ack_required_for_live_states")
 
-        if target in LIVE_STATES and not operator_ack and "operator_ack_required_for_live_states" not in failures:
+        if (
+            target in LIVE_STATES
+            and not operator_ack
+            and "operator_ack_required_for_live_states" not in failures
+        ):
             failures.append("operator_ack_required_for_live_states")
 
         if failures:
             return LifecyclePromotionDecision(
-                approved=False, from_state=current, to_state=target, failures=failures
+                approved=False,
+                from_state=current,
+                to_state=target,
+                failures=failures,
             )
+
         self.store.set_strategy_state(
             strategy_id,
             current,
@@ -254,7 +322,10 @@ class LifecycleManager:
             operator_ack=operator_ack,
         )
         return LifecyclePromotionDecision(
-            approved=True, from_state=current, to_state=target, failures=[]
+            approved=True,
+            from_state=current,
+            to_state=target,
+            failures=[],
         )
 
     def demote(
@@ -264,15 +335,17 @@ class LifecycleManager:
         reason: str,
         evidence: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Move a strategy to a lower-privilege state.  Never needs an ack;
-        refuses to smuggle in a privilege INCREASE."""
         current = self.state(strategy_id)
         if _PRIVILEGE_ORDER[to_state] > _PRIVILEGE_ORDER[current]:
             raise ValueError(
                 f"demote() cannot raise privilege: {current.value} -> {to_state.value}."
             )
         self.store.set_strategy_state(
-            strategy_id, current, to_state, reason=reason, evidence=evidence
+            strategy_id,
+            current,
+            to_state,
+            reason=reason,
+            evidence=evidence,
         )
 
 
@@ -304,19 +377,12 @@ class DegradationThresholds:
 
 @dataclass
 class DegradationVerdict:
-    action: str  # 'none' | 'reduce_risk' | 'quarantine'
+    action: str
     reasons: list[str] = field(default_factory=list)
 
 
 class DegradationMonitor:
-    """Detects decay early and proposes graduated responses (spec §27).
-
-    One soft-metric breach with adequate sample recommends REDUCED_RISK;
-    two or more breaches — or a hard breach (drawdown, cost inflation) —
-    recommends QUARANTINE.  Insufficient sample recommends nothing: noise
-    is not evidence, and punishing it would just randomize deployments.
-    None-valued metrics are skipped, never treated as breaches.
-    """
+    """Detect decay and propose reduce-risk/quarantine responses."""
 
     def __init__(self, thresholds: Optional[DegradationThresholds] = None):
         self.thresholds = thresholds or DegradationThresholds()
@@ -347,7 +413,10 @@ class DegradationMonitor:
             and health.expectancy_r < thresholds.min_expectancy_r
         ):
             soft.append("expectancy_collapse")
-        if calibration_ece is not None and calibration_ece > thresholds.max_calibration_ece:
+        if (
+            calibration_ece is not None
+            and calibration_ece > thresholds.max_calibration_ece
+        ):
             soft.append("calibration_failure")
         if (
             health.max_drawdown_pct is not None
@@ -361,7 +430,10 @@ class DegradationMonitor:
             hard.append("execution_cost_inflation")
 
         if hard or len(soft) >= 2:
-            return DegradationVerdict(action="quarantine", reasons=sorted(hard + soft))
+            return DegradationVerdict(
+                action="quarantine",
+                reasons=sorted(hard + soft),
+            )
         if soft:
             return DegradationVerdict(action="reduce_risk", reasons=sorted(soft))
         return DegradationVerdict(action="none", reasons=[])
