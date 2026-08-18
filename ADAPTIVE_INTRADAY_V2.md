@@ -1,14 +1,13 @@
 # Adaptive Intraday v2 — Production Path
 
-`crypto_intraday_adaptive` v2.0.0 is the preferred high-velocity research path.
-The older `crypto_intraday_momentum` v1 remains available for comparison, but its
-research, lifecycle state and execution database are isolated from v2.
+`crypto_intraday_adaptive` v2.0.0 is the preferred high-velocity research path. The
+legacy v1 momentum strategy remains isolated for comparison.
 
 The objective is many **independent, positive-expectancy** intraday opportunities.
-The requested 2%/day number is an untouched-OOS diagnostic only; it is never an
-optimizer or lifecycle promotion target.
+The requested 2%/day figure is an untouched-OOS diagnostic only; it is never an
+optimizer or lifecycle-promotion target.
 
-## Decision architecture
+## Alpha and execution architecture
 
 Completed 5-minute or 15-minute bars feed four causal sleeves:
 
@@ -17,72 +16,88 @@ Completed 5-minute or 15-minute bars feed four causal sleeves:
 3. trend pullback continuation;
 4. range mean reversion with reversal confirmation.
 
-A cross-sectional router estimates bull/range/stress/risk-off conditions from the
-benchmark, market breadth and volatility. Stress/risk-off can block entries. The
-bar-driven alpha hypothesis never uses future data or live order-book state.
+A causal cross-sectional router estimates bull/range/stress/risk-off conditions from
+the benchmark, market breadth and volatility. Stress/risk-off can block entries.
 
-Immediately before an entry, Quant Desk independently applies current quote
-freshness/spread, measured or assumed round-trip costs, statistical expectancy
-confidence, adverse-depth penalty, regime/abstention, current-book correlation,
-portfolio heat/exposure, lifecycle risk scaling and the original broker sizing,
-idempotency, reconciliation and protective-stop controls. Favorable order-book depth
-never creates alpha; adverse depth can only reduce execution quality.
+Immediately before entry, Quant Desk separately applies quote freshness/spread,
+measured or assumed round-trip costs, statistical expectancy confidence, adverse
+depth, regime/abstention, current-book correlation, portfolio heat/exposure,
+lifecycle risk scaling and the audited broker sizing/reconciliation/stop controls.
+Favorable order-book depth never creates alpha; adverse depth can only reduce
+execution quality.
 
-Quotes are refreshed every five seconds while flat and every one second while
-exposed. OHLCV history is cached until the next safely completed bar. Fresh quote and
-depth telemetry is persisted separately; telemetry failure cannot break broker
-protection.
+Adaptive sleeves also have **negative-only forward supervision**. After at least 40
+current-lifecycle real trades for a sleeve, deteriorating expectancy/PF can reduce its
+confidence; a statistically negative sleeve can be suspended. A recent winner never
+receives more than the baseline 1x confidence.
 
-## 1. Select executable symbols and run real-data research
+A new lifecycle rung may temporarily bridge only the immediately preceding qualified
+rung so PAPER/CANARY can start from zero trades. After 40 current-rung real trades,
+current-rung evidence becomes authoritative. Arbitrary older evidence is not pooled
+into v2 entry confidence.
 
-Default research uses 120 calendar days of 5-minute Alpaca data:
+Quotes refresh every five seconds while flat and every one second while exposed.
+OHLCV history is cached until the next safely completed bar. Quote/depth telemetry is
+non-blocking and cannot interrupt protective execution.
+
+## 1. Real-data research
+
+Default run:
 
 ```bash
 python scripts/run_adaptive_intraday_research.py --days 120
 ```
 
-Before downloading return history, the runner screens the active BASE/USD discovery
-pool using **current executability only**:
+Before return research, the runner screens the active BASE/USD discovery pool by
+current executability only:
 
 - BTC/USD must be eligible;
 - quote age <= 120 seconds;
 - spread <= 40 bps;
 - at least $250 top-of-book notional on each side;
-- the 12 highest-quality eligible pairs are selected, with at least 6 required.
+- select up to 12 eligible pairs, with at least 6 required.
 
-The selector does not use historical return to choose symbols. Current selected-pair
-spread is also incorporated into the modeled research cost: the 75th percentile of
-observed selected spreads becomes a floor under `--spread-bps`.
+Historical return never chooses the symbols. Current selected-pair spread also enters
+the research cost model: observed 75th-percentile spread becomes a floor under the
+configured spread assumption. An explicit `--symbols` tuple is allowed, but its exact
+order becomes part of the research identity.
 
-If `--symbols` is supplied, that exact 6-12-symbol tuple is the research universe and
-is stored with the run. For measured-cost reruns, provide cost assumptions at least
-as adverse as observed PAPER execution.
+The bounded normal grid contains 18 structural hypotheses. Selection is training-only
+inside chronological walk-forward folds, with non-overlapping OOS windows and an
+embargo. Historical trial count is accumulated into the deflated-Sharpe correction.
 
-The bounded research grid contains 18 structural hypotheses. Candidate selection is
-training-only inside chronological walk-forward folds; OOS folds do not overlap and
-are separated by an embargo. Historical trial count is accumulated into the
-deflated-Sharpe correction.
+A PASS requires all gates, including:
 
-A research PASS requires all gates, including:
-
-- at least 8 OOS folds and 300 OOS trades;
-- at least 65% positive OOS folds;
+- >=8 OOS folds and >=300 OOS trades;
+- >=65% positive OOS folds;
 - positive compounded OOS and benchmark-excess return;
-- aggregate Sharpe >= 0.85 and profit factor >= 1.18;
-- worst OOS-fold drawdown <= 8%;
-- positive return under harsher slippage/spread/fees;
-- deflated-Sharpe probability >= 0.80;
-- Monte Carlo ruin probability <= 1%;
-- at least 6 and no more than 50 OOS closed trades/day;
-- OOS expectancy >= +0.03R/trade;
+- Sharpe >=0.85 and PF >=1.18;
+- worst OOS-fold drawdown <=8%;
+- positive stressed return under worse costs;
+- deflated-Sharpe probability >=0.80;
+- Monte Carlo ruin probability <=1%;
+- >=6 and <=50 OOS closed trades/day;
+- OOS expectancy >=+0.03R/trade;
 - broad symbol participation;
-- no one symbol contributing >55% of positive symbol PnL;
-- no one OOS fold contributing >45% of positive fold return.
+- <=55% positive-PnL concentration in one symbol;
+- <=45% positive-return concentration in one OOS fold.
 
-The output separately reports geometric OOS return/day and whether 2%/day was
-observed. A result can never pass merely because that number appeared.
+The report separately prints geometric OOS return/day and whether 2%/day was observed.
+That diagnostic cannot make a failed strategy pass.
 
-## 2. Promote RESEARCH -> SHADOW and lock the universe
+Every recorded adaptive research run also gets an immutable manifest containing:
+
+- full 40-character git commit;
+- strategy ID and version;
+- timeframe;
+- exact ordered universe;
+- exact selected adaptive parameters;
+- research run ID.
+
+If the git commit cannot be resolved, adaptive research refuses to record deployable
+evidence.
+
+## 2. RESEARCH -> SHADOW locks the complete strategy identity
 
 ```bash
 python scripts/manage_strategy_lifecycle.py status \
@@ -92,30 +107,29 @@ python scripts/manage_strategy_lifecycle.py promote \
   --strategy crypto_intraday_adaptive
 ```
 
-A passing run is mandatory. When promotion succeeds, the exact researched symbol
-tuple **including order** is locked in Quant Desk. This matters because deterministic
-cross-sectional tie-breaking uses configured symbol order.
+A passing research row **and** its matching manifest are mandatory. Promotion locks
+the complete manifest, not only the symbols.
 
-Every SHADOW/PAPER/LIVE startup then loads that lock. `--symbols` on a runtime is only
-an assertion and must exactly match it. A missing or different universe fails closed.
-Changing the universe requires new research and explicit lifecycle adoption; the bot
-cannot silently trade assets it was not validated on.
+Every later SHADOW/PAPER/LIVE runtime verifies the checked-out Git SHA and reconstructs
+the exact researched timeframe, symbol order and `AdaptiveIntradayConfig` from that
+manifest. Runtime `--symbols` and `--timeframe` arguments are assertions only; they
+cannot override the researched strategy. A code/config mismatch fails closed.
 
-## 3. Continuous SHADOW forward test
+## 3. SHADOW forward evidence
 
 ```bash
 python scripts/run_adaptive_intraday_runtime.py --mode shadow
 ```
 
-SHADOW receives current Alpaca bars and quotes but submits no broker orders. Only
-forward attributions recorded since SHADOW began count. PAPER requires:
+SHADOW gets current Alpaca bars/quotes but submits no broker orders. PAPER requires
+current-SHADOW evidence:
 
 - >=100 SHADOW trades;
-- expectancy >= +0.03R/trade;
-- profit factor >=1.10;
+- expectancy >=+0.03R/trade;
+- PF >=1.10;
 - max R-drawdown <=5R.
 
-Then run the lifecycle `promote` command again.
+Then run the same lifecycle promotion command again.
 
 ## 4. PAPER execution
 
@@ -123,63 +137,66 @@ Then run the lifecycle `promote` command again.
 python scripts/run_adaptive_intraday_runtime.py --mode paper
 ```
 
-PAPER uses `data/adaptive_intraday_trading.db`. Every real exit is attributed back to
-Quant Desk. Degradation monitoring can reduce risk, demote to SHADOW or quarantine
-the strategy when expectancy, PF, drawdown or execution quality deteriorates.
+PAPER uses `data/adaptive_intraday_trading.db`. Real exits feed back into Quant Desk.
+Automatic degradation can reduce risk, demote to SHADOW or quarantine the strategy.
 
-LIVE_CANARY eligibility requires current-state evidence only:
+LIVE_CANARY eligibility requires:
 
-- >=200 PAPER trades;
-- expectancy >= +0.03R/trade;
+- >=200 current-PAPER trades;
+- expectancy >=+0.03R/trade;
 - PF >=1.10;
 - drawdown <=6R;
 - >=50 measured execution samples;
 - zero open operational defects;
-- a new passing measured-cost research run using the **same locked universe**.
+- a new passing measured-cost research run of the **exact same manifest strategy**.
 
-## 5. Re-run with measured execution costs
+## 5. Pre-CANARY measured-cost verification — no re-optimization
 
-Inspect current state and execution quality:
+Inspect PAPER execution quality:
 
 ```bash
 python scripts/manage_strategy_lifecycle.py status \
   --strategy crypto_intraday_adaptive
 ```
 
-If average measured slippage is 14.2 bps, for example:
+Then rerun the locked strategy, for example:
 
 ```bash
 python scripts/run_adaptive_intraday_research.py \
+  --locked-config \
   --days 120 \
-  --symbols <THE_LOCKED_SYMBOLS_IN_EXACT_ORDER> \
   --slippage-bps 14.2 \
   --spread-bps <CONSERVATIVE_OBSERVED_SPREAD> \
   --fee-bps 25
 ```
 
-Stress costs are automatically at least 1.5x base assumptions and never below the
-configured conservative floors. PAPER -> LIVE_CANARY additionally refuses a research
-run whose modeled slippage is below measured PAPER slippage or whose universe differs
-from the deployment lock.
+`--locked-config` loads the promoted manifest and evaluates **one exact parameter
+set**. It does not search the 18-hypothesis grid. It also requires the current Git SHA
+to equal the locked research SHA. Cost assumptions and the later data window may
+change; code, version, timeframe, universe/order and parameters may not.
+
+Stress costs remain at least 1.5x base assumptions and never below conservative
+floors. PAPER -> LIVE_CANARY refuses the rerun if its modeled slippage is below
+measured PAPER slippage or if its manifest is not the exact promoted strategy.
 
 ## 6. PAPER -> LIVE_CANARY
 
 ```bash
 python scripts/manage_strategy_lifecycle.py promote \
   --strategy crypto_intraday_adaptive \
-  --measured-research-run-id <PASSING_RUN_ID> \
+  --measured-research-run-id <PASSING_LOCKED_CONFIG_RUN_ID> \
   --operational-defects 0 \
   --live-ack I_ACCEPT_LIVE_RISK
 ```
 
-Canary risk is 25% of the strategy risk budget. From the default 0.15% base budget,
-that is at most **0.0375% equity risk/trade** before correlation, drawdown,
-volatility and portfolio reductions.
+CANARY gets 25% of the strategy risk budget. From the 0.15% base budget, that is at
+most **0.0375% equity risk/trade** before correlation, drawdown, volatility and
+portfolio reductions.
 
 ## 7. Guarded LIVE canary
 
-After configuring separate Alpaca live credentials and the repository's independent
-live-deployment gate:
+After separate live credentials and the independent live-deployment environment gate
+are configured:
 
 ```bash
 python scripts/run_adaptive_intraday_runtime.py \
@@ -187,33 +204,34 @@ python scripts/run_adaptive_intraday_runtime.py \
   --live-ack I_ACCEPT_LIVE_RISK
 ```
 
-LIVE uses `data/adaptive_intraday_live_trading.db`. The base crypto LIVE configuration
-cannot mint the Quant-controlled process-local authorization, so the legacy UI/base
-engine cannot bypass this path.
+LIVE uses `data/adaptive_intraday_live_trading.db`. The base crypto LIVE config cannot
+mint the Quant-controlled process-local authorization, so the legacy/base engine
+cannot bypass this path. Direct intraday engine construction also enforces the strict
+high-velocity lifecycle requirements and rejects weaker lifecycle managers.
 
 ## 8. LIVE_CANARY -> LIVE
 
-Full LIVE requires another explicit acknowledgement plus current-canary evidence:
+Full LIVE requires another explicit acknowledgement plus current-CANARY evidence:
 
 - >=100 real canary trades;
-- expectancy >= +0.01R/trade;
+- expectancy >=+0.01R/trade;
 - PF >=1.05;
 - drawdown <=4R.
 
-Automatic health supervision remains active after promotion.
+Continuous degradation monitoring remains active after promotion.
 
-## What iteration means
+## Iteration policy
 
-A failed run remains a failed hypothesis. Do not widen parameter ranges on the same
-sample until a desired percentage appears. A materially new signal idea receives a
-new hypothesis/version, cumulative trial accounting and the same untouched-OOS and
+A failed run remains failed. Do not widen parameters repeatedly on the same sample
+until a desired percentage appears. A materially new alpha idea gets a new
+hypothesis/version, cumulative trial accounting and the same untouched-OOS and
 forward lifecycle ladder.
 
-The production iteration loop is:
+The production loop is:
 
 **liquidity selection -> causal hypothesis -> chronological research -> stressed OOS
--> locked-universe SHADOW -> PAPER -> measured-cost rerun -> CANARY -> LIVE ->
-continuous degradation monitoring**.
+-> immutable manifest -> SHADOW -> PAPER -> fixed-config measured-cost rerun ->
+CANARY -> LIVE -> continuous strategy/sleeve degradation monitoring**.
 
-The system is designed to maximize the chance that an observed edge is real, not to
-manufacture a backtest that says 2%/day.
+This system is designed to maximize the chance that an observed edge survives real
+execution. It is not designed to manufacture a backtest that says 2%/day.
