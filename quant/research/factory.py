@@ -1,23 +1,9 @@
 """Walk-forward research factory for ``UniverseStrategy`` families.
 
-The chronological protocol mirrors the audited equity/crypto research
-stacks (rolling train -> embargo -> test windows over one aligned index,
-per-fold candidate selection on training data only, out-of-sample
-evaluation of the selected candidate at base and stressed costs) and adds
-the two controls the spec requires on top:
-
-* Monte Carlo trade-sequence stress on the pooled out-of-sample trades
-  (drawdown distribution, losing streaks, risk-of-ruin proxy);
-* deflated-Sharpe multiple-testing correction using the TOTAL number of
-  candidates this run evaluated plus every previously recorded trial for
-  the strategy, so the best of many experiments is never presented as if
-  it were the only one.
-
-Every promotion gate is evaluated and reported individually — a failed
-gate is never averaged away by a passing one — and a PASS means exactly
-what it means elsewhere in this repository: eligible for SHADOW/PAPER
-evaluation, never a live unlock.  The factory produces challengers only;
-it deploys nothing.
+Chronological rolling train -> embargo -> test research with training-only
+candidate selection, stressed execution costs, Monte Carlo trade-sequence stress,
+and deflated-Sharpe multiple-testing correction. A research failure can never
+silently become an out-of-sample candidate.
 """
 
 from __future__ import annotations
@@ -40,8 +26,6 @@ StrategyFactory = Callable[[dict[str, Any]], UniverseStrategy]
 
 @dataclass(frozen=True)
 class QuantWalkForwardConfig:
-    """Bounded rolling train/embargo/test protocol for the simulator."""
-
     train_bars: int = 500
     test_bars: int = 150
     step_bars: int = 150
@@ -78,8 +62,6 @@ class QuantWalkForwardConfig:
 
 @dataclass(frozen=True)
 class QuantPromotionCriteria:
-    """Evidence gates a candidate must pass to become a SHADOW challenger."""
-
     min_folds: int = 3
     min_oos_trades: int = 15
     min_positive_fold_ratio: float = 0.60
@@ -121,8 +103,6 @@ class QuantPromotionCriteria:
 
 @dataclass
 class GateResult:
-    """One promotion gate, individually visible (never averaged away)."""
-
     name: str
     value: Optional[float]
     threshold: float
@@ -174,12 +154,6 @@ class QuantResearchReport:
 def _robust_training_score(
     result: SimulationResult, *, min_trades: int, candidate_count: int
 ) -> float:
-    """Risk-adjusted selection objective with a multiple-testing penalty.
-
-    Same shape as the audited stacks: Sharpe plus a Calmar and profit-factor
-    contribution, penalized by drawdown and by sqrt(2 ln k / n) so a larger
-    candidate grid needs proportionally stronger evidence to select.
-    """
     if result.num_trades < min_trades:
         return -math.inf
     sharpe = result.sharpe_ratio if result.sharpe_ratio is not None else -2.0
@@ -211,12 +185,6 @@ def run_quant_walk_forward(
     stress_config: Optional[StressConfig] = None,
     prior_trials: int = 0,
 ) -> QuantResearchReport:
-    """Chronological walk-forward with per-gate promotion evaluation.
-
-    ``prior_trials`` should carry ``QuantStore.total_trials(strategy_id)``
-    so the deflated-Sharpe correction sees the full hypothesis lineage,
-    not just this run's grid.
-    """
     walk_config = walk_config or QuantWalkForwardConfig()
     criteria = criteria or QuantPromotionCriteria()
     for config, label in ((walk_config, "walk-forward"), (criteria, "promotion")):
@@ -267,12 +235,12 @@ def run_quant_walk_forward(
             break
 
         best_score = -math.inf
-        best_ordinal = 0
-        for ordinal, (params, strategy, warmup) in enumerate(
+        best_ordinal: Optional[int] = None
+        for ordinal, (_params, strategy, warmup) in enumerate(
             zip(candidate_params, strategies, warmups)
         ):
             if walk_config.train_bars < warmup + 2:
-                continue  # candidate cannot complete warmup inside the window
+                continue
             try:
                 train_result = run_simulation(
                     strategy,
@@ -287,22 +255,23 @@ def run_quant_walk_forward(
                 min_trades=walk_config.min_train_trades,
                 candidate_count=len(candidate_params),
             )
-            # Deterministic tie-break: earlier ordinal wins.
-            if score > best_score:
+            if math.isfinite(score) and (best_ordinal is None or score > best_score):
                 best_score = score
                 best_ordinal = ordinal
+
+        if best_ordinal is None:
+            raise ValueError(
+                "No candidate satisfied minimum training evidence in walk-forward fold "
+                f"{common[train_start].isoformat()}..{common[train_end - 1].isoformat()}; "
+                "refusing to select candidate 0 by default or skip the fold."
+            )
 
         selected_params = dict(candidate_params[best_ordinal])
         selected_strategy = strategies[best_ordinal]
         selected_warmup = warmups[best_ordinal]
-
-        # OOS slice carries exactly enough pre-test history for warmup, so
-        # the first traded bar is the first test bar.
         oos_start = test_start - (selected_warmup - 1)
         if oos_start < 0:
-            raise ValueError(
-                "Test window cannot supply candidate warmup; extend train_bars."
-            )
+            raise ValueError("Test window cannot supply candidate warmup; extend train_bars.")
         test_result = run_simulation(
             selected_strategy,
             slice_bars(oos_start, test_end),
@@ -351,12 +320,20 @@ def run_quant_walk_forward(
         pooled_returns.extend(fold.test_result.equity_curve.pct_change().dropna().tolist())
     per_bar_sharpe: Optional[float] = None
     aggregate_sharpe: Optional[float] = None
+    return_skew = 0.0
+    return_kurtosis = 3.0
     if len(pooled_returns) >= 20:
-        series = pd.Series(pooled_returns)
+        series = pd.Series(pooled_returns, dtype=float)
         std = float(series.std(ddof=1))
         if std > 0:
             per_bar_sharpe = float(series.mean() / std)
             aggregate_sharpe = per_bar_sharpe * math.sqrt(sim_config.annualization_factor)
+        skew = float(series.skew())
+        excess_kurtosis = float(series.kurt())
+        if math.isfinite(skew):
+            return_skew = skew
+        if math.isfinite(excess_kurtosis):
+            return_kurtosis = max(1.0, excess_kurtosis + 3.0)
 
     pooled_pnl = [
         trade.net_pnl
@@ -372,12 +349,7 @@ def run_quant_walk_forward(
     elif wins > 0:
         profit_factor = math.inf
 
-    oos_r = [
-        r
-        for fold in folds
-        for r in fold.test_result.r_multiples
-    ]
-
+    oos_r = [r for fold in folds for r in fold.test_result.r_multiples]
     stress_report = None
     ruin_probability: Optional[float] = None
     try:
@@ -385,27 +357,20 @@ def run_quant_walk_forward(
         report_dict = stress_report.to_dict()
         stressed_block = report_dict.get("stressed") or {}
         baseline_block = report_dict.get("baseline") or {}
-        ruin_probability = stressed_block.get(
-            "risk_of_ruin", baseline_block.get("risk_of_ruin")
-        )
+        ruin_probability = stressed_block.get("risk_of_ruin", baseline_block.get("risk_of_ruin"))
     except ValueError:
-        # Too few trades for a meaningful distribution; the trade-count
-        # gate below fails on its own and the ruin gate fails closed.
         stress_report = None
 
     dsr_report = None
     dsr_probability: Optional[float] = None
     trial_count = len(candidate_params) + prior_trials
     if per_bar_sharpe is not None:
-        # The expected-max benchmark needs the variance of the per-trial
-        # Sharpe ESTIMATOR, which for near-zero true Sharpe is ~1/(n-1) in
-        # the same per-period units as the observed figure — passing the
-        # default 1.0 here would compare a per-bar Sharpe against an
-        # annualized-scale noise benchmark and auto-fail every run.
         dsr_report = deflated_sharpe_probability(
             per_bar_sharpe,
             n_trials=max(1, trial_count),
             n_observations=len(pooled_returns),
+            skewness=return_skew,
+            kurtosis=return_kurtosis,
             variance_sharpe=1.0 / max(2, len(pooled_returns) - 1),
         )
         dsr_probability = float(getattr(dsr_report, "dsr_probability"))
@@ -415,67 +380,16 @@ def run_quant_walk_forward(
 
     gates = [
         gate("min_folds", float(len(folds)), float(criteria.min_folds), len(folds) >= criteria.min_folds),
-        gate(
-            "min_oos_trades",
-            float(total_trades),
-            float(criteria.min_oos_trades),
-            total_trades >= criteria.min_oos_trades,
-        ),
-        gate(
-            "min_positive_fold_ratio",
-            positive_ratio,
-            criteria.min_positive_fold_ratio,
-            positive_ratio >= criteria.min_positive_fold_ratio,
-        ),
-        gate(
-            "min_compounded_return_pct",
-            compounded,
-            criteria.min_compounded_return_pct,
-            compounded >= criteria.min_compounded_return_pct,
-        ),
-        gate(
-            "min_benchmark_excess_return_pct",
-            compounded - benchmark_compounded,
-            criteria.min_benchmark_excess_return_pct,
-            (compounded - benchmark_compounded) >= criteria.min_benchmark_excess_return_pct,
-        ),
-        gate(
-            "min_aggregate_sharpe",
-            aggregate_sharpe,
-            criteria.min_aggregate_sharpe,
-            aggregate_sharpe is not None and aggregate_sharpe >= criteria.min_aggregate_sharpe,
-        ),
-        gate(
-            "min_profit_factor",
-            None if profit_factor is None or math.isinf(profit_factor) else profit_factor,
-            criteria.min_profit_factor,
-            profit_factor is not None and profit_factor >= criteria.min_profit_factor,
-        ),
-        gate(
-            "max_fold_drawdown_pct",
-            worst_drawdown,
-            criteria.max_fold_drawdown_pct,
-            worst_drawdown <= criteria.max_fold_drawdown_pct,
-        ),
-        gate(
-            "min_stressed_return_pct",
-            stressed_compounded,
-            criteria.min_stressed_return_pct,
-            stressed_compounded >= criteria.min_stressed_return_pct,
-        ),
-        gate(
-            "min_deflated_sharpe_probability",
-            dsr_probability,
-            criteria.min_deflated_sharpe_probability,
-            dsr_probability is not None
-            and dsr_probability >= criteria.min_deflated_sharpe_probability,
-        ),
-        gate(
-            "max_ruin_probability",
-            ruin_probability,
-            criteria.max_ruin_probability,
-            ruin_probability is not None and ruin_probability <= criteria.max_ruin_probability,
-        ),
+        gate("min_oos_trades", float(total_trades), float(criteria.min_oos_trades), total_trades >= criteria.min_oos_trades),
+        gate("min_positive_fold_ratio", positive_ratio, criteria.min_positive_fold_ratio, positive_ratio >= criteria.min_positive_fold_ratio),
+        gate("min_compounded_return_pct", compounded, criteria.min_compounded_return_pct, compounded >= criteria.min_compounded_return_pct),
+        gate("min_benchmark_excess_return_pct", compounded - benchmark_compounded, criteria.min_benchmark_excess_return_pct, compounded - benchmark_compounded >= criteria.min_benchmark_excess_return_pct),
+        gate("min_aggregate_sharpe", aggregate_sharpe, criteria.min_aggregate_sharpe, aggregate_sharpe is not None and aggregate_sharpe >= criteria.min_aggregate_sharpe),
+        gate("min_profit_factor", None if profit_factor is None or math.isinf(profit_factor) else profit_factor, criteria.min_profit_factor, profit_factor is not None and profit_factor >= criteria.min_profit_factor),
+        gate("max_fold_drawdown_pct", worst_drawdown, criteria.max_fold_drawdown_pct, worst_drawdown <= criteria.max_fold_drawdown_pct),
+        gate("min_stressed_return_pct", stressed_compounded, criteria.min_stressed_return_pct, stressed_compounded >= criteria.min_stressed_return_pct),
+        gate("min_deflated_sharpe_probability", dsr_probability, criteria.min_deflated_sharpe_probability, dsr_probability is not None and dsr_probability >= criteria.min_deflated_sharpe_probability),
+        gate("max_ruin_probability", ruin_probability, criteria.max_ruin_probability, ruin_probability is not None and ruin_probability <= criteria.max_ruin_probability),
     ]
     passed = all(g.passed for g in gates)
 
@@ -507,6 +421,8 @@ def run_quant_walk_forward(
             "exit_policy": asdict(exit_policy) if exit_policy else None,
             "universe": sorted(bars_by_symbol),
             "data_window": f"{common[0].isoformat()}..{common[-1].isoformat()}",
+            "oos_return_skewness": return_skew,
+            "oos_return_kurtosis": return_kurtosis,
         },
     )
 
@@ -519,13 +435,13 @@ def record_research_report(
     seed: Optional[int] = None,
     hypothesis_id: Optional[str] = None,
 ) -> int:
-    """Persist a research run with full gate detail and trial lineage."""
     return store.record_research_run(
         strategy_id=report.strategy_id,
         params=report.latest_selected_params,
         universe=list(report.protocol.get("universe", [])),
         data_window=str(report.protocol.get("data_window", "")),
         candidate_count=report.candidate_count,
+        # Persist only trials performed by this run; QuantStore accumulates lineage.
         trial_count=report.candidate_count,
         passed=report.passed,
         gates=report.gates_dict(),
@@ -541,11 +457,7 @@ def record_research_report(
             "benchmark_compounded_return_pct": report.benchmark_compounded_return_pct,
             "stressed_compounded_return_pct": report.stressed_compounded_return_pct,
             "aggregate_sharpe": report.aggregate_sharpe,
-            "profit_factor": (
-                None
-                if report.profit_factor is None or math.isinf(report.profit_factor)
-                else report.profit_factor
-            ),
+            "profit_factor": None if report.profit_factor is None or math.isinf(report.profit_factor) else report.profit_factor,
             "positive_fold_ratio": report.positive_fold_ratio,
             "worst_fold_drawdown_pct": report.worst_fold_drawdown_pct,
             "total_oos_trades": report.total_oos_trades,
