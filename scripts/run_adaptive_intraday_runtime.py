@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Run adaptive intraday v2 in SHADOW, PAPER, or guarded LIVE mode.
 
-Quotes are fetched on every loop and persisted as non-blocking telemetry.  Completed
-5-minute history is cached until the next safely completed bar.  LIVE remains behind
-all existing broker, lifecycle, operator-ack and canary controls.
+The runtime never invents or silently changes its symbol set. RESEARCH -> SHADOW
+promotion locks the exact passing-research universe in QuantStore; every runtime mode
+must reuse it. A requested `--symbols` list is accepted only when it exactly matches
+that locked tuple.
+
+Quotes are fetched on every loop and persisted as non-blocking telemetry. Completed
+bar history is cached until the next safely completed bar. LIVE remains behind all
+broker, lifecycle, operator-ack and canary controls.
 """
 
 from __future__ import annotations
@@ -31,13 +36,13 @@ from quant.contracts import Market, StrategyState
 from quant.evidence_scanner import EvidenceQuantScanner
 from quant.execution import ExecutionQualityEngine
 from quant.intraday import (
-    HIGH_VELOCITY_CRYPTO_UNIVERSE,
     make_high_velocity_engine_config,
     make_high_velocity_risk_config,
     make_high_velocity_strategy_config,
 )
 from quant.intraday_lifecycle import intraday_promotion_requirements
 from quant.lifecycle import LifecycleManager
+from quant.liquidity_universe import require_locked_universe
 from quant.portfolio import PortfolioBook
 from quant.realtime_feed import CompletedBarCachingCryptoFeed
 from quant.scanner import ScanStrategy
@@ -74,8 +79,15 @@ def _quote_snapshot(quotes) -> str:
         age = None
         if timestamp is not None:
             try:
-                ts = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=timezone.utc)
-                age = max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds())
+                ts = (
+                    timestamp
+                    if timestamp.tzinfo is not None
+                    else timestamp.replace(tzinfo=timezone.utc)
+                )
+                age = max(
+                    0.0,
+                    (now - ts.astimezone(timezone.utc)).total_seconds(),
+                )
             except (AttributeError, TypeError, ValueError):
                 pass
         payload[symbol] = {
@@ -125,7 +137,10 @@ def _shadow_loop(symbols, timeframe, quant_store: QuantStore, poll_seconds: floa
     risk_config = make_high_velocity_risk_config()
     broker, feed = _make_market_stack(AccountMode.PAPER, risk_config, quant_store)
     account = broker.verify_account()
-    strategy_config = make_high_velocity_strategy_config(symbols=symbols, timeframe=timeframe)
+    strategy_config = make_high_velocity_strategy_config(
+        symbols=symbols,
+        timeframe=timeframe,
+    )
     strategy = AdaptiveIntradayStrategy(strategy_config)
     scanner = EvidenceQuantScanner(
         store=quant_store,
@@ -142,8 +157,8 @@ def _shadow_loop(symbols, timeframe, quant_store: QuantStore, poll_seconds: floa
     )
     last_bar = None
     print(
-        f"SHADOW {ADAPTIVE_STRATEGY_ID}: {len(symbols)} symbols, {timeframe} decisions, "
-        f"fresh quotes every {poll_seconds:g}s. Ctrl+C stops."
+        f"SHADOW {ADAPTIVE_STRATEGY_ID}: locked universe={symbols}; "
+        f"{timeframe} decisions, fresh quotes every {poll_seconds:g}s. Ctrl+C stops."
     )
     try:
         while True:
@@ -179,7 +194,9 @@ def _shadow_loop(symbols, timeframe, quant_store: QuantStore, poll_seconds: floa
                         counts = report.shadow_counts.get(ADAPTIVE_STRATEGY_ID, {})
                         print(
                             f"{bar.isoformat()} shadow: "
-                            + ", ".join(f"{key}={value}" for key, value in counts.items())
+                            + ", ".join(
+                                f"{key}={value}" for key, value in counts.items()
+                            )
                         )
                         last_bar = bar
             time.sleep(poll_seconds)
@@ -224,10 +241,16 @@ def _broker_loop(
 
     risk_config = make_high_velocity_risk_config()
     broker, feed = _make_market_stack(account_mode, risk_config, quant_store)
-    strategy_config = make_high_velocity_strategy_config(symbols=symbols, timeframe=timeframe)
+    strategy_config = make_high_velocity_strategy_config(
+        symbols=symbols,
+        timeframe=timeframe,
+    )
     engine_config = make_high_velocity_engine_config(account_mode=account_mode)
     if max_runtime_hours is not None:
-        engine_config = replace(engine_config, max_runtime_seconds=max_runtime_hours * 3600.0)
+        engine_config = replace(
+            engine_config,
+            max_runtime_seconds=max_runtime_hours * 3600.0,
+        )
     state_store = StateStore(state_db)
     engine = make_intraday_adaptive_crypto_engine(
         broker,
@@ -240,9 +263,12 @@ def _broker_loop(
         lifecycle=lifecycle,
     )
     label = account_mode.value.upper()
-    effective_risk = risk_config.risk_per_trade_pct * lifecycle.risk_multiplier(ADAPTIVE_STRATEGY_ID)
+    effective_risk = (
+        risk_config.risk_per_trade_pct
+        * lifecycle.risk_multiplier(ADAPTIVE_STRATEGY_ID)
+    )
     print(
-        f"{label} {ADAPTIVE_STRATEGY_ID}: {len(symbols)} symbols, {timeframe}, "
+        f"{label} {ADAPTIVE_STRATEGY_ID}: locked universe={symbols}; {timeframe}, "
         f"base risk={risk_config.risk_per_trade_pct:.3f}%/trade, lifecycle risk<="
         f"{effective_risk:.3f}%/trade, quote/protection loop 5s flat / 1s exposed."
     )
@@ -264,9 +290,18 @@ def _broker_loop(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("shadow", "paper", "live"), default="shadow")
+    parser.add_argument(
+        "--mode",
+        choices=("shadow", "paper", "live"),
+        default="shadow",
+    )
     parser.add_argument("--timeframe", choices=("5Min", "15Min"), default="5Min")
-    parser.add_argument("--symbols", nargs="+", default=None)
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=None,
+        help="Optional assertion; must exactly match the promoted research universe.",
+    )
     parser.add_argument("--quant-db", default=DEFAULT_QUANT_DB_PATH)
     parser.add_argument("--state-db", default=DEFAULT_STATE_DB)
     parser.add_argument("--live-state-db", default=DEFAULT_LIVE_STATE_DB)
@@ -284,21 +319,26 @@ def main() -> int:
     if args.mode == "live" and args.live_ack != LIVE_ACK:
         print(f"LIVE requires --live-ack {LIVE_ACK}", file=sys.stderr)
         return 2
-    symbols = tuple(args.symbols or HIGH_VELOCITY_CRYPTO_UNIVERSE)
-    if len(symbols) < 6 or len(symbols) > 12:
-        print("Adaptive runtime universe must contain 6-12 symbols.", file=sys.stderr)
-        return 2
 
     quant_store = QuantStore(args.quant_db)
     try:
+        requested = tuple(args.symbols) if args.symbols else None
+        symbols = require_locked_universe(quant_store, requested)
         if args.mode == "shadow":
-            return _shadow_loop(symbols, args.timeframe, quant_store, args.poll_seconds)
+            return _shadow_loop(
+                symbols,
+                args.timeframe,
+                quant_store,
+                args.poll_seconds,
+            )
         return _broker_loop(
             symbols=symbols,
             timeframe=args.timeframe,
             quant_store=quant_store,
             state_db=args.state_db if args.mode == "paper" else args.live_state_db,
-            account_mode=AccountMode.PAPER if args.mode == "paper" else AccountMode.LIVE,
+            account_mode=(
+                AccountMode.PAPER if args.mode == "paper" else AccountMode.LIVE
+            ),
             max_runtime_hours=args.max_runtime_hours,
         )
     except (BrokerError, RuntimeError, ValueError) as error:
