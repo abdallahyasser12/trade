@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Inspect or promote a Quant Desk strategy without editing SQLite by hand.
 
-Each forward rung is measured only from attributions recorded since that rung
-began. High-velocity intraday thresholds come from one centralized policy module
-shared with its runtime.
+Each forward rung is measured only from attributions recorded since that rung began.
+Both high-velocity intraday generations use the centralized stricter lifecycle
+policy, but keep separate strategy identities/evidence and separate execution-state
+databases.
 """
 
 from __future__ import annotations
@@ -23,17 +24,24 @@ from quant.marketplace import compute_strategy_health
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
 
-DEFAULT_STATE_DB = str(Path("data") / "intraday_trading.db")
+LEGACY_STATE_DB = str(Path("data") / "intraday_trading.db")
+ADAPTIVE_STATE_DB = str(Path("data") / "adaptive_intraday_trading.db")
 LIVE_ACK = "I_ACCEPT_LIVE_RISK"
-INTRADAY_STRATEGY_ID = "crypto_intraday_momentum"
+INTRADAY_STRATEGY_IDS = frozenset(
+    {"crypto_intraday_momentum", "crypto_intraday_adaptive"}
+)
 
 
 def _requirements(strategy_id: str) -> PromotionRequirements:
     return (
         intraday_promotion_requirements()
-        if strategy_id == INTRADAY_STRATEGY_ID
+        if strategy_id in INTRADAY_STRATEGY_IDS
         else PromotionRequirements()
     )
+
+
+def _default_state_db(strategy_id: str) -> str:
+    return ADAPTIVE_STATE_DB if strategy_id == "crypto_intraday_adaptive" else LEGACY_STATE_DB
 
 
 def _manager(store: QuantStore, strategy_id: str) -> LifecycleManager:
@@ -255,9 +263,7 @@ def promote(args, quant_store, state_store) -> int:
             file=sys.stderr,
         )
         return 1
-    print(
-        f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}."
-    )
+    print(f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}.")
     return 0
 
 
@@ -268,7 +274,11 @@ def main() -> int:
         cmd = sub.add_parser(name)
         cmd.add_argument("--strategy", required=True)
         cmd.add_argument("--quant-db", default=DEFAULT_QUANT_DB_PATH)
-        cmd.add_argument("--state-db", default=DEFAULT_STATE_DB)
+        cmd.add_argument(
+            "--state-db",
+            default=None,
+            help="Defaults to the strategy-specific intraday execution DB.",
+        )
         if name == "promote":
             cmd.add_argument("--measured-research-run-id", type=int, default=None)
             cmd.add_argument("--operational-defects", type=int, default=0)
@@ -279,8 +289,9 @@ def main() -> int:
         print("operational-defects cannot be negative.", file=sys.stderr)
         return 2
 
+    state_db = args.state_db or _default_state_db(args.strategy)
     quant_store = QuantStore(args.quant_db)
-    state_store = StateStore(args.state_db)
+    state_store = StateStore(state_db)
     try:
         if args.command == "status":
             return show_status(quant_store, state_store, args.strategy)
