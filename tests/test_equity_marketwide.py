@@ -5,6 +5,7 @@ import pandas as pd
 from equity_market_data import EquityAssetSnapshot
 from quant.contracts import Market
 from quant.equity_marketwide import (
+    MARKET_BENCHMARK,
     MarketWideEquityConfig,
     MarketWideEquitySelector,
     OwnershipAwareStrategy,
@@ -56,6 +57,7 @@ def test_marketwide_config_is_bounded():
     assert not MarketWideEquityConfig().validate()
     assert MarketWideEquityConfig().timeframe == "15Min"
     assert MarketWideEquityConfig().max_scan_symbols == 48
+    assert MarketWideEquityConfig(timeframe="1Day").validate()
     assert MarketWideEquityConfig(shard_size=65).validate()
     assert MarketWideEquityConfig(risk_per_trade_pct=1.01).validate()
     assert MarketWideEquityConfig(max_total_exposure_pct=101).validate()
@@ -113,6 +115,24 @@ def test_selector_cap_is_liquidity_only_and_deterministic():
     assert report.rejected["BBB"] == "beyond_scan_cap"
 
 
+def test_selector_reserves_executable_spy_as_stable_benchmark_anchor():
+    assets = [asset("AAA"), asset(MARKET_BENCHMARK), asset("CCC")]
+    quotes = {
+        symbol: Quote(49.99, 50.01)
+        for symbol in ("AAA", MARKET_BENCHMARK, "CCC")
+    }
+    bars = {
+        "AAA": daily(volume=900_000),
+        MARKET_BENCHMARK: daily(volume=200_000),
+        "CCC": daily(volume=800_000),
+    }
+    report = MarketWideEquitySelector(
+        MarketWideEquityConfig(max_scan_symbols=2)
+    ).select(assets, quotes, bars, now=NOW)
+    assert report.selected == (MARKET_BENCHMARK, "AAA")
+    assert report.rejected["CCC"] == "beyond_scan_cap"
+
+
 def test_strategy_builder_shards_without_changing_strategy_identity():
     symbols = tuple(f"S{index:03d}" for index in range(110))
     cfg = MarketWideEquityConfig(max_scan_symbols=192, shard_size=48, timeframe="15Min")
@@ -133,6 +153,13 @@ def test_strategy_builder_shards_without_changing_strategy_identity():
             for symbol in entry.strategy.config.symbols
         ]
         assert family_symbols == list(symbols)
+
+
+def test_strategy_builder_uses_spy_when_it_is_in_the_shard():
+    symbols = (MARKET_BENCHMARK, "AAPL", "MSFT")
+    entries = build_equity_scan_strategies(symbols, config=MarketWideEquityConfig())
+    assert entries
+    assert all(entry.strategy.config.benchmark_symbol == MARKET_BENCHMARK for entry in entries)
 
 
 def test_ownership_wrapper_filters_real_owned_context_but_preserves_shadow_context():
