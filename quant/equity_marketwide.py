@@ -1,6 +1,6 @@
 """Market-wide US-equity discovery and intraday strategy orchestration.
 
-The full Alpaca asset catalogue is considered at the discovery stage.  Only hard,
+The full Alpaca asset catalogue is considered at the discovery stage. Only hard,
 point-in-time executability filters (active/tradable status, price, quote freshness,
 spread, history and dollar liquidity) may shrink that catalogue before alpha logic.
 Historical return is deliberately NOT a universe-selection input: using recent winners
@@ -8,7 +8,7 @@ to decide what the backtest was allowed to see would introduce selection bias.
 
 The surviving liquid universe is sharded into bounded strategy instances because the
 shared ``IntradayStrategyConfig`` intentionally caps one strategy instance at 64
-symbols.  The QuantScanner still ranks all resulting candidates globally.
+symbols. The QuantScanner still ranks all resulting candidates globally.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from quant.strategies.vwap_reversion import (
 
 @dataclass(frozen=True)
 class MarketWideEquityConfig:
-    timeframe: str = "5Min"
+    timeframe: str = "15Min"
     min_price: float = 5.0
     max_price: Optional[float] = 1_500.0
     min_avg_dollar_volume: float = 5_000_000.0
@@ -47,7 +47,7 @@ class MarketWideEquityConfig:
     min_daily_history_bars: int = 15
     max_quote_age_seconds: float = 30.0
     max_spread_bps: float = 35.0
-    max_scan_symbols: int = 192
+    max_scan_symbols: int = 48
     shard_size: int = 48
     universe_refresh_seconds: int = 3_600
     intraday_lookback_bars: int = 220
@@ -273,7 +273,6 @@ class MarketWideEquitySelector:
         )
         selected = tuple(metric.symbol for metric in eligible[: cfg.max_scan_symbols])
         selected_set = set(selected)
-        # The cap is an explicit reason, not a silent disappearance.
         metrics = [
             EquityUniverseMetric(
                 **{
@@ -299,11 +298,14 @@ class MarketWideEquitySelector:
 
 
 class OwnershipAwareStrategy:
-    """Prevent one strategy family from issuing exits for another family's position.
+    """Keep real strategy ownership while preserving SHADOW virtual-position context.
 
-    ``QuantScanner`` predates a multi-strategy equity runtime and passes every held
-    symbol to every strategy.  The wrapper preserves the shared scanner while making
-    position ownership explicit and deterministic at the strategy boundary.
+    ``QuantScanner`` passes a strategy-specific held set in SHADOW but the whole broker
+    book in PAPER. When this strategy already owns real positions, its explicit durable
+    ownership set is authoritative. When it owns none, the scanner-provided held set is
+    passed through so SHADOW positions can generate strategy exits. PAPER execution has
+    a second ownership check immediately before any sell, so a pass-through symbol can
+    never cause one strategy to liquidate another strategy's or a manual position.
     """
 
     def __init__(self, delegate, owned_symbols: set[str] | frozenset[str]):
@@ -320,11 +322,18 @@ class OwnershipAwareStrategy:
     def prepare_universe(self, bars_by_symbol):
         return self.delegate.prepare_universe(bars_by_symbol)
 
+    def _effective_held(self, held_symbols):
+        return self.owned_symbols if self.owned_symbols else frozenset(held_symbols)
+
     def evaluate(self, bars_by_symbol, held_symbols=frozenset()):
-        return self.delegate.evaluate(bars_by_symbol, self.owned_symbols)
+        return self.delegate.evaluate(bars_by_symbol, self._effective_held(held_symbols))
 
     def evaluate_prepared(self, prepared, timestamp, held_symbols=frozenset()):
-        return self.delegate.evaluate_prepared(prepared, timestamp, self.owned_symbols)
+        return self.delegate.evaluate_prepared(
+            prepared,
+            timestamp,
+            self._effective_held(held_symbols),
+        )
 
     def ratchet_stop(self, current_stop, highest_completed_close, completed_close, current_atr):
         return self.delegate.ratchet_stop(
@@ -348,7 +357,7 @@ def build_equity_scan_strategies(
     """Build all enabled US-equity intraday hypotheses over bounded shards.
 
     Strategy ids/versions stay identical across shards: a shard is only a data/compute
-    partition, not a different hypothesis.  Symbols occur in exactly one shard, so
+    partition, not a different hypothesis. Symbols occur in exactly one shard, so
     ``strategy_id:symbol`` remains a unique scanner key.
     """
 
