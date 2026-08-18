@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """Research adaptive intraday v2 on real Alpaca data.
 
-The default universe is selected before research from current executability only:
-quote freshness, spread and top-of-book depth. Return history is never used to choose
-symbols. The exact selected symbol order is persisted with the research evidence and
-later locked by RESEARCH -> SHADOW promotion.
+Normal mode selects a currently executable universe (or an explicit 6-12 symbol
+universe), evaluates a bounded 18-hypothesis grid and records an immutable research
+manifest containing the exact git commit, timeframe, ordered universe and selected
+parameters.
 
-The runner adds breadth, concentration, activity and expectancy gates on top of
-chronological walk-forward, stressed execution costs, DSR multiple-testing correction
-and Monte Carlo ruin. The requested 2%/day number is diagnostic only.
+``--locked-config`` is the pre-CANARY verification mode.  It does not optimize: it
+re-evaluates the exact promoted deployment manifest under current/measured costs.
+The requested 2%/day number remains an untouched-OOS diagnostic only.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -26,7 +25,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_credentials
 from crypto_config import crypto_bars_per_year
 from crypto_data_feed import AlpacaCryptoDataFeed
-from intraday_crypto_engine import ADAPTIVE_STRATEGY_ID
+from intraday_crypto_engine import ADAPTIVE_STRATEGY_ID, ADAPTIVE_STRATEGY_VERSION
+from quant.adaptive_manifest import (
+    AdaptiveManifest,
+    current_git_commit,
+    locked_deployment_manifest,
+    record_research_manifest,
+)
 from quant.exits import ExitPolicyConfig
 from quant.intraday import DEFAULT_INTRADAY_OBJECTIVE, make_high_velocity_strategy_config
 from quant.liquidity_universe import (
@@ -48,18 +53,7 @@ from quant.strategies.intraday_adaptive import (
     AdaptiveIntradayStrategy,
 )
 
-
-def _git_commit() -> str | None:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=Path(__file__).resolve().parent.parent,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _feed() -> AlpacaCryptoDataFeed:
@@ -69,17 +63,38 @@ def _feed() -> AlpacaCryptoDataFeed:
     return AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
 
 
-def _spread_p75(metrics, symbols: tuple[str, ...]) -> float:
-    by_symbol = {metric.symbol: metric for metric in metrics}
-    spreads = sorted(
-        float(by_symbol[symbol].spread_bps)
-        for symbol in symbols
-        if by_symbol.get(symbol) is not None and by_symbol[symbol].spread_bps is not None
-    )
-    if not spreads:
+def _finite(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _p75(values: list[float]) -> float:
+    values = sorted(value for value in values if math.isfinite(value) and value >= 0)
+    if not values:
         return 0.0
-    index = min(len(spreads) - 1, max(0, math.ceil(0.75 * len(spreads)) - 1))
-    return spreads[index]
+    index = min(len(values) - 1, max(0, math.ceil(0.75 * len(values)) - 1))
+    return values[index]
+
+
+def _current_spread_p75(feed: AlpacaCryptoDataFeed, symbols: tuple[str, ...]) -> float:
+    quotes = feed.get_latest_quotes(list(symbols))
+    spreads: list[float] = []
+    for symbol in symbols:
+        quote = quotes.get(symbol)
+        if quote is None:
+            continue
+        spread = _finite(getattr(quote, "spread_bps", None))
+        if spread is None:
+            bid = _finite(getattr(quote, "bid_price", None))
+            ask = _finite(getattr(quote, "ask_price", None))
+            if bid is not None and ask is not None and bid > 0 and ask > bid:
+                spread = (ask - bid) / ((ask + bid) / 2.0) * 10_000.0
+        if spread is not None:
+            spreads.append(spread)
+    return _p75(spreads)
 
 
 def _liquidity_selected_symbols(feed: AlpacaCryptoDataFeed):
@@ -95,7 +110,15 @@ def _liquidity_selected_symbols(feed: AlpacaCryptoDataFeed):
         ),
         now=datetime.now(timezone.utc),
     )
-    return symbols, metrics, _spread_p75(metrics, symbols)
+    by_symbol = {metric.symbol: metric for metric in metrics}
+    spread_floor = _p75(
+        [
+            float(by_symbol[symbol].spread_bps)
+            for symbol in symbols
+            if by_symbol[symbol].spread_bps is not None
+        ]
+    )
+    return symbols, metrics, spread_floor
 
 
 def _real_bars(feed, symbols: tuple[str, ...], timeframe: str, days: int):
@@ -161,7 +184,6 @@ def _diagnostics(report, universe_size: int):
         if growth > 0 and test_days > 0
         else -100.0
     )
-
     symbol_pnl = defaultdict(float)
     traded_symbols = set()
     positive_fold_profit = []
@@ -175,30 +197,26 @@ def _diagnostics(report, universe_size: int):
             r_value = trade.r_multiple
             if r_value is not None and math.isfinite(r_value):
                 r_values.append(float(r_value))
-
     positive_symbol_pnl = {symbol: max(0.0, pnl) for symbol, pnl in symbol_pnl.items()}
     positive_total = sum(positive_symbol_pnl.values())
-    symbol_concentration = (
-        max(positive_symbol_pnl.values()) / positive_total
-        if positive_total > 0 and positive_symbol_pnl
-        else 1.0
-    )
     fold_profit_total = sum(positive_fold_profit)
-    fold_concentration = (
-        max(positive_fold_profit) / fold_profit_total
-        if fold_profit_total > 0 and positive_fold_profit
-        else 1.0
-    )
-    expectancy_r = sum(r_values) / len(r_values) if r_values else None
     return {
         "test_days": test_days,
         "trades_per_day": trades_per_day,
         "geometric_daily_return_pct": geometric_daily,
         "active_symbols": len(traded_symbols),
         "min_active_symbols": min(6, max(3, math.ceil(universe_size / 2))),
-        "symbol_profit_concentration": symbol_concentration,
-        "fold_profit_concentration": fold_concentration,
-        "expectancy_r": expectancy_r,
+        "symbol_profit_concentration": (
+            max(positive_symbol_pnl.values()) / positive_total
+            if positive_total > 0 and positive_symbol_pnl
+            else 1.0
+        ),
+        "fold_profit_concentration": (
+            max(positive_fold_profit) / fold_profit_total
+            if fold_profit_total > 0 and positive_fold_profit
+            else 1.0
+        ),
+        "expectancy_r": sum(r_values) / len(r_values) if r_values else None,
     }
 
 
@@ -257,8 +275,9 @@ def _finite_nonnegative(label: str, value: float) -> str | None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=120)
-    parser.add_argument("--timeframe", choices=("5Min", "15Min"), default="5Min")
+    parser.add_argument("--timeframe", choices=("5Min", "15Min"), default=None)
     parser.add_argument("--symbols", nargs="+", default=None)
+    parser.add_argument("--locked-config", action="store_true")
     parser.add_argument("--db", default=DEFAULT_QUANT_DB_PATH)
     parser.add_argument("--slippage-bps", type=float, default=10.0)
     parser.add_argument("--spread-bps", type=float, default=8.0)
@@ -279,13 +298,37 @@ def main() -> int:
             print(error, file=sys.stderr)
             return 2
 
+    git_commit = current_git_commit(REPO_ROOT)
+    if git_commit is None:
+        print("COULD NOT RUN: exact git commit is required for reproducible research.", file=sys.stderr)
+        return 2
+
+    store = QuantStore(args.db)
     try:
-        feed = _feed()
-        if args.symbols:
-            symbols = tuple(args.symbols)
-            observed_spread_p75 = 0.0
-            print("Universe source: explicit --symbols (stored with this run).")
+        locked = locked_deployment_manifest(store) if args.locked_config else None
+        if args.locked_config and locked is None:
+            print("COULD NOT RUN: --locked-config requires a promoted deployment manifest.", file=sys.stderr)
+            return 2
+        if locked is not None:
+            try:
+                locked.assert_runtime_identity(git_commit=git_commit)
+            except ValueError as error:
+                print(f"COULD NOT RUN: {error}", file=sys.stderr)
+                return 2
+            if args.timeframe is not None and args.timeframe != locked.timeframe:
+                print("COULD NOT RUN: --timeframe differs from locked manifest.", file=sys.stderr)
+                return 2
+            if args.symbols is not None and tuple(args.symbols) != locked.universe:
+                print("COULD NOT RUN: --symbols differs from locked manifest.", file=sys.stderr)
+                return 2
+            timeframe = locked.timeframe
+            symbols = locked.universe
         else:
+            timeframe = args.timeframe or "5Min"
+            symbols = tuple(args.symbols) if args.symbols else None
+
+        feed = _feed()
+        if locked is None and symbols is None:
             symbols, metrics, observed_spread_p75 = _liquidity_selected_symbols(feed)
             by_symbol = {metric.symbol: metric for metric in metrics}
             print("Universe source: current executable-liquidity selection.")
@@ -296,19 +339,20 @@ def main() -> int:
                     f"age={metric.quote_age_seconds:.1f}s "
                     f"side_depth=${metric.side_depth_usd:.0f} score={metric.score:.3f}"
                 )
-        if not 6 <= len(symbols) <= 12 or "BTC/USD" not in symbols:
-            raise ValueError(
-                "Adaptive research universe must contain BTC/USD and 6-12 symbols."
-            )
-        bars = _real_bars(feed, symbols, args.timeframe, args.days)
-        build, grid = _factory(symbols, args.timeframe)
-    except Exception as error:
-        print(f"COULD NOT RUN: {error}", file=sys.stderr)
-        return 2
+        else:
+            source = "locked deployment manifest" if locked is not None else "explicit --symbols"
+            print(f"Universe source: {source}.")
+            observed_spread_p75 = _current_spread_p75(feed, symbols)
 
-    effective_spread_bps = max(args.spread_bps, observed_spread_p75)
-    store = QuantStore(args.db)
-    try:
+        if not 6 <= len(symbols) <= 12 or "BTC/USD" not in symbols:
+            raise ValueError("Adaptive research universe must contain BTC/USD and 6-12 symbols.")
+        bars = _real_bars(feed, symbols, timeframe, args.days)
+        build, grid = _factory(symbols, timeframe)
+        if locked is not None:
+            grid = [dict(locked.params)]
+            print("Locked-config verification: optimization disabled; one exact parameter set.")
+
+        effective_spread_bps = max(args.spread_bps, observed_spread_p75)
         report = run_quant_walk_forward(
             strategy_id=ADAPTIVE_STRATEGY_ID,
             strategy_factory=build,
@@ -321,12 +365,9 @@ def main() -> int:
                 slippage_bps=args.slippage_bps,
                 spread_bps=effective_spread_bps,
                 fee_bps=args.fee_bps,
-                annualization_factor=crypto_bars_per_year(args.timeframe),
+                annualization_factor=crypto_bars_per_year(timeframe),
             ),
-            exit_policy=ExitPolicyConfig(
-                enable_trailing_stop=True,
-                enable_runner=True,
-            ),
+            exit_policy=ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True),
             walk_config=QuantWalkForwardConfig(
                 train_bars=4_032,
                 test_bars=1_152,
@@ -353,17 +394,18 @@ def main() -> int:
             ),
             prior_trials=store.total_trials(ADAPTIVE_STRATEGY_ID),
         )
-        # The generic factory keeps its own generic universe representation. For
-        # adaptive v2, deployment identity includes ordering because deterministic
-        # cross-sectional tie-breaking uses configured symbol order. Persist exactly
-        # the tuple that was researched so promotion/runtime cannot reorder it.
         report.protocol["universe"] = list(symbols)
+        report.protocol["timeframe"] = timeframe
+        report.protocol["strategy_version"] = ADAPTIVE_STRATEGY_VERSION
+        report.protocol["git_commit"] = git_commit
+        report.protocol["locked_config_verification"] = bool(locked)
 
         diagnostics = _diagnostics(report, len(symbols))
         _add_robustness_gates(report, diagnostics)
 
         print(f"\n=== Adaptive intraday v2 — {ADAPTIVE_STRATEGY_ID} ===")
-        print(f"universe={', '.join(symbols)}")
+        print(f"git_commit={git_commit}")
+        print(f"timeframe={timeframe} universe={', '.join(symbols)}")
         print(
             f"folds={len(report.folds)} candidates={report.candidate_count} "
             f"trials={report.trial_count} OOS_trades={report.total_oos_trades}"
@@ -395,21 +437,29 @@ def main() -> int:
                 f"  [{'PASS' if gate.passed else 'FAIL'}] {gate.name:<40} "
                 f"value={value:<12} threshold={gate.threshold:.4f}"
             )
-        print(f"\nselected latest params={report.latest_selected_params}")
+        print(f"\nselected params={report.latest_selected_params}")
 
         if not args.no_record:
             run_id = record_research_report(
                 store,
                 report,
-                git_commit=_git_commit(),
-                hypothesis_id="adaptive_intraday_v2",
+                git_commit=git_commit,
+                hypothesis_id="adaptive_intraday_v2_locked" if locked else "adaptive_intraday_v2",
             )
-            print(f"recorded research run #{run_id}")
+            manifest = AdaptiveManifest(
+                research_run_id=run_id,
+                git_commit=git_commit,
+                timeframe=timeframe,
+                universe=tuple(symbols),
+                params=dict(report.latest_selected_params),
+            ).require_valid()
+            record_research_manifest(store, manifest)
+            print(f"recorded research run #{run_id} + immutable manifest")
 
         if report.passed:
-            print("VERDICT: PASS — SHADOW eligibility only; no live-profit claim.")
+            print("VERDICT: PASS — lifecycle eligibility only; no live-profit claim.")
             return 0
-        print("VERDICT: FAIL — remain RESEARCH.")
+        print("VERDICT: FAIL — remain at current lifecycle state.")
         return 1
     except ValueError as error:
         print(f"COULD NOT RUN: {error}", file=sys.stderr)
