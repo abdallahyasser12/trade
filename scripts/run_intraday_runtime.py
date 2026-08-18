@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from dataclasses import replace
@@ -40,7 +41,8 @@ from quant.intraday import (
     make_high_velocity_risk_config,
     make_high_velocity_strategy_config,
 )
-from quant.lifecycle import LifecycleManager, PromotionRequirements
+from quant.intraday_lifecycle import intraday_promotion_requirements
+from quant.lifecycle import LifecycleManager
 from quant.portfolio import PortfolioBook
 from quant.realtime_feed import CompletedBarCachingCryptoFeed
 from quant.scanner import QuantScanner, ScanStrategy
@@ -55,28 +57,32 @@ LIVE_ACK = "I_ACCEPT_LIVE_RISK"
 
 
 def _intraday_lifecycle(store: QuantStore) -> LifecycleManager:
-    return LifecycleManager(
-        store,
-        requirements=PromotionRequirements(
-            min_research_trades=100,
-            min_shadow_trades=100,
-            max_shadow_drawdown_r=6.0,
-            min_paper_trades=200,
-            min_measured_execution_samples=50,
-            min_canary_trades=100,
-            max_open_operational_defects=0,
-        ),
-    )
+    return LifecycleManager(store, requirements=intraday_promotion_requirements())
 
 
 def _quote_snapshot(quotes) -> str:
+    """Persist quote/depth telemetry for the dashboard and later attribution work."""
     payload = {}
     for symbol, quote in quotes.items():
         timestamp = getattr(quote, "timestamp", None)
+        bid_size = getattr(quote, "bid_size", None)
+        ask_size = getattr(quote, "ask_size", None)
+        imbalance = None
+        try:
+            bid_size_f = float(bid_size) if bid_size is not None else math.nan
+            ask_size_f = float(ask_size) if ask_size is not None else math.nan
+            total = bid_size_f + ask_size_f
+            if math.isfinite(total) and total > 0:
+                imbalance = (bid_size_f - ask_size_f) / total
+        except (TypeError, ValueError):
+            imbalance = None
         payload[symbol] = {
             "timestamp": timestamp.isoformat() if timestamp is not None else None,
             "bid": getattr(quote, "bid_price", None),
             "ask": getattr(quote, "ask_price", None),
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "depth_imbalance": imbalance,
             "spread_bps": getattr(quote, "spread_bps", None),
         }
     return json.dumps(payload, sort_keys=True)
@@ -149,10 +155,17 @@ def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
                 )
                 for symbol in symbols
             }
-            if all(len(frame) >= strategy.required_bars() for frame in bars.values()):
+            if all(
+                len(frame) >= strategy.required_bars()
+                for frame in bars.values()
+            ):
                 common = None
                 for frame in bars.values():
-                    common = frame.index if common is None else common.intersection(frame.index)
+                    common = (
+                        frame.index
+                        if common is None
+                        else common.intersection(frame.index)
+                    )
                 if common is not None and len(common):
                     bar = common[-1]
                     if last_bar is None or bar > last_bar:
@@ -170,7 +183,8 @@ def _shadow_loop(symbols, quant_store: QuantStore, poll_seconds: float) -> int:
                         print(
                             f"{bar.isoformat()} shadow cycle: "
                             + ", ".join(
-                                f"{key}={value}" for key, value in counts.items()
+                                f"{key}={value}"
+                                for key, value in counts.items()
                             )
                         )
                         last_bar = bar
@@ -253,14 +267,19 @@ def _broker_loop(
         engine.stop()
         engine.join(10.0)
     status = engine.status
-    print(f"{label} stopped: state={status.state.value}, reason={status.stop_reason}")
+    print(
+        f"{label} stopped: state={status.state.value}, "
+        f"reason={status.stop_reason}"
+    )
     return 1 if status.error else 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("shadow", "paper", "live"), default="shadow"
+        "--mode",
+        choices=("shadow", "paper", "live"),
+        default="shadow",
     )
     parser.add_argument("--symbols", nargs="+", default=None)
     parser.add_argument("--quant-db", default=DEFAULT_QUANT_DB_PATH)
