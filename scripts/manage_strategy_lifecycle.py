@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """Inspect or promote a Quant Desk strategy without editing SQLite by hand.
 
-Examples
---------
-  python scripts/manage_strategy_lifecycle.py status --strategy crypto_intraday_momentum
-  python scripts/manage_strategy_lifecycle.py promote --strategy crypto_intraday_momentum
-
-RESEARCH->SHADOW uses the latest passing real research run.
-SHADOW->PAPER uses only shadow attributions recorded since SHADOW began.
-PAPER->LIVE_CANARY additionally requires measured execution samples, an explicitly
-selected passing research rerun whose modeled slippage is at least the measured
-slippage, zero open operational defects, and ``--live-ack I_ACCEPT_LIVE_RISK``.
-LIVE_CANARY->LIVE uses only real canary fills recorded since CANARY began and the
-same explicit live acknowledgement.
+High-velocity intraday strategies have stricter forward sample requirements:
+100 SHADOW trades, 200 PAPER trades, 50 measured executions and 100 CANARY trades.
+Each rung is measured only from attributions recorded since that rung began.
 """
 
 from __future__ import annotations
@@ -26,13 +17,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quant.contracts import StrategyState
-from quant.lifecycle import LifecycleManager, PromotionEvidence
+from quant.lifecycle import LifecycleManager, PromotionEvidence, PromotionRequirements
 from quant.marketplace import compute_strategy_health
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
 
 DEFAULT_STATE_DB = str(Path("data") / "intraday_trading.db")
 LIVE_ACK = "I_ACCEPT_LIVE_RISK"
+INTRADAY_STRATEGY_ID = "crypto_intraday_momentum"
+
+
+def _requirements(strategy_id: str) -> PromotionRequirements:
+    if strategy_id == INTRADAY_STRATEGY_ID:
+        return PromotionRequirements(
+            min_research_trades=100,
+            min_shadow_trades=100,
+            max_shadow_drawdown_r=6.0,
+            min_paper_trades=200,
+            min_measured_execution_samples=50,
+            min_canary_trades=100,
+            max_open_operational_defects=0,
+        )
+    return PromotionRequirements()
+
+
+def _manager(store: QuantStore, strategy_id: str) -> LifecycleManager:
+    return LifecycleManager(store, requirements=_requirements(strategy_id))
 
 
 def _parse_time(value) -> datetime | None:
@@ -82,18 +92,24 @@ def _state_health(store, strategy_id, state, state_row, include_shadow):
 
 
 def show_status(quant_store, state_store, strategy_id) -> int:
-    lifecycle = LifecycleManager(quant_store)
+    lifecycle = _manager(quant_store, strategy_id)
     state = lifecycle.state(strategy_id)
     row = quant_store.get_strategy_state(strategy_id)
     include_shadow = state is StrategyState.SHADOW
     health = _state_health(quant_store, strategy_id, state, row, include_shadow)
     latest = _latest_passing_research(quant_store, strategy_id)
     quality = state_store.execution_quality()
+    req = lifecycle.requirements
     print(f"strategy={strategy_id}")
     print(f"state={state.value} since={(row or {}).get('since') or 'not-recorded'}")
     print(
         f"current-state trades={health.trades} expectancy_R={health.expectancy_r} "
         f"PF={health.profit_factor} drawdown_R={health.max_drawdown_pct}"
+    )
+    print(
+        f"required samples: research={req.min_research_trades} shadow={req.min_shadow_trades} "
+        f"paper={req.min_paper_trades} executions={req.min_measured_execution_samples} "
+        f"canary={req.min_canary_trades}"
     )
     print(
         f"execution samples={quality['samples']} avg_slippage_bps="
@@ -111,7 +127,7 @@ def show_status(quant_store, state_store, strategy_id) -> int:
 
 def promote(args, quant_store, state_store) -> int:
     strategy_id = args.strategy
-    lifecycle = LifecycleManager(quant_store)
+    lifecycle = _manager(quant_store, strategy_id)
     state = lifecycle.state(strategy_id)
     state_row = quant_store.get_strategy_state(strategy_id)
     evidence = PromotionEvidence()
@@ -143,11 +159,12 @@ def promote(args, quant_store, state_store) -> int:
                 file=sys.stderr,
             )
             return 1
-        run = _research_run_by_id(
-            quant_store, strategy_id, args.measured_research_run_id
-        )
+        run = _research_run_by_id(quant_store, strategy_id, args.measured_research_run_id)
         if run is None or not bool(run.get("passed")):
-            print("Promotion refused: selected measured-cost research run is missing/failed.", file=sys.stderr)
+            print(
+                "Promotion refused: selected measured-cost research run is missing/failed.",
+                file=sys.stderr,
+            )
             return 1
         quality = state_store.execution_quality()
         measured_samples = int(quality.get("samples") or 0)
@@ -155,7 +172,8 @@ def promote(args, quant_store, state_store) -> int:
         modeled_slippage = _modeled_slippage(run)
         if measured_samples < lifecycle.requirements.min_measured_execution_samples:
             print(
-                f"Promotion refused: only {measured_samples} measured execution samples.",
+                f"Promotion refused: only {measured_samples} measured execution samples; "
+                f"{lifecycle.requirements.min_measured_execution_samples} required.",
                 file=sys.stderr,
             )
             return 1
@@ -210,9 +228,7 @@ def promote(args, quant_store, state_store) -> int:
             file=sys.stderr,
         )
         return 1
-    print(
-        f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}."
-    )
+    print(f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}.")
     return 0
 
 
