@@ -1,9 +1,10 @@
-"""Liquidity-aware universe selection for adaptive intraday research.
+"""Liquidity-aware universe selection and deployment locking for adaptive intraday.
 
 Selection is based only on *current executability* (quote freshness, spread and top
-of book depth), never on historical/future return.  The selected symbols are then
-recorded in the research run.  Deployed SHADOW/PAPER/LIVE runtimes must reuse the
-exact universe from a passing run; changing the universe requires new research.
+of book depth), never on historical/future return. The selected symbols are recorded
+in research. RESEARCH -> SHADOW promotion locks that exact universe in QuantStore;
+SHADOW/PAPER/LIVE must reuse it. Replacing symbols therefore requires a new research
+cycle and explicit lifecycle reset rather than silent production drift.
 """
 
 from __future__ import annotations
@@ -14,8 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Mapping, Optional
 
-# Active/tradable Alpaca BASE/USD candidates verified on 2026-08-18.  This is a
-# discovery pool, not an approved trading universe.  Broker startup still verifies
+ADAPTIVE_LOCKED_UNIVERSE_KEY = "crypto_intraday_adaptive.locked_universe.v2"
+
+# Active/tradable Alpaca BASE/USD candidates verified on 2026-08-18. This is a
+# discovery pool, not an approved trading universe. Broker startup still verifies
 # every selected asset because listings can change.
 ADAPTIVE_USD_CANDIDATE_POOL = (
     "BTC/USD",
@@ -109,7 +112,12 @@ def _quote_age_seconds(quote, now: datetime) -> Optional[float]:
         return None
 
 
-def score_quote(symbol: str, quote, config: LiquiditySelectionConfig, now: datetime) -> LiquidityMetric:
+def score_quote(
+    symbol: str,
+    quote,
+    config: LiquiditySelectionConfig,
+    now: datetime,
+) -> LiquidityMetric:
     if quote is None:
         return LiquidityMetric(symbol, False, 0.0, None, None, None, "missing_quote")
     age = _quote_age_seconds(quote, now)
@@ -140,7 +148,10 @@ def score_quote(symbol: str, quote, config: LiquiditySelectionConfig, now: datet
 
     freshness = max(0.0, 1.0 - age / config.max_quote_age_seconds)
     spread_quality = max(0.0, 1.0 - spread / config.max_spread_bps)
-    depth_quality = min(1.0, math.log1p(side_depth / config.min_side_depth_usd) / math.log(21.0))
+    depth_quality = min(
+        1.0,
+        math.log1p(side_depth / config.min_side_depth_usd) / math.log(21.0),
+    )
     score = 0.45 * spread_quality + 0.30 * freshness + 0.25 * depth_quality
     return LiquidityMetric(symbol, True, score, age, spread, side_depth, "eligible")
 
@@ -166,7 +177,8 @@ def select_liquid_universe(
         key=lambda metric: (-metric.score, metric.symbol),
     )
     benchmark = next(
-        (m for m in eligible if m.symbol == config.benchmark_symbol), None
+        (metric for metric in eligible if metric.symbol == config.benchmark_symbol),
+        None,
     )
     if benchmark is None:
         raise ValueError("Benchmark BTC/USD is not currently liquidity-eligible.")
@@ -198,7 +210,11 @@ def universe_from_research_run(run: Optional[dict]) -> Optional[tuple[str, ...]]
     if not isinstance(values, list) or not values:
         return None
     symbols = tuple(str(value) for value in values)
-    if len(set(symbols)) != len(symbols) or "BTC/USD" not in symbols:
+    if (
+        not 6 <= len(symbols) <= 12
+        or len(set(symbols)) != len(symbols)
+        or "BTC/USD" not in symbols
+    ):
         return None
     return symbols
 
@@ -209,3 +225,51 @@ def latest_passing_universe(store, strategy_id: str) -> Optional[tuple[str, ...]
         if universe is not None:
             return universe
     return None
+
+
+def lock_deployment_universe(store, universe: tuple[str, ...]) -> None:
+    if (
+        not 6 <= len(universe) <= 12
+        or len(set(universe)) != len(universe)
+        or "BTC/USD" not in universe
+    ):
+        raise ValueError("Cannot lock an invalid adaptive deployment universe.")
+    store.set_kv(ADAPTIVE_LOCKED_UNIVERSE_KEY, json.dumps(list(universe)))
+
+
+def locked_deployment_universe(store) -> Optional[tuple[str, ...]]:
+    raw = store.get_kv(ADAPTIVE_LOCKED_UNIVERSE_KEY)
+    if not raw:
+        return None
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(values, list):
+        return None
+    universe = tuple(str(value) for value in values)
+    if (
+        not 6 <= len(universe) <= 12
+        or len(set(universe)) != len(universe)
+        or "BTC/USD" not in universe
+    ):
+        return None
+    return universe
+
+
+def require_locked_universe(
+    store,
+    requested: Optional[tuple[str, ...]] = None,
+) -> tuple[str, ...]:
+    locked = locked_deployment_universe(store)
+    if locked is None:
+        raise ValueError(
+            "Adaptive deployment universe is not locked. Promote a passing "
+            "RESEARCH run to SHADOW first."
+        )
+    if requested is not None and tuple(requested) != locked:
+        raise ValueError(
+            "Requested runtime universe does not exactly match the promoted "
+            f"research universe. locked={locked}, requested={tuple(requested)}"
+        )
+    return locked
