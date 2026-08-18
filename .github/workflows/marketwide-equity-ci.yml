@@ -26,16 +26,14 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-mobile-api.txt
-      - name: Compile and test market-wide path
+      - name: Compile, install, and test with durable diagnostics
         id: verify
         shell: bash
         run: |
           set +e
           : > marketwide-ci.log
+
+          echo "=== compile ===" >> marketwide-ci.log
           python -m py_compile \
             equity_market_data.py \
             equity_marketwide_engine.py \
@@ -43,13 +41,29 @@ jobs:
             scripts/run_marketwide_equity_runtime.py \
             tests/test_equity_marketwide.py >> marketwide-ci.log 2>&1
           compile_status=$?
+
+          echo "=== install ===" >> marketwide-ci.log
+          python -m pip install --upgrade pip >> marketwide-ci.log 2>&1
+          pip_upgrade_status=$?
+          python -m pip install -r requirements.txt -r requirements-mobile-api.txt >> marketwide-ci.log 2>&1
+          install_status=$?
+
           test_status=0
-          if [ "$compile_status" -eq 0 ]; then
+          if [ "$compile_status" -eq 0 ] && [ "$pip_upgrade_status" -eq 0 ] && [ "$install_status" -eq 0 ]; then
+            echo "=== pytest ===" >> marketwide-ci.log
             python -m pytest -q tests/test_equity_marketwide.py >> marketwide-ci.log 2>&1
             test_status=$?
+          else
+            echo "=== pytest skipped because compile/install failed ===" >> marketwide-ci.log
           fi
+
+          echo "compile_status=$compile_status" >> marketwide-ci.log
+          echo "pip_upgrade_status=$pip_upgrade_status" >> marketwide-ci.log
+          echo "install_status=$install_status" >> marketwide-ci.log
+          echo "test_status=$test_status" >> marketwide-ci.log
           cat marketwide-ci.log
-          if [ "$compile_status" -ne 0 ] || [ "$test_status" -ne 0 ]; then
+
+          if [ "$compile_status" -ne 0 ] || [ "$pip_upgrade_status" -ne 0 ] || [ "$install_status" -ne 0 ] || [ "$test_status" -ne 0 ]; then
             exit 1
           fi
       - name: Upload verification log
