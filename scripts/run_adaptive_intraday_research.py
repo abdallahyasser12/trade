@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Research adaptive intraday v2 on real Alpaca data.
 
-The default universe is selected *before* research from current executability only:
+The default universe is selected before research from current executability only:
 quote freshness, spread and top-of-book depth. Return history is never used to choose
-symbols. The resulting universe is stored with the research run and deployment must
-reuse that exact universe until a new research run approves a replacement.
+symbols. The exact selected symbol order is persisted with the research evidence and
+later locked by RESEARCH -> SHADOW promotion.
 
 The runner adds breadth, concentration, activity and expectancy gates on top of
 chronological walk-forward, stressed execution costs, DSR multiple-testing correction
@@ -69,6 +69,19 @@ def _feed() -> AlpacaCryptoDataFeed:
     return AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
 
 
+def _spread_p75(metrics, symbols: tuple[str, ...]) -> float:
+    by_symbol = {metric.symbol: metric for metric in metrics}
+    spreads = sorted(
+        float(by_symbol[symbol].spread_bps)
+        for symbol in symbols
+        if by_symbol.get(symbol) is not None and by_symbol[symbol].spread_bps is not None
+    )
+    if not spreads:
+        return 0.0
+    index = min(len(spreads) - 1, max(0, math.ceil(0.75 * len(spreads)) - 1))
+    return spreads[index]
+
+
 def _liquidity_selected_symbols(feed: AlpacaCryptoDataFeed):
     quotes = feed.get_latest_quotes(list(ADAPTIVE_USD_CANDIDATE_POOL))
     symbols, metrics = select_liquid_universe(
@@ -82,19 +95,7 @@ def _liquidity_selected_symbols(feed: AlpacaCryptoDataFeed):
         ),
         now=datetime.now(timezone.utc),
     )
-    by_symbol = {metric.symbol: metric for metric in metrics}
-    selected_spreads = [
-        float(by_symbol[symbol].spread_bps)
-        for symbol in symbols
-        if by_symbol[symbol].spread_bps is not None
-    ]
-    selected_spreads.sort()
-    p75_index = min(
-        len(selected_spreads) - 1,
-        max(0, math.ceil(0.75 * len(selected_spreads)) - 1),
-    )
-    observed_spread_p75 = selected_spreads[p75_index] if selected_spreads else 0.0
-    return symbols, metrics, observed_spread_p75
+    return symbols, metrics, _spread_p75(metrics, symbols)
 
 
 def _real_bars(feed, symbols: tuple[str, ...], timeframe: str, days: int):
@@ -160,6 +161,7 @@ def _diagnostics(report, universe_size: int):
         if growth > 0 and test_days > 0
         else -100.0
     )
+
     symbol_pnl = defaultdict(float)
     traded_symbols = set()
     positive_fold_profit = []
@@ -170,9 +172,10 @@ def _diagnostics(report, universe_size: int):
             if trade.net_pnl is not None:
                 symbol_pnl[trade.symbol] += float(trade.net_pnl)
                 traded_symbols.add(trade.symbol)
-            r = trade.r_multiple
-            if r is not None and math.isfinite(r):
-                r_values.append(float(r))
+            r_value = trade.r_multiple
+            if r_value is not None and math.isfinite(r_value):
+                r_values.append(float(r_value))
+
     positive_symbol_pnl = {symbol: max(0.0, pnl) for symbol, pnl in symbol_pnl.items()}
     positive_total = sum(positive_symbol_pnl.values())
     symbol_concentration = (
@@ -294,7 +297,9 @@ def main() -> int:
                     f"side_depth=${metric.side_depth_usd:.0f} score={metric.score:.3f}"
                 )
         if not 6 <= len(symbols) <= 12 or "BTC/USD" not in symbols:
-            raise ValueError("Adaptive research universe must contain BTC/USD and 6-12 symbols.")
+            raise ValueError(
+                "Adaptive research universe must contain BTC/USD and 6-12 symbols."
+            )
         bars = _real_bars(feed, symbols, args.timeframe, args.days)
         build, grid = _factory(symbols, args.timeframe)
     except Exception as error:
@@ -318,7 +323,10 @@ def main() -> int:
                 fee_bps=args.fee_bps,
                 annualization_factor=crypto_bars_per_year(args.timeframe),
             ),
-            exit_policy=ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True),
+            exit_policy=ExitPolicyConfig(
+                enable_trailing_stop=True,
+                enable_runner=True,
+            ),
             walk_config=QuantWalkForwardConfig(
                 train_bars=4_032,
                 test_bars=1_152,
@@ -345,6 +353,12 @@ def main() -> int:
             ),
             prior_trials=store.total_trials(ADAPTIVE_STRATEGY_ID),
         )
+        # The generic factory keeps its own generic universe representation. For
+        # adaptive v2, deployment identity includes ordering because deterministic
+        # cross-sectional tie-breaking uses configured symbol order. Persist exactly
+        # the tuple that was researched so promotion/runtime cannot reorder it.
+        report.protocol["universe"] = list(symbols)
+
         diagnostics = _diagnostics(report, len(symbols))
         _add_robustness_gates(report, diagnostics)
 
