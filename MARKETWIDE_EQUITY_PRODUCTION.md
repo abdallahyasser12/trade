@@ -23,9 +23,12 @@ universe. That bounded universe is required because research must be computation
 reproducible and because one strategy instance is capped at 64 symbols.
 
 After a strategy advances beyond RESEARCH, the runtime may temporarily **remove** a
-locked symbol that is no longer executable, but it may never add a symbol that was not
-in the promoted research manifest. To change code, timeframe, universe order or any
-runtime configuration, rerun research on the new final commit.
+locked symbol from fresh-entry eligibility when it is no longer executable, but it may
+never add a symbol that was not in the promoted research manifest. A currently held
+SHADOW symbol remains in a separate management-only set so its virtual stops/exits keep
+receiving completed bars; that management exception does not restore permission for a
+new SHADOW or PAPER BUY. To change code, timeframe, universe order or any runtime
+configuration, rerun research on the new final commit.
 
 ## Strategies and ranking
 
@@ -113,7 +116,9 @@ python scripts/run_marketwide_equity_runtime.py
 
 A SHADOW strategy receives real current bars and quotes but no broker allocation. Its
 virtual positions pay modeled slippage/spread/fees, maintain virtual stops/trailing
-stops and write shadow-only attribution.
+stops and write shadow-only attribution. Fresh SHADOW BUYs are subjected to the same
+current entry-eligible universe as PAPER; management-only held symbols may produce
+EXIT/stop evidence but may not create new virtual risk.
 
 SHADOW -> PAPER requires **all** of:
 
@@ -152,9 +157,15 @@ For PAPER strategies the engine:
   lifecycle health is broker-backed evidence;
 - treats a fill through the planned stop as an invalidated setup, adopts the position
   first, then immediately flattens it with conservative fallback stop protection;
-- blocks fresh entries near the close, at the conservative day-trade account gate, at
-  the session-loss halt, or whenever lifecycle/portfolio/cost/evidence gates reject;
+- blocks fresh entries near the close, when cash/buying power is unavailable, at the
+  session-loss halt, or whenever lifecycle/portfolio/cost/evidence gates reject;
 - leaves protective stops in place on graceful process shutdown.
+
+The market-wide runner uses `AlpacaIntradayMarginPaperBroker`, which does not depend on
+legacy PDT/day-trade-count account fields removed from Alpaca's Trading API in July
+2026. The engine is long-only and sizes new orders by the lesser of available cash and
+current buying power; Alpaca's current real-time pre-trade intraday-margin checks remain
+the final broker authority.
 
 The default session equity-loss halt is 2%. When it trips, the kill switch is persisted
 and new entries stop. After investigating the cause, restart requires explicit operator
@@ -166,10 +177,10 @@ python scripts/run_marketwide_equity_runtime.py --acknowledge-kill-switch
 
 ## Live-money boundary
 
-This implementation deliberately stops at PAPER. The runner constructs
-`AlpacaPaperBroker`, the engine independently verifies PAPER mode at startup, the
-existing equity broker order boundary rejects LIVE equity orders, and the market-wide
-lifecycle CLI refuses promotion beyond PAPER.
+This implementation deliberately stops at PAPER. The runner constructs the paper-only
+`AlpacaIntradayMarginPaperBroker`, the engine independently verifies PAPER mode at
+startup, the existing equity broker order boundary rejects LIVE equity orders, and the
+market-wide lifecycle CLI refuses promotion beyond PAPER.
 
 Do not weaken those controls to get more trades. A future live-equity path should be a
 separate audited change with measured PAPER execution evidence, operational-defect
@@ -198,6 +209,7 @@ python scripts/manage_marketwide_equity_lifecycle.py status \
 ## Verification gate
 
 `.github/workflows/marketwide-equity-ci.yml` compiles every new runtime/research module
-and runs the market-wide selector, manifest, restart/gap-recovery, strict lifecycle and
-exactly-once attribution regression tests. The repository's existing full Python CI
-remains the broader regression gate.
+and runs the current Alpaca account-schema, market-wide selector, manifest,
+restart/gap-recovery, SHADOW entry-gating, strict lifecycle and exactly-once attribution
+regression tests. The repository's existing full Python CI remains the broader
+regression gate.
