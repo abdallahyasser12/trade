@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Research the adaptive v2 intraday strategy on real Alpaca data.
+"""Research adaptive intraday v2 on real Alpaca data.
 
-The runner is intentionally harder to pass than the generic research command. It
-adds breadth, concentration, activity and trade-expectancy gates on top of
-chronological walk-forward, stressed execution costs, DSR multiple-testing
-correction and Monte Carlo ruin.
+The default universe is selected *before* research from current executability only:
+quote freshness, spread and top-of-book depth. Return history is never used to choose
+symbols. The resulting universe is stored with the research run and deployment must
+reuse that exact universe until a new research run approves a replacement.
 
-The 2%/day objective is diagnostic only. A run may pass because it demonstrates
-robust positive expectancy even when 2%/day is not observed; conversely, a run that
-prints 2%/day but fails robustness cannot promote.
-
-Base execution-cost assumptions are CLI inputs so PAPER -> LIVE_CANARY research can
-be rerun with slippage at least as adverse as the broker's measured execution. Stress
-costs are always at least as severe as the configured base costs.
+The runner adds breadth, concentration, activity and expectancy gates on top of
+chronological walk-forward, stressed execution costs, DSR multiple-testing correction
+and Monte Carlo ruin. The requested 2%/day number is diagnostic only.
 """
 
 from __future__ import annotations
@@ -32,10 +28,11 @@ from crypto_config import crypto_bars_per_year
 from crypto_data_feed import AlpacaCryptoDataFeed
 from intraday_crypto_engine import ADAPTIVE_STRATEGY_ID
 from quant.exits import ExitPolicyConfig
-from quant.intraday import (
-    DEFAULT_INTRADAY_OBJECTIVE,
-    HIGH_VELOCITY_CRYPTO_UNIVERSE,
-    make_high_velocity_strategy_config,
+from quant.intraday import DEFAULT_INTRADAY_OBJECTIVE, make_high_velocity_strategy_config
+from quant.liquidity_universe import (
+    ADAPTIVE_USD_CANDIDATE_POOL,
+    LiquiditySelectionConfig,
+    select_liquid_universe,
 )
 from quant.research.factory import (
     GateResult,
@@ -65,11 +62,42 @@ def _git_commit() -> str | None:
         return None
 
 
-def _real_bars(symbols: tuple[str, ...], timeframe: str, days: int):
+def _feed() -> AlpacaCryptoDataFeed:
     credentials = load_credentials()
     if not credentials.is_configured:
         raise RuntimeError("Alpaca credentials are required for real adaptive research.")
-    feed = AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
+    return AlpacaCryptoDataFeed(credentials.api_key, credentials.secret_key)
+
+
+def _liquidity_selected_symbols(feed: AlpacaCryptoDataFeed):
+    quotes = feed.get_latest_quotes(list(ADAPTIVE_USD_CANDIDATE_POOL))
+    symbols, metrics = select_liquid_universe(
+        quotes,
+        config=LiquiditySelectionConfig(
+            max_symbols=12,
+            min_symbols=6,
+            max_quote_age_seconds=120.0,
+            max_spread_bps=40.0,
+            min_side_depth_usd=250.0,
+        ),
+        now=datetime.now(timezone.utc),
+    )
+    by_symbol = {metric.symbol: metric for metric in metrics}
+    selected_spreads = [
+        float(by_symbol[symbol].spread_bps)
+        for symbol in symbols
+        if by_symbol[symbol].spread_bps is not None
+    ]
+    selected_spreads.sort()
+    p75_index = min(
+        len(selected_spreads) - 1,
+        max(0, math.ceil(0.75 * len(selected_spreads)) - 1),
+    )
+    observed_spread_p75 = selected_spreads[p75_index] if selected_spreads else 0.0
+    return symbols, metrics, observed_spread_p75
+
+
+def _real_bars(feed, symbols: tuple[str, ...], timeframe: str, days: int):
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
     bars = {symbol: feed.get_bars(symbol, timeframe, start, end) for symbol in symbols}
@@ -85,8 +113,6 @@ def _factory(symbols: tuple[str, ...], timeframe: str):
     def build(params):
         return AdaptiveIntradayStrategy(base, AdaptiveIntradayConfig(**params))
 
-    # Structural grid only: 18 hypotheses. Do not expand this just to make an old
-    # data set look better; cumulative trial count is carried into DSR.
     structures = (
         (2, 9, 30, 16, 48),
         (3, 12, 36, 18, 54),
@@ -124,10 +150,7 @@ def _factory(symbols: tuple[str, ...], timeframe: str):
 
 def _diagnostics(report, universe_size: int):
     test_days = sum(
-        max(
-            (fold.test_end - fold.test_start).total_seconds() / 86_400.0,
-            1.0 / 288.0,
-        )
+        max((fold.test_end - fold.test_start).total_seconds() / 86_400.0, 1.0 / 288.0)
         for fold in report.folds
     )
     trades_per_day = report.total_oos_trades / test_days if test_days > 0 else 0.0
@@ -137,7 +160,6 @@ def _diagnostics(report, universe_size: int):
         if growth > 0 and test_days > 0
         else -100.0
     )
-
     symbol_pnl = defaultdict(float)
     traded_symbols = set()
     positive_fold_profit = []
@@ -151,10 +173,7 @@ def _diagnostics(report, universe_size: int):
             r = trade.r_multiple
             if r is not None and math.isfinite(r):
                 r_values.append(float(r))
-
-    positive_symbol_pnl = {
-        symbol: max(0.0, pnl) for symbol, pnl in symbol_pnl.items()
-    }
+    positive_symbol_pnl = {symbol: max(0.0, pnl) for symbol, pnl in symbol_pnl.items()}
     positive_total = sum(positive_symbol_pnl.values())
     symbol_concentration = (
         max(positive_symbol_pnl.values()) / positive_total
@@ -168,13 +187,12 @@ def _diagnostics(report, universe_size: int):
         else 1.0
     )
     expectancy_r = sum(r_values) / len(r_values) if r_values else None
-    min_active_symbols = min(6, max(3, math.ceil(universe_size / 2)))
     return {
         "test_days": test_days,
         "trades_per_day": trades_per_day,
         "geometric_daily_return_pct": geometric_daily,
         "active_symbols": len(traded_symbols),
-        "min_active_symbols": min_active_symbols,
+        "min_active_symbols": min(6, max(3, math.ceil(universe_size / 2))),
         "symbol_profit_concentration": symbol_concentration,
         "fold_profit_concentration": fold_concentration,
         "expectancy_r": expectancy_r,
@@ -258,18 +276,32 @@ def main() -> int:
             print(error, file=sys.stderr)
             return 2
 
-    symbols = tuple(args.symbols or HIGH_VELOCITY_CRYPTO_UNIVERSE)
-    if len(symbols) < 6:
-        print("Adaptive research requires at least six symbols for breadth evidence.", file=sys.stderr)
-        return 2
-
     try:
-        bars = _real_bars(symbols, args.timeframe, args.days)
+        feed = _feed()
+        if args.symbols:
+            symbols = tuple(args.symbols)
+            observed_spread_p75 = 0.0
+            print("Universe source: explicit --symbols (stored with this run).")
+        else:
+            symbols, metrics, observed_spread_p75 = _liquidity_selected_symbols(feed)
+            by_symbol = {metric.symbol: metric for metric in metrics}
+            print("Universe source: current executable-liquidity selection.")
+            for symbol in symbols:
+                metric = by_symbol[symbol]
+                print(
+                    f"  {symbol:<12} spread={metric.spread_bps:.2f}bps "
+                    f"age={metric.quote_age_seconds:.1f}s "
+                    f"side_depth=${metric.side_depth_usd:.0f} score={metric.score:.3f}"
+                )
+        if not 6 <= len(symbols) <= 12 or "BTC/USD" not in symbols:
+            raise ValueError("Adaptive research universe must contain BTC/USD and 6-12 symbols.")
+        bars = _real_bars(feed, symbols, args.timeframe, args.days)
         build, grid = _factory(symbols, args.timeframe)
     except Exception as error:
         print(f"COULD NOT RUN: {error}", file=sys.stderr)
         return 2
 
+    effective_spread_bps = max(args.spread_bps, observed_spread_p75)
     store = QuantStore(args.db)
     try:
         report = run_quant_walk_forward(
@@ -282,14 +314,11 @@ def main() -> int:
                 max_positions=6,
                 max_total_exposure_pct=30.0,
                 slippage_bps=args.slippage_bps,
-                spread_bps=args.spread_bps,
+                spread_bps=effective_spread_bps,
                 fee_bps=args.fee_bps,
                 annualization_factor=crypto_bars_per_year(args.timeframe),
             ),
-            exit_policy=ExitPolicyConfig(
-                enable_trailing_stop=True,
-                enable_runner=True,
-            ),
+            exit_policy=ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True),
             walk_config=QuantWalkForwardConfig(
                 train_bars=4_032,
                 test_bars=1_152,
@@ -298,7 +327,7 @@ def main() -> int:
                 min_train_trades=40,
                 max_candidates=32,
                 stress_slippage_bps=max(25.0, args.slippage_bps * 1.5),
-                stress_spread_bps=max(25.0, args.spread_bps * 1.5),
+                stress_spread_bps=max(30.0, effective_spread_bps * 1.5),
                 stress_fee_bps=max(50.0, args.fee_bps * 1.5),
             ),
             criteria=QuantPromotionCriteria(
@@ -320,6 +349,7 @@ def main() -> int:
         _add_robustness_gates(report, diagnostics)
 
         print(f"\n=== Adaptive intraday v2 — {ADAPTIVE_STRATEGY_ID} ===")
+        print(f"universe={', '.join(symbols)}")
         print(
             f"folds={len(report.folds)} candidates={report.candidate_count} "
             f"trials={report.trial_count} OOS_trades={report.total_oos_trades}"
@@ -331,10 +361,9 @@ def main() -> int:
         )
         print(
             f"activity={diagnostics['trades_per_day']:.2f}/day across "
-            f"{diagnostics['active_symbols']} symbols; E[R]="
-            f"{diagnostics['expectancy_r']}R; symbol concentration="
-            f"{diagnostics['symbol_profit_concentration']:.3f}; fold concentration="
-            f"{diagnostics['fold_profit_concentration']:.3f}"
+            f"{diagnostics['active_symbols']} symbols; E[R]={diagnostics['expectancy_r']}R; "
+            f"symbol concentration={diagnostics['symbol_profit_concentration']:.3f}; "
+            f"fold concentration={diagnostics['fold_profit_concentration']:.3f}"
         )
         print(
             f"geometric OOS={diagnostics['geometric_daily_return_pct']:+.3f}%/day; "
@@ -343,7 +372,7 @@ def main() -> int:
         )
         print(
             f"cost model: slippage={args.slippage_bps:.2f}bps, "
-            f"spread={args.spread_bps:.2f}bps, fee={args.fee_bps:.2f}bps"
+            f"spread={effective_spread_bps:.2f}bps, fee={args.fee_bps:.2f}bps"
         )
         print("\nGates:")
         for gate in report.gates:
