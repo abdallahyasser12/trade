@@ -6,6 +6,7 @@ on:
       - "equity_market_data.py"
       - "equity_marketwide_engine.py"
       - "equity_marketwide_deployment.py"
+      - "equity_marketwide_production_engine.py"
       - "quant/equity_marketwide.py"
       - "quant/equity_manifest.py"
       - "quant/equity_attribution.py"
@@ -14,6 +15,7 @@ on:
       - "scripts/run_marketwide_equity_research.py"
       - "scripts/manage_marketwide_equity_lifecycle.py"
       - "tests/test_equity_marketwide*.py"
+      - "tests/test_equity_production_partition.py"
       - "tests/test_equity_manifest.py"
       - "tests/test_equity_attribution.py"
       - "tests/test_equity_lifecycle.py"
@@ -47,6 +49,7 @@ jobs:
             equity_market_data.py \
             equity_marketwide_engine.py \
             equity_marketwide_deployment.py \
+            equity_marketwide_production_engine.py \
             quant/equity_marketwide.py \
             quant/equity_manifest.py \
             quant/equity_attribution.py \
@@ -58,7 +61,8 @@ jobs:
             tests/test_equity_manifest.py \
             tests/test_equity_marketwide_recovery.py \
             tests/test_equity_attribution.py \
-            tests/test_equity_lifecycle.py >> marketwide-ci.log 2>&1
+            tests/test_equity_lifecycle.py \
+            tests/test_equity_production_partition.py >> marketwide-ci.log 2>&1
           compile_status=$?
 
           echo "=== install ===" >> marketwide-ci.log
@@ -75,7 +79,8 @@ jobs:
               tests/test_equity_manifest.py \
               tests/test_equity_marketwide_recovery.py \
               tests/test_equity_attribution.py \
-              tests/test_equity_lifecycle.py >> marketwide-ci.log 2>&1
+              tests/test_equity_lifecycle.py \
+              tests/test_equity_production_partition.py >> marketwide-ci.log 2>&1
             test_status=$?
           else
             echo "=== pytest skipped because compile/install failed ===" >> marketwide-ci.log
