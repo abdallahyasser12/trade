@@ -14,21 +14,23 @@ scanned: inactive/non-tradable assets, missing or stale quotes, wide spreads, pr
 outside the configured range, insufficient completed daily history and insufficient
 average dollar volume.
 
-The default production research universe contains **48** executable names. If SPY
-passes exactly the same hard executability/liquidity gates, it reserves one slot as the
-stable market benchmark; the remaining slots are filled by a deterministic
-liquidity/freshness score. SPY is not inserted when it is itself unexecutable, and no
-historical return, strategy P&L, Sharpe, hit rate or future information chooses the
-universe. That bounded universe is required because research must be computationally
-reproducible and because one strategy instance is capped at 64 symbols.
+The deployable researched desk uses one reproducible strategy instance containing
+**12–48 symbols**, with **48** as the default. If SPY passes exactly the same hard
+executability/liquidity gates, it reserves one slot as the stable market benchmark; the
+remaining slots are filled by a deterministic liquidity/freshness score. SPY is not
+inserted when it is itself unexecutable, and no historical return, strategy P&L,
+Sharpe, hit rate or future information chooses the universe. The bounded one-shard desk
+keeps research and forward execution structurally identical; increasing the runtime
+above 48 symbols is rejected rather than silently creating a deployment shape that was
+not researched.
 
 After a strategy advances beyond RESEARCH, the runtime may temporarily **remove** a
 locked symbol from fresh-entry eligibility when it is no longer executable, but it may
 never add a symbol that was not in the promoted research manifest. A currently held
 SHADOW symbol remains in a separate management-only set so its virtual stops/exits keep
 receiving completed bars; that management exception does not restore permission for a
-new SHADOW or PAPER BUY. To change code, timeframe, universe order or any runtime
-configuration, rerun research on the new final commit.
+new SHADOW or PAPER BUY. To change code, timeframe, universe order, universe size or
+any runtime configuration, rerun research on the new final commit.
 
 ## Strategies and ranking
 
@@ -63,6 +65,9 @@ python scripts/run_marketwide_equity_research.py \
   --universe-size 48 \
   --history-bars 6500
 ```
+
+`--universe-size` may be 12–48. The runtime must use the same value because the complete
+runtime configuration is part of the immutable deployment manifest.
 
 The runner:
 
@@ -108,10 +113,11 @@ before lifecycle privilege increases, so a crash cannot leave SHADOW without ide
 
 ## SHADOW forward evidence
 
-Start the same production runtime:
+Start the same production runtime with the same manifest-bound universe size used for
+research (48 is the default):
 
 ```bash
-python scripts/run_marketwide_equity_runtime.py
+python scripts/run_marketwide_equity_runtime.py --max-scan-symbols 48
 ```
 
 A SHADOW strategy receives real current bars and quotes but no broker allocation. Its
@@ -136,7 +142,7 @@ kept separate.
 Run the same manifest-locked runtime:
 
 ```bash
-python scripts/run_marketwide_equity_runtime.py
+python scripts/run_marketwide_equity_runtime.py --max-scan-symbols 48
 ```
 
 For PAPER strategies the engine:
