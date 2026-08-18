@@ -161,6 +161,25 @@ class ProductionMarketWideEquityTradeEngine(ManifestLockedMarketWideEquityTradeE
                 session_id=self.session_id,
             )
 
+    def _entries_allowed_by_clock(self, account, clock, now) -> bool:
+        """Use Alpaca's current intraday-margin model, not removed PDT counters.
+
+        The engine is long-only and sizes every order by the lesser of available cash
+        and current buying power. Alpaca's current real-time pre-trade checks remain the
+        final margin authority. This local gate only prevents stale/near-close/no-funds
+        entry attempts and deliberately never references removed day-trade fields.
+        """
+        if not clock.is_open:
+            return False
+        seconds_to_close = (clock.next_close - now).total_seconds()
+        if seconds_to_close <= self.config.near_close_entry_block_minutes * 60:
+            self._warn("Fresh equity entries are blocked near the market close.")
+            return False
+        if account.cash <= 0 or account.buying_power <= 0:
+            self._warn("Fresh equity entries are blocked because no cash/buying power is available.")
+            return False
+        return True
+
     def _execute_ranked_entries(
         self,
         decisions,
