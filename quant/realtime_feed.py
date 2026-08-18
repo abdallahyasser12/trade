@@ -1,29 +1,34 @@
 """Real-time crypto feed adapter: fresh quotes, one history fetch per completed bar.
 
-A 5-second protection loop should refresh live quotes every cycle, but it should
-not download the same 5-minute OHLCV history 60 times before the next bar closes.
-This adapter keys the bar cache by the *latest safely completed bar bucket* while
-passing quote calls straight through.
+A fast protection loop must refresh quotes on every cycle without downloading the
+same OHLCV history repeatedly.  An optional quote observer receives every fresh quote
+snapshot for dashboards/telemetry; observer failures are logged and never interfere
+with broker protection or trading-state reconciliation.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from threading import RLock
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
 from config import timeframe_to_timedelta
 
+logger = logging.getLogger(__name__)
+
 
 class CompletedBarCachingCryptoFeed:
     """Wrap an AlpacaCryptoDataFeed-compatible object without stale quote caching."""
 
-    def __init__(self, backend):
+    def __init__(self, backend, *, quote_observer: Optional[Callable[[object], None]] = None):
         self.backend = backend
+        self.quote_observer = quote_observer
         self._lock = RLock()
         self._cache: dict[tuple[str, str, int], tuple[pd.Timestamp, pd.DataFrame]] = {}
+        self._quote_observer_failures = 0
 
     def set_interrupt_event(self, event) -> None:
         setter = getattr(self.backend, "set_interrupt_event", None)
@@ -33,6 +38,10 @@ class CompletedBarCachingCryptoFeed:
     @property
     def rate_limit_events(self) -> int:
         return int(getattr(self.backend, "rate_limit_events", 0))
+
+    @property
+    def quote_observer_failures(self) -> int:
+        return self._quote_observer_failures
 
     @staticmethod
     def _completed_bucket(
@@ -80,9 +89,16 @@ class CompletedBarCachingCryptoFeed:
         return frame
 
     def get_latest_quotes(self, symbols):
-        # Never cache quotes: spread/freshness and the stop watchdog need current
-        # market state on every engine cycle.
-        return self.backend.get_latest_quotes(symbols)
+        # Never cache quotes: spread/freshness, depth and stop watchdogs require the
+        # current market state on every engine cycle.
+        quotes = self.backend.get_latest_quotes(symbols)
+        if self.quote_observer is not None:
+            try:
+                self.quote_observer(quotes)
+            except Exception:  # telemetry must never break protective execution
+                self._quote_observer_failures += 1
+                logger.exception("Real-time quote telemetry observer failed")
+        return quotes
 
     def invalidate(self) -> None:
         with self._lock:
