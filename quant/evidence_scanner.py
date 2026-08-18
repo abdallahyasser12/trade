@@ -1,12 +1,13 @@
 """Production scanner extension with evidence, microstructure and sleeve supervision.
 
-Trade hit-rate is not confidence: positive expectancy can coexist with sub-50% hit
-rate.  Confidence is derived from trade-level expectancy evidence.
+Adaptive-v2 execution evidence is lifecycle-scoped.  A newly promoted rung cannot
+bootstrap from zero trades, so it may temporarily bridge only the immediately
+preceding qualified rung.  After 40 current-rung real trades, current-rung evidence
+becomes authoritative.  Arbitrary old history is never pooled into v2 entry
+confidence.
 
-Live bid/ask depth is used only as an adverse-selection penalty.  Favorable imbalance
-never manufactures alpha.  Adaptive-v2 sleeve supervision is also negative-only:
-after enough current-lifecycle real trades, deteriorating sleeves can reduce or lose
-entry privilege, but recent winners never receive a confidence boost above baseline.
+Live depth and sleeve adaptation remain negative-only: neither can manufacture or
+boost alpha above baseline.
 """
 
 from __future__ import annotations
@@ -14,9 +15,13 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-from quant.marketplace import MIN_SAMPLE
+from quant.contracts import StrategyState
+from quant.marketplace import MIN_SAMPLE, compute_strategy_health
 from quant.scanner import QuantScanner
 from quant.sleeve_supervision import compute_sleeve_health, sleeve_from_entry_reason
+
+ADAPTIVE_STRATEGY_ID = "crypto_intraday_adaptive"
+CURRENT_RUNG_AUTHORITY_TRADES = 40
 
 
 def expectancy_confidence(health) -> float:
@@ -67,9 +72,7 @@ def adverse_depth_quality(imbalance: float | None) -> float:
     return max(0.50, 1.0 + 0.50 * imbalance)
 
 
-def _state_since(store, strategy_id: str):
-    row = store.get_strategy_state(strategy_id)
-    raw = row.get("since") if row else None
+def _parse_time(raw):
     if not raw:
         return None
     try:
@@ -81,8 +84,77 @@ def _state_since(store, strategy_id: str):
     return timestamp.astimezone(timezone.utc)
 
 
+def _state_since(store, strategy_id: str):
+    row = store.get_strategy_state(strategy_id)
+    return _parse_time(row.get("since") if row else None)
+
+
+def _immediately_prior_rung_start(store, strategy_id: str, state: StrategyState):
+    """Return (previous_state, previous_state_start) from immutable transition history."""
+    history = store.get_promotion_history(strategy_id, limit=500)
+    current_index = None
+    current_event = None
+    for index, event in enumerate(history):
+        if event.get("to_state") == state.value:
+            current_index = index
+            current_event = event
+            break
+    if current_event is None or current_index is None:
+        return None, None
+    try:
+        previous_state = StrategyState(str(current_event.get("from_state")))
+    except (TypeError, ValueError):
+        return None, None
+    for event in history[current_index + 1 :]:
+        if event.get("to_state") == previous_state.value:
+            return previous_state, _parse_time(event.get("timestamp"))
+    return previous_state, None
+
+
+def adaptive_deployment_health(store, lifecycle, strategy_id: str):
+    """Current-rung health, with a bounded one-rung bootstrap bridge when necessary."""
+    state = lifecycle.state(strategy_id)
+    current_since = _state_since(store, strategy_id)
+    current = compute_strategy_health(
+        store,
+        strategy_id,
+        state,
+        include_shadow=False,
+        since=current_since,
+    )
+    if current.trades >= CURRENT_RUNG_AUTHORITY_TRADES:
+        return current, "current_rung"
+
+    previous_state, previous_since = _immediately_prior_rung_start(
+        store,
+        strategy_id,
+        state,
+    )
+    if previous_state is None or previous_since is None:
+        return current, "current_rung_insufficient"
+    if previous_state not in {
+        StrategyState.SHADOW,
+        StrategyState.PAPER,
+        StrategyState.LIVE_CANARY,
+        StrategyState.LIVE,
+        StrategyState.REDUCED_RISK,
+    }:
+        return current, "current_rung_insufficient"
+
+    bridge = compute_strategy_health(
+        store,
+        strategy_id,
+        state,
+        include_shadow=previous_state is StrategyState.SHADOW,
+        since=previous_since,
+    )
+    if bridge.trades >= MIN_SAMPLE:
+        return bridge, f"bridge_{previous_state.value.lower()}_to_{state.value.lower()}"
+    return current, "current_rung_insufficient"
+
+
 class EvidenceQuantScanner(QuantScanner):
-    """Scanner whose entry confidence is evidence- and adverse-selection-aware."""
+    """Scanner whose entries are evidence- and adverse-selection-aware."""
 
     def _candidate_from_decision(
         self,
@@ -96,6 +168,14 @@ class EvidenceQuantScanner(QuantScanner):
         equity,
         now,
     ):
+        health_source = "scanner_default"
+        if entry.strategy_id == ADAPTIVE_STRATEGY_ID:
+            health, health_source = adaptive_deployment_health(
+                self.store,
+                self.lifecycle,
+                entry.strategy_id,
+            )
+
         candidate, context = super()._candidate_from_decision(
             entry,
             decision,
@@ -114,11 +194,10 @@ class EvidenceQuantScanner(QuantScanner):
         candidate.confidence = base_confidence
         candidate.details["hit_rate"] = health.hit_rate
         candidate.details["expectancy_confidence"] = base_confidence
+        candidate.details["deployment_health_source"] = health_source
 
-        # Adaptive v2: current-state forward evidence can only remove privilege.
-        # No sleeve ever receives >1x confidence from recent PnL.
         sleeve = sleeve_from_entry_reason(candidate.signal_reason)
-        if sleeve is not None and entry.strategy_id == "crypto_intraday_adaptive":
+        if sleeve is not None and entry.strategy_id == ADAPTIVE_STRATEGY_ID:
             sleeve_health = compute_sleeve_health(
                 self.store,
                 entry.strategy_id,
