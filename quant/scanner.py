@@ -1,20 +1,15 @@
-"""The desk scanner: one cycle of the full decision pipeline (spec §75).
+"""Quant Desk decision pipeline.
 
-    bars -> strategies -> regime -> abstention -> global ranking ->
-    portfolio heat -> execution gate -> journaled decisions
+One scan cycle performs:
 
-The scanner is a pure DECISION layer.  It places no orders: EXECUTE
-decisions with granted risk are what an execution engine (or an operator)
-acts on; SHADOW-state strategies flow to the shadow executor for virtual
-fills.  Everything — executions, rejections, abstentions, shadow routing —
-is journaled with reasons.
+    bars -> strategy -> regime -> abstention -> measured-alpha/cost gate ->
+    global ranking -> existing-book correlation/exposure checks -> allocation ->
+    journal
 
-Expected alpha is MEASURED, never assumed: a candidate's gross alpha is
-its strategy's marketplace expectancy (R per trade, from attributed real
-or shadow fills) converted to bps through its own stop distance.  A
-strategy with no measured expectancy cannot be ranked for execution —
-its decisions run in shadow until the record exists.  That is the honest
-cold-start: evidence first, capital second.
+The scanner never submits broker orders. ``EXECUTE`` BUY decisions carry an
+explicit risk grant that an execution engine must honor. EXIT decisions are
+surfaced separately and journaled immediately because risk-reducing exits must
+never wait behind opportunity ranking.
 """
 
 from __future__ import annotations
@@ -22,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 import pandas as pd
@@ -42,17 +38,8 @@ from quant.contracts import (
 from quant.execution import ExecutionQualityEngine
 from quant.lifecycle import LifecycleManager
 from quant.marketplace import MIN_SAMPLE, compute_strategy_health, regime_compatibility
-from quant.opportunity import (
-    GlobalOpportunityRanker,
-    OpportunityScoringConfig,
-    RankerInput,
-)
-from quant.portfolio import (
-    PortfolioBook,
-    PortfolioLimitsConfig,
-    PortfolioRiskGovernor,
-    sector_for,
-)
+from quant.opportunity import GlobalOpportunityRanker, OpportunityScoringConfig, RankerInput
+from quant.portfolio import PortfolioBook, PortfolioLimitsConfig, PortfolioRiskGovernor, sector_for
 from quant.regime import RegimeEngine
 from quant.shadow import ShadowExecutor
 from quant.store import QuantStore
@@ -61,13 +48,15 @@ from quant.strategies.base import UniverseStrategy
 
 @dataclass
 class ScanStrategy:
-    """One strategy instance participating in a scan cycle."""
+    """One strategy participating in a scan cycle."""
 
     strategy_id: str
     strategy: UniverseStrategy
     market: Market
     timeframe: str
     version: str = "1.0.0"
+    # The scanner may only reduce this budget through lifecycle/portfolio gates.
+    base_risk_pct: float = 0.35
 
 
 @dataclass
@@ -76,6 +65,7 @@ class ScanReport:
     regime: Optional[RegimeAssessment]
     decisions: list[OpportunityDecision] = field(default_factory=list)
     grants: dict[str, float] = field(default_factory=dict)
+    exit_signals: list[CryptoSignalDecision] = field(default_factory=list)
     shadow_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     skipped_strategies: dict[str, str] = field(default_factory=dict)
 
@@ -85,12 +75,13 @@ class ScanReport:
             decision
             for decision in self.decisions
             if decision.outcome is DecisionOutcome.EXECUTE
+            and decision.candidate.action is QuantAction.BUY
             and (decision.risk_allocation_pct or 0.0) > 0.0
         ]
 
 
 class QuantScanner:
-    """Runs the decision pipeline over prepared strategy sets."""
+    """Deterministic, fully journaled strategy/opportunity scanner."""
 
     def __init__(
         self,
@@ -126,9 +117,17 @@ class QuantScanner:
         benchmark_symbol: Optional[str] = None,
         drawdown_pct: float = 0.0,
         session_id: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> ScanReport:
-        """One full decision cycle over the latest aligned completed bar."""
+        """Run one decision cycle over the latest exactly aligned completed bar."""
+
         quotes = quotes or {}
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("QuantScanner 'now' must be timezone-aware.")
+        if not math.isfinite(equity) or equity <= 0:
+            raise ValueError("QuantScanner requires positive finite equity.")
+
         common: Optional[pd.DatetimeIndex] = None
         for frame in bars_by_symbol.values():
             common = frame.index if common is None else common.intersection(frame.index)
@@ -136,23 +135,10 @@ class QuantScanner:
             return ScanReport(timestamp=None, regime=None)
         timestamp = common.sort_values()[-1]
 
-        regime = None
-        bench = benchmark_symbol or sorted(bars_by_symbol)[0]
-        bench_bars = bars_by_symbol.get(bench)
-        if bench_bars is not None and len(bench_bars) >= self.regime_engine.required_bars():
-            member_closes = {
-                symbol: frame["close"] for symbol, frame in bars_by_symbol.items()
-            }
-            regime = self.regime_engine.assess(
-                bench_bars,
-                market=strategies[0].market if strategies else Market.CRYPTO,
-                member_closes=member_closes,
-            )
-
+        regime = self._assess_regime(strategies, bars_by_symbol, benchmark_symbol)
         if regime is not None:
-            # KV snapshot for the dashboard's market-state panel; decisions
-            # embed their own regime copy, this is just the latest view.
             self.store.set_kv("last_regime", json.dumps(regime.to_dict()))
+
         report = ScanReport(timestamp=timestamp, regime=regime)
         ranker_inputs: list[RankerInput] = []
         candidate_context: dict[str, dict[str, Any]] = {}
@@ -164,6 +150,10 @@ class QuantScanner:
                     f"state_{state.value.lower()}_not_scanned"
                 )
                 continue
+            if not math.isfinite(entry.base_risk_pct) or entry.base_risk_pct <= 0:
+                report.skipped_strategies[entry.strategy_id] = "invalid_base_risk_pct"
+                continue
+
             universe = [
                 symbol
                 for symbol in getattr(entry.strategy.config, "symbols", [])
@@ -179,8 +169,7 @@ class QuantScanner:
             except ValueError as error:
                 report.skipped_strategies[entry.strategy_id] = f"prepare_failed: {error}"
                 continue
-            aligned = all(timestamp in frame.index for frame in prepared.values())
-            if not aligned:
+            if not all(timestamp in frame.index for frame in prepared.values()):
                 report.skipped_strategies[entry.strategy_id] = "bars_not_aligned"
                 continue
 
@@ -199,15 +188,11 @@ class QuantScanner:
                 )
                 for decision in decisions:
                     report.decisions.append(
-                        self._journal_shadow_decision(
-                            entry, decision, session_id=session_id
-                        )
+                        self._journal_shadow_decision(entry, decision, session_id=session_id)
                     )
                 continue
 
-            held_symbols = frozenset(
-                position.symbol for position in book.positions
-            )
+            held_symbols = frozenset(position.symbol for position in book.positions)
             decisions = entry.strategy.evaluate_prepared(prepared, timestamp, held_symbols)
             health = compute_strategy_health(
                 self.store,
@@ -216,14 +201,28 @@ class QuantScanner:
                 include_shadow=True,
             )
             for decision in decisions:
+                if decision.action is BotAction.EXIT:
+                    if decision.symbol in held_symbols:
+                        report.exit_signals.append(decision)
+                        report.decisions.append(
+                            self._journal_exit(entry, decision, session_id=session_id)
+                        )
+                    continue
                 if decision.action is not BotAction.BUY:
                     continue
+
                 candidate, context = self._candidate_from_decision(
-                    entry, decision, health, prepared, regime, drawdown_pct, quotes, equity
+                    entry,
+                    decision,
+                    health,
+                    prepared,
+                    regime,
+                    drawdown_pct,
+                    quotes,
+                    equity,
+                    now,
                 )
                 if candidate is None:
-                    # No measured expectancy yet: journaled as a rejection
-                    # with the honest reason, never given fabricated alpha.
                     report.decisions.append(
                         self._journal_unmeasured(entry, decision, session_id=session_id)
                     )
@@ -234,7 +233,11 @@ class QuantScanner:
 
         ranked = self.ranker.rank(ranker_inputs)
 
-        allocation_entries = []
+        # Existing positions need correlation evidence too. The allocator tracks
+        # correlations among newly granted candidates itself; this pre-check adds
+        # the current broker book, which the old scanner omitted.
+        held_returns = self._held_returns(book, bars_by_symbol)
+        allocation_entries: list[dict[str, Any]] = []
         for decision in ranked:
             if decision.outcome is not DecisionOutcome.EXECUTE:
                 continue
@@ -242,20 +245,35 @@ class QuantScanner:
             context = candidate_context.get(key)
             if context is None:
                 continue
+            requested = float(context["requested_risk_pct"])
+            precheck = self.governor.check(
+                book,
+                candidate_symbol=decision.candidate.symbol,
+                market=decision.candidate.market,
+                sector=sector_for(decision.candidate.symbol, decision.candidate.market),
+                strategy_id=decision.candidate.strategy_id,
+                add_notional=float(context["notional"]),
+                add_risk=requested / 100.0 * equity,
+                candidate_returns=context.get("returns"),
+                held_returns=held_returns,
+            )
+            if not precheck.approved:
+                decision.outcome = DecisionOutcome.REJECT
+                decision.rejection_reasons = list(precheck.reasons)
+                continue
             allocation_entries.append(
                 {
                     "key": key,
-                    "requested_risk_pct": context["requested_risk_pct"],
+                    "requested_risk_pct": requested,
                     "notional": context["notional"],
                     "symbol": decision.candidate.symbol,
                     "market": decision.candidate.market.value,
-                    "sector": sector_for(
-                        decision.candidate.symbol, decision.candidate.market
-                    ),
+                    "sector": sector_for(decision.candidate.symbol, decision.candidate.market),
                     "strategy_id": decision.candidate.strategy_id,
                     "returns": context.get("returns"),
                 }
             )
+
         grants = self.governor.allocate(
             PortfolioBook(equity=equity, positions=list(book.positions)),
             allocation_entries,
@@ -274,7 +292,44 @@ class QuantScanner:
             report.decisions.append(decision)
         return report
 
-    # ------------------------------------------------------------------
+    def _assess_regime(self, strategies, bars_by_symbol, benchmark_symbol):
+        if not bars_by_symbol:
+            return None
+        bench = benchmark_symbol or sorted(bars_by_symbol)[0]
+        bench_bars = bars_by_symbol.get(bench)
+        if bench_bars is None or len(bench_bars) < self.regime_engine.required_bars():
+            return None
+        member_closes = {symbol: frame["close"] for symbol, frame in bars_by_symbol.items()}
+        return self.regime_engine.assess(
+            bench_bars,
+            market=strategies[0].market if strategies else Market.CRYPTO,
+            member_closes=member_closes,
+        )
+
+    @staticmethod
+    def _held_returns(book: PortfolioBook, bars_by_symbol) -> dict[str, pd.Series]:
+        out: dict[str, pd.Series] = {}
+        for position in book.positions:
+            frame = bars_by_symbol.get(position.symbol)
+            if frame is not None and "close" in frame.columns:
+                out[position.symbol] = frame["close"].astype(float).pct_change()
+        return out
+
+    @staticmethod
+    def _quote_age_seconds(quote: Any, now: datetime) -> Optional[float]:
+        if quote is None:
+            return None
+        raw = getattr(quote, "timestamp", None)
+        if raw is None:
+            return None
+        try:
+            timestamp = pd.Timestamp(raw)
+        except (TypeError, ValueError):
+            return None
+        if timestamp.tzinfo is None:
+            return None
+        timestamp = timestamp.tz_convert("UTC")
+        return (pd.Timestamp(now).tz_convert("UTC") - timestamp).total_seconds()
 
     def _candidate_from_decision(
         self,
@@ -286,6 +341,7 @@ class QuantScanner:
         drawdown_pct: float,
         quotes: Mapping[str, Any],
         equity: float,
+        now: datetime,
     ) -> tuple[Optional[OpportunityCandidate], dict[str, Any]]:
         close = decision.close
         stop = decision.stop_price
@@ -324,6 +380,7 @@ class QuantScanner:
         quote = quotes.get(decision.symbol)
         bid = getattr(quote, "bid_price", None)
         ask = getattr(quote, "ask_price", None)
+        quote_age = self._quote_age_seconds(quote, now)
         frame = prepared.get(decision.symbol)
         avg_dollar_volume = None
         returns = None
@@ -334,9 +391,10 @@ class QuantScanner:
             if len(tail) == 20:
                 avg_dollar_volume = float(tail.mean())
             returns = closes.pct_change()
-        risk_pct = self.lifecycle.risk_multiplier(entry.strategy_id) * 0.35
+
+        risk_pct = self.lifecycle.risk_multiplier(entry.strategy_id) * entry.base_risk_pct
         notional = 0.0
-        if equity > 0 and close > stop:
+        if equity > 0 and close > stop and risk_pct > 0:
             qty = equity * risk_pct / 100.0 / (close - stop)
             notional = qty * close
         estimate = self.execution_engine.estimate(
@@ -344,15 +402,15 @@ class QuantScanner:
             entry.market,
             bid=bid,
             ask=ask,
-            quote_age_seconds=0.0 if quote is not None else None,
+            quote_age_seconds=quote_age,
             notional=notional if notional > 0 else None,
             avg_bar_dollar_volume=avg_dollar_volume,
         )
+        candidate.details["quote_age_seconds"] = quote_age
+
         compatibility = None
         if regime is not None:
-            compatibility = regime_compatibility(
-                health, regime.dominant_trend_label.value
-            )
+            compatibility = regime_compatibility(health, regime.dominant_trend_label.value)
         reliability = None
         if health.profit_factor is not None and math.isfinite(health.profit_factor):
             reliability = health.profit_factor / (1.0 + health.profit_factor)
@@ -373,13 +431,37 @@ class QuantScanner:
             "returns": returns,
         }
 
-    def _journal_shadow_decision(
-        self,
-        entry: ScanStrategy,
-        decision: CryptoSignalDecision,
-        *,
-        session_id: Optional[str],
-    ) -> OpportunityDecision:
+    def _journal_exit(self, entry, decision, *, session_id):
+        journal_decision = OpportunityDecision(
+            candidate=OpportunityCandidate(
+                symbol=decision.symbol,
+                market=entry.market,
+                timeframe=entry.timeframe,
+                strategy_id=entry.strategy_id,
+                strategy_version=entry.version,
+                action=QuantAction.EXIT,
+                timestamp=decision.timestamp,
+                close=decision.close,
+                stop_price=decision.stop_price,
+                atr=decision.atr,
+                expected_gross_alpha_bps=0.0,
+                confidence=1.0,
+                signal_reason=decision.reason,
+                filters=dict(decision.filters),
+                details={"risk_reducing_exit": True},
+            ),
+            outcome=DecisionOutcome.EXECUTE,
+            rank=None,
+            expected_cost_bps=None,
+            expected_net_alpha_bps=None,
+            opportunity_score=None,
+            risk_allocation_pct=0.0,
+            rejection_reasons=[],
+        )
+        self.store.record_decision(journal_decision, session_id)
+        return journal_decision
+
+    def _journal_shadow_decision(self, entry, decision, *, session_id):
         journal_decision = OpportunityDecision(
             candidate=OpportunityCandidate(
                 symbol=decision.symbol,
@@ -409,13 +491,7 @@ class QuantScanner:
         self.store.record_decision(journal_decision, session_id)
         return journal_decision
 
-    def _journal_unmeasured(
-        self,
-        entry: ScanStrategy,
-        decision: CryptoSignalDecision,
-        *,
-        session_id: Optional[str],
-    ) -> OpportunityDecision:
+    def _journal_unmeasured(self, entry, decision, *, session_id):
         journal_decision = OpportunityDecision(
             candidate=OpportunityCandidate(
                 symbol=decision.symbol,
