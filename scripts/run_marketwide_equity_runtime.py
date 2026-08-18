@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from broker import AlpacaPaperBroker
+from alpaca_intraday_margin_broker import AlpacaIntradayMarginPaperBroker
 from config import AccountMode, load_credentials
 from equity_market_data import AlpacaEquityMarketData, EquityMarketDataConfig
 from equity_marketwide_engine import clear_marketwide_equity_kill_switch
@@ -95,7 +95,10 @@ def main() -> int:
     try:
         if args.acknowledge_kill_switch:
             clear_marketwide_equity_kill_switch(store)
-        broker = AlpacaPaperBroker(credentials.api_key, credentials.secret_key)
+        broker = AlpacaIntradayMarginPaperBroker(
+            credentials.api_key,
+            credentials.secret_key,
+        )
         market_data = AlpacaEquityMarketData(
             credentials.api_key,
             credentials.secret_key,
