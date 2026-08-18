@@ -14,11 +14,13 @@ scanned: inactive/non-tradable assets, missing or stale quotes, wide spreads, pr
 outside the configured range, insufficient completed daily history and insufficient
 average dollar volume.
 
-The default production research universe is the top **48** survivors by a deterministic
-liquidity/freshness score. Historical return, strategy P&L, Sharpe, hit rate and future
-information never choose those symbols. That bounded universe is required because
-research must be computationally reproducible and because one strategy instance is
-capped at 64 symbols.
+The default production research universe contains **48** executable names. If SPY
+passes exactly the same hard executability/liquidity gates, it reserves one slot as the
+stable market benchmark; the remaining slots are filled by a deterministic
+liquidity/freshness score. SPY is not inserted when it is itself unexecutable, and no
+historical return, strategy P&L, Sharpe, hit rate or future information chooses the
+universe. That bounded universe is required because research must be computationally
+reproducible and because one strategy instance is capped at 64 symbols.
 
 After a strategy advances beyond RESEARCH, the runtime may temporarily **remove** a
 locked symbol that is no longer executable, but it may never add a symbol that was not
@@ -32,6 +34,10 @@ The common 15-minute universe is evaluated by three existing versioned hypothese
 1. `opening_range_breakout`
 2. `vwap_reversion`
 3. `volatility_squeeze`
+
+When executable, SPY is the shared benchmark anchor used for market/regime and relative
+context rather than an arbitrary first-ranked stock. It is still eligible for ordinary
+strategy evaluation only under the same rules as every other symbol.
 
 The existing Quant Desk remains the decision authority. It applies strategy evidence,
 regime/abstention, current quote quality, modeled execution cost, expected post-cost
@@ -58,7 +64,8 @@ python scripts/run_marketwide_equity_research.py \
 The runner:
 
 - discovers the current full active/tradable US-equity catalogue;
-- chooses the research universe using only current executability/liquidity;
+- chooses the research universe using only current executability/liquidity, with SPY
+  reserving the benchmark slot only when it passes those same gates;
 - downloads completed historical bars for that fixed ordered universe;
 - requires at least 12 names with at least 5,750 exactly aligned completed bars;
 - runs chronological train -> embargo -> untouched OOS folds;
@@ -191,6 +198,6 @@ python scripts/manage_marketwide_equity_lifecycle.py status \
 ## Verification gate
 
 `.github/workflows/marketwide-equity-ci.yml` compiles every new runtime/research module
-and runs the market-wide selector, manifest, restart/gap-recovery and exactly-once
-attribution regression tests. The repository's existing full Python CI remains the
-broader regression gate.
+and runs the market-wide selector, manifest, restart/gap-recovery, strict lifecycle and
+exactly-once attribution regression tests. The repository's existing full Python CI
+remains the broader regression gate.
