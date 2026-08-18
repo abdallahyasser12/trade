@@ -25,7 +25,9 @@ from config import AccountMode, load_credentials
 from equity_market_data import AlpacaEquityMarketData, EquityMarketDataConfig
 from equity_marketwide_deployment import ManifestLockedMarketWideEquityTradeEngine
 from equity_marketwide_engine import clear_marketwide_equity_kill_switch
+from quant.equity_lifecycle import marketwide_equity_promotion_requirements
 from quant.equity_marketwide import MarketWideEquityConfig
+from quant.lifecycle import LifecycleManager
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
 
@@ -99,12 +101,17 @@ def main() -> int:
             credentials.secret_key,
             EquityMarketDataConfig(feed=args.feed),
         )
+        lifecycle = LifecycleManager(
+            quant_store,
+            requirements=marketwide_equity_promotion_requirements(),
+        )
         engine = ManifestLockedMarketWideEquityTradeEngine(
             broker,
             market_data,
             store,
             config=config,
             quant_store=quant_store,
+            lifecycle=lifecycle,
         )
 
         stopping = False
