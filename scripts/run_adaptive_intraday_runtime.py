@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Run adaptive intraday v2 in SHADOW, PAPER, or guarded LIVE mode.
 
-The runtime never invents or silently changes its symbol set. RESEARCH -> SHADOW
-promotion locks the exact passing-research universe in QuantStore; every runtime mode
-must reuse it. A requested `--symbols` list is accepted only when it exactly matches
-that locked tuple.
+Every runtime loads the immutable promoted deployment manifest and refuses to start
+unless the checked-out git commit, strategy version, timeframe, ordered universe and
+adaptive parameters exactly match researched evidence.  CLI timeframe/symbol options
+are assertions only; they cannot change the deployed strategy.
 
 Quotes are fetched on every loop and persisted as non-blocking telemetry. Completed
-bar history is cached until the next safely completed bar. LIVE remains behind all
+bar history is cached until the next safely completed bar. LIVE remains behind the
 broker, lifecycle, operator-ack and canary controls.
 """
 
@@ -32,6 +32,7 @@ from intraday_crypto_engine import (
     ADAPTIVE_STRATEGY_VERSION,
     make_intraday_adaptive_crypto_engine,
 )
+from quant.adaptive_manifest import current_git_commit, require_locked_manifest
 from quant.contracts import Market, StrategyState
 from quant.evidence_scanner import EvidenceQuantScanner
 from quant.execution import ExecutionQualityEngine
@@ -47,9 +48,13 @@ from quant.portfolio import PortfolioBook
 from quant.realtime_feed import CompletedBarCachingCryptoFeed
 from quant.scanner import ScanStrategy
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
-from quant.strategies.intraday_adaptive import AdaptiveIntradayStrategy
+from quant.strategies.intraday_adaptive import (
+    AdaptiveIntradayConfig,
+    AdaptiveIntradayStrategy,
+)
 from state_store import StateStore
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_DB = str(Path("data") / "adaptive_intraday_trading.db")
 DEFAULT_LIVE_STATE_DB = str(Path("data") / "adaptive_intraday_live_trading.db")
 REALTIME_QUOTES_KEY = "adaptive_intraday_realtime_quotes"
@@ -84,10 +89,7 @@ def _quote_snapshot(quotes) -> str:
                     if timestamp.tzinfo is not None
                     else timestamp.replace(tzinfo=timezone.utc)
                 )
-                age = max(
-                    0.0,
-                    (now - ts.astimezone(timezone.utc)).total_seconds(),
-                )
+                age = max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds())
             except (AttributeError, TypeError, ValueError):
                 pass
         payload[symbol] = {
@@ -123,7 +125,14 @@ def _make_market_stack(mode: AccountMode, risk_config, quant_store: QuantStore):
     return broker, CompletedBarCachingCryptoFeed(backend, quote_observer=observe)
 
 
-def _shadow_loop(symbols, timeframe, quant_store: QuantStore, poll_seconds: float) -> int:
+def _shadow_loop(
+    *,
+    symbols,
+    timeframe,
+    adaptive_config,
+    quant_store: QuantStore,
+    poll_seconds: float,
+) -> int:
     lifecycle = _lifecycle(quant_store)
     state = lifecycle.state(ADAPTIVE_STRATEGY_ID)
     if state is not StrategyState.SHADOW:
@@ -141,7 +150,7 @@ def _shadow_loop(symbols, timeframe, quant_store: QuantStore, poll_seconds: floa
         symbols=symbols,
         timeframe=timeframe,
     )
-    strategy = AdaptiveIntradayStrategy(strategy_config)
+    strategy = AdaptiveIntradayStrategy(strategy_config, adaptive_config)
     scanner = EvidenceQuantScanner(
         store=quant_store,
         lifecycle=lifecycle,
@@ -158,7 +167,8 @@ def _shadow_loop(symbols, timeframe, quant_store: QuantStore, poll_seconds: floa
     last_bar = None
     print(
         f"SHADOW {ADAPTIVE_STRATEGY_ID}: locked universe={symbols}; "
-        f"{timeframe} decisions, fresh quotes every {poll_seconds:g}s. Ctrl+C stops."
+        f"timeframe={timeframe}; params={adaptive_config}; "
+        f"fresh quotes every {poll_seconds:g}s. Ctrl+C stops."
     )
     try:
         while True:
@@ -209,6 +219,7 @@ def _broker_loop(
     *,
     symbols,
     timeframe,
+    adaptive_config,
     quant_store: QuantStore,
     state_db: str,
     account_mode: AccountMode,
@@ -259,6 +270,7 @@ def _broker_loop(
         strategy_config,
         risk_config,
         engine_config,
+        adaptive_config=adaptive_config,
         quant_store=quant_store,
         lifecycle=lifecycle,
     )
@@ -268,7 +280,7 @@ def _broker_loop(
         * lifecycle.risk_multiplier(ADAPTIVE_STRATEGY_ID)
     )
     print(
-        f"{label} {ADAPTIVE_STRATEGY_ID}: locked universe={symbols}; {timeframe}, "
+        f"{label} {ADAPTIVE_STRATEGY_ID}: locked universe={symbols}; {timeframe}; "
         f"base risk={risk_config.risk_per_trade_pct:.3f}%/trade, lifecycle risk<="
         f"{effective_risk:.3f}%/trade, quote/protection loop 5s flat / 1s exposed."
     )
@@ -295,12 +307,17 @@ def main() -> int:
         choices=("shadow", "paper", "live"),
         default="shadow",
     )
-    parser.add_argument("--timeframe", choices=("5Min", "15Min"), default="5Min")
+    parser.add_argument(
+        "--timeframe",
+        choices=("5Min", "15Min"),
+        default=None,
+        help="Optional assertion only; cannot override the deployment manifest.",
+    )
     parser.add_argument(
         "--symbols",
         nargs="+",
         default=None,
-        help="Optional assertion; must exactly match the promoted research universe.",
+        help="Optional assertion only; must exactly match the deployment manifest.",
     )
     parser.add_argument("--quant-db", default=DEFAULT_QUANT_DB_PATH)
     parser.add_argument("--state-db", default=DEFAULT_STATE_DB)
@@ -320,20 +337,52 @@ def main() -> int:
         print(f"LIVE requires --live-ack {LIVE_ACK}", file=sys.stderr)
         return 2
 
+    git_commit = current_git_commit(REPO_ROOT)
+    if git_commit is None:
+        print("Runtime refused: exact git commit is unavailable.", file=sys.stderr)
+        return 2
+
     quant_store = QuantStore(args.quant_db)
     try:
-        requested = tuple(args.symbols) if args.symbols else None
-        symbols = require_locked_universe(quant_store, requested)
+        manifest = require_locked_manifest(quant_store)
+        if manifest.strategy_version != ADAPTIVE_STRATEGY_VERSION:
+            raise ValueError(
+                f"Manifest version {manifest.strategy_version} != runtime "
+                f"{ADAPTIVE_STRATEGY_VERSION}."
+            )
+        requested_symbols = tuple(args.symbols) if args.symbols else None
+        manifest.assert_runtime_identity(
+            git_commit=git_commit,
+            timeframe=args.timeframe,
+            universe=requested_symbols,
+        )
+        # Defense in depth with the original universe-only lock.
+        require_locked_universe(quant_store, manifest.universe)
+
+        symbols = manifest.universe
+        timeframe = manifest.timeframe
+        adaptive_config = AdaptiveIntradayConfig(**manifest.params)
+        errors = adaptive_config.validate()
+        if errors:
+            raise ValueError("Locked adaptive parameters are invalid: " + "; ".join(errors))
+
+        print(
+            f"deployment manifest run#{manifest.research_run_id}: commit={manifest.git_commit} "
+            f"version={manifest.strategy_version} timeframe={timeframe} "
+            f"universe={symbols} params={manifest.params}"
+        )
         if args.mode == "shadow":
             return _shadow_loop(
-                symbols,
-                args.timeframe,
-                quant_store,
-                args.poll_seconds,
+                symbols=symbols,
+                timeframe=timeframe,
+                adaptive_config=adaptive_config,
+                quant_store=quant_store,
+                poll_seconds=args.poll_seconds,
             )
         return _broker_loop(
             symbols=symbols,
-            timeframe=args.timeframe,
+            timeframe=timeframe,
+            adaptive_config=adaptive_config,
             quant_store=quant_store,
             state_db=args.state_db if args.mode == "paper" else args.live_state_db,
             account_mode=(
