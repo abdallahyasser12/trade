@@ -20,6 +20,37 @@ from equity_marketwide_engine import MarketWideEquityTradeEngine
 from quant.contracts import StrategyState
 
 
+def partition_locked_universe(
+    locked_universe: tuple[str, ...],
+    hard_selected: tuple[str, ...],
+    shadow_held: set[str] | frozenset[str],
+    *,
+    min_entry_breadth: int = 3,
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Return (fresh-entry set, ordered scan/management set).
+
+    Every returned symbol must belong to the immutable researched universe. A held
+    SHADOW symbol can extend only the management set; it can never restore itself to
+    fresh-entry eligibility after failing the current hard selector.
+    """
+    if min_entry_breadth < 1:
+        raise ValueError("min_entry_breadth must be positive.")
+    locked_set = set(locked_universe)
+    hard_set = set(hard_selected)
+    executable = tuple(symbol for symbol in locked_universe if symbol in hard_set)
+    entry_eligible = (
+        frozenset(executable)
+        if len(executable) >= min_entry_breadth
+        else frozenset()
+    )
+    held = set(shadow_held) & locked_set
+    management_set = set(executable) | held
+    management = tuple(
+        symbol for symbol in locked_universe if symbol in management_set
+    )
+    return entry_eligible, management
+
+
 class ProductionMarketWideEquityTradeEngine(ManifestLockedMarketWideEquityTradeEngine):
     """Manifest-locked runtime with state-aware management-only symbol handling."""
 
@@ -57,34 +88,17 @@ class ProductionMarketWideEquityTradeEngine(ManifestLockedMarketWideEquityTradeE
                 "Forward equity strategy has no locked research universe."
             )
 
-        hard_set = set(hard_selected)
-        currently_executable = tuple(
-            symbol
-            for symbol in self._locked_research_universe
-            if symbol in hard_set
-        )
-        # The desk needs a minimally broad current market before it can create new
-        # risk. Existing/virtual positions remain managed below even when this gate
-        # closes completely.
-        self._entry_eligible_symbols = (
-            frozenset(currently_executable)
-            if len(currently_executable) >= 3
-            else frozenset()
-        )
-
         shadow_held: set[str] = set()
         for strategy_id in forward:
             if self.lifecycle.state(strategy_id) is StrategyState.SHADOW:
                 shadow_held.update(self.scanner.shadow.held_symbols(strategy_id))
-        locked_set = set(self._locked_research_universe)
-        shadow_held.intersection_update(locked_set)
 
-        management_set = set(currently_executable) | shadow_held
-        management_symbols = tuple(
-            symbol
-            for symbol in self._locked_research_universe
-            if symbol in management_set
+        entry_eligible, management_symbols = partition_locked_universe(
+            self._locked_research_universe,
+            hard_selected,
+            shadow_held,
         )
+        self._entry_eligible_symbols = entry_eligible
         if self._universe is not None:
             self._universe.selected = management_symbols
 
@@ -95,13 +109,16 @@ class ProductionMarketWideEquityTradeEngine(ManifestLockedMarketWideEquityTradeE
             self._persist_status()
 
         if not self._entry_eligible_symbols and shadow_held:
+            currently_executable = set(self._locked_research_universe) & set(hard_selected)
             self.store.log(
                 "WARNING",
                 "Fresh market-wide equity entries are blocked by current universe "
                 "breadth; held SHADOW symbols remain under management.",
                 context={
                     "currently_executable_researched": len(currently_executable),
-                    "shadow_management_symbols": sorted(shadow_held),
+                    "shadow_management_symbols": sorted(
+                        set(management_symbols) - currently_executable
+                    ),
                 },
                 session_id=self.session_id,
             )
