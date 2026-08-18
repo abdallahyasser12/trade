@@ -45,6 +45,7 @@ jobs:
             quant/realtime_feed.py \
             quant/research/factory.py \
             quant/scanner.py \
+            quant/sleeve_supervision.py \
             quant/strategies/intraday_momentum.py \
             quant/strategies/intraday_adaptive.py \
             quant/strategies/registry.py \
@@ -62,6 +63,7 @@ jobs:
             tests/test_adaptive_intraday_registry.py \
             tests/test_adaptive_intraday_research_policy.py \
             tests/test_adaptive_liquidity_universe.py \
+            tests/test_adaptive_sleeve_supervision.py \
             tests/test_quant_evidence_scanner.py \
             tests/test_quant_factory_fail_closed.py \
             tests/test_quant_intraday_profile.py \
