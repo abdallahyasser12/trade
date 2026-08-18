@@ -59,6 +59,7 @@ jobs:
           python -m py_compile \
             tests/test_intraday_momentum.py \
             tests/test_intraday_adaptive.py \
+            tests/test_adaptive_evidence_bridge.py \
             tests/test_adaptive_intraday_lifecycle_cli.py \
             tests/test_adaptive_intraday_registry.py \
             tests/test_adaptive_intraday_research_policy.py \
