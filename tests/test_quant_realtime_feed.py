@@ -28,7 +28,13 @@ def test_repeated_fast_cycles_fetch_history_once_per_completed_bar():
     feed = CompletedBarCachingCryptoFeed(backend)
     now = datetime(2026, 8, 18, 12, 3, tzinfo=timezone.utc)
     for seconds in (0, 5, 10, 30, 60):
-        frame = feed.get_recent_bars("BTC/USD", "5Min", 100, now=now + timedelta(seconds=seconds), tolerance_seconds=2)
+        frame = feed.get_recent_bars(
+            "BTC/USD",
+            "5Min",
+            100,
+            now=now + timedelta(seconds=seconds),
+            tolerance_seconds=2,
+        )
         assert len(frame) == 100
     assert backend.bar_calls == 1
 
@@ -43,9 +49,28 @@ def test_cache_rolls_exactly_when_next_bar_is_safely_complete():
     assert backend.bar_calls == 2
 
 
-def test_quotes_are_never_cached():
+def test_quotes_are_never_cached_and_observer_receives_every_snapshot():
     backend = Backend()
-    feed = CompletedBarCachingCryptoFeed(backend)
+    snapshots = []
+    feed = CompletedBarCachingCryptoFeed(
+        backend,
+        quote_observer=lambda quotes: snapshots.append(quotes),
+    )
     for _ in range(10):
         feed.get_latest_quotes(["BTC/USD", "ETH/USD"])
     assert backend.quote_calls == 10
+    assert len(snapshots) == 10
+    assert feed.quote_observer_failures == 0
+
+
+def test_quote_observer_failure_never_breaks_market_data_path():
+    backend = Backend()
+
+    def broken_observer(_quotes):
+        raise RuntimeError("telemetry database unavailable")
+
+    feed = CompletedBarCachingCryptoFeed(backend, quote_observer=broken_observer)
+    quotes = feed.get_latest_quotes(["BTC/USD"])
+    assert "BTC/USD" in quotes
+    assert backend.quote_calls == 1
+    assert feed.quote_observer_failures == 1
