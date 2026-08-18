@@ -1,9 +1,7 @@
 """Broker-backed adapter for the high-velocity intraday momentum hypothesis.
 
-The adapter is intentionally thin: strategy logic changes, execution does not.
-All broker-backed entries pass through QuantControlledCryptoTradeEngine, so this
-new strategy cannot trade PAPER before PAPER promotion or LIVE before canary/live
-promotion.
+Strategy logic changes; execution does not. Broker-backed entries pass through the
+Quant-controlled lifecycle runtime and use intraday-specific degradation thresholds.
 """
 
 from __future__ import annotations
@@ -14,11 +12,15 @@ from typing import Callable, Optional
 from broker import AlpacaBroker
 from crypto_config import CryptoEngineConfig, CryptoRiskConfig, CryptoStrategyConfig
 from crypto_data_feed import AlpacaCryptoDataFeed
+from quant.intraday_lifecycle import intraday_degradation_monitor
 from quant.lifecycle import LifecycleManager
 from quant.production_runtime import QuantControlledCryptoTradeEngine
 from quant.scanner import QuantScanner
 from quant.store import QuantStore
-from quant.strategies.intraday_momentum import IntradayMomentumConfig, IntradayMomentumStrategy
+from quant.strategies.intraday_momentum import (
+    IntradayMomentumConfig,
+    IntradayMomentumStrategy,
+)
 from state_store import StateStore
 
 STRATEGY_ID = "crypto_intraday_momentum"
@@ -47,6 +49,7 @@ class IntradayMomentumCryptoTradeEngine(QuantControlledCryptoTradeEngine):
             "quant_store": quant_store,
             "lifecycle": lifecycle,
             "scanner": scanner,
+            "degradation_monitor": intraday_degradation_monitor(),
         }
         if now_fn is not None:
             kwargs["now_fn"] = now_fn
@@ -60,7 +63,10 @@ class IntradayMomentumCryptoTradeEngine(QuantControlledCryptoTradeEngine):
             **kwargs,
         )
         self.intraday_config = intraday_config or IntradayMomentumConfig()
-        self.strategy = IntradayMomentumStrategy(strategy_config, self.intraday_config)
+        self.strategy = IntradayMomentumStrategy(
+            strategy_config,
+            self.intraday_config,
+        )
 
 
 def make_intraday_momentum_crypto_engine(
