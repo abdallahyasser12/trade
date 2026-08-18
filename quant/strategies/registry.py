@@ -100,6 +100,11 @@ def _make_intraday_momentum(config):
     return IntradayMomentumStrategy(config)
 
 
+def _make_intraday_adaptive(config):
+    from quant.strategies.intraday_adaptive import AdaptiveIntradayStrategy
+    return AdaptiveIntradayStrategy(config)
+
+
 def build_default_registry() -> StrategyRegistry:
     registry = StrategyRegistry()
     registry.register(
@@ -138,19 +143,44 @@ def build_default_registry() -> StrategyRegistry:
     )
     registry.register(
         StrategyMetadata(
-            strategy_id="crypto_intraday_momentum",
-            name="Intraday cross-sectional momentum",
-            version="1.0.0",
+            strategy_id="crypto_intraday_adaptive",
+            name="Adaptive intraday alpha ensemble v2",
+            version="2.0.0",
             hypothesis=(
-                "On liquid crypto pairs, short-horizon risk-adjusted momentum leaders "
-                "with non-degenerate volume persist long enough on 5-15 minute bars "
-                "to cover spread, slippage and fees; rank hysteresis limits churn. "
-                "This is a new unproven hypothesis and ships RESEARCH-only."
+                "Routing causal momentum, breakout, pullback and range-reversion "
+                "sleeves by current cross-sectional regime captures more independent "
+                "intraday opportunities than one always-on signal while stress, "
+                "execution-cost and evidence gates suppress adverse conditions."
             ),
             markets=(Market.CRYPTO,),
             natural_timeframes=("5Min", "15Min"),
             horizon_bars=12,
-            tags=("intraday", "momentum", "cross_sectional", "high_velocity"),
+            tags=(
+                "intraday",
+                "adaptive",
+                "ensemble",
+                "momentum",
+                "breakout",
+                "mean_reversion",
+                "high_velocity",
+            ),
+        ),
+        _make_intraday_adaptive,
+    )
+    registry.register(
+        StrategyMetadata(
+            strategy_id="crypto_intraday_momentum",
+            name="Intraday cross-sectional momentum (legacy v1)",
+            version="1.0.0",
+            hypothesis=(
+                "On liquid crypto pairs, short-horizon risk-adjusted momentum leaders "
+                "with non-degenerate volume persist long enough on 5-15 minute bars "
+                "to cover spread, slippage and fees; rank hysteresis limits churn."
+            ),
+            markets=(Market.CRYPTO,),
+            natural_timeframes=("5Min", "15Min"),
+            horizon_bars=12,
+            tags=("intraday", "momentum", "cross_sectional", "high_velocity", "legacy"),
         ),
         _make_intraday_momentum,
     )
