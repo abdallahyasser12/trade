@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Inspect or promote a Quant Desk strategy without editing SQLite by hand.
 
-Each forward rung is measured only from attributions recorded since that rung began.
-Both high-velocity intraday generations use the centralized stricter lifecycle
-policy, but keep separate strategy identities/evidence and separate execution-state
-databases.
+Forward rungs use only evidence recorded since that rung began. High-velocity
+strategies use stricter thresholds. Adaptive v2 additionally locks the exact universe
+from its promoted research run; measured-cost reruns and deployed runtimes must use
+the same symbols/order until a new research cycle is explicitly adopted.
 """
 
 from __future__ import annotations
@@ -20,15 +20,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from quant.contracts import StrategyState
 from quant.intraday_lifecycle import intraday_promotion_requirements
 from quant.lifecycle import LifecycleManager, PromotionEvidence, PromotionRequirements
+from quant.liquidity_universe import (
+    lock_deployment_universe,
+    locked_deployment_universe,
+    universe_from_research_run,
+)
 from quant.marketplace import compute_strategy_health
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
 
 LEGACY_STATE_DB = str(Path("data") / "intraday_trading.db")
 ADAPTIVE_STATE_DB = str(Path("data") / "adaptive_intraday_trading.db")
+ADAPTIVE_STRATEGY_ID = "crypto_intraday_adaptive"
 LIVE_ACK = "I_ACCEPT_LIVE_RISK"
 INTRADAY_STRATEGY_IDS = frozenset(
-    {"crypto_intraday_momentum", "crypto_intraday_adaptive"}
+    {"crypto_intraday_momentum", ADAPTIVE_STRATEGY_ID}
 )
 
 
@@ -41,7 +47,7 @@ def _requirements(strategy_id: str) -> PromotionRequirements:
 
 
 def _default_state_db(strategy_id: str) -> str:
-    return ADAPTIVE_STATE_DB if strategy_id == "crypto_intraday_adaptive" else LEGACY_STATE_DB
+    return ADAPTIVE_STATE_DB if strategy_id == ADAPTIVE_STRATEGY_ID else LEGACY_STATE_DB
 
 
 def _manager(store: QuantStore, strategy_id: str) -> LifecycleManager:
@@ -111,6 +117,8 @@ def show_status(quant_store, state_store, strategy_id) -> int:
     req = lifecycle.requirements
     print(f"strategy={strategy_id}")
     print(f"state={state.value} since={(row or {}).get('since') or 'not-recorded'}")
+    if strategy_id == ADAPTIVE_STRATEGY_ID:
+        print(f"locked_universe={locked_deployment_universe(quant_store)}")
     print(
         f"current-state trades={health.trades} expectancy_R={health.expectancy_r} "
         f"PF={health.profit_factor} drawdown_R={health.max_drawdown_pct}"
@@ -147,12 +155,21 @@ def promote(args, quant_store, state_store) -> int:
     state_row = quant_store.get_strategy_state(strategy_id)
     evidence = PromotionEvidence()
     operator_ack = False
+    research_universe = None
 
     if state is StrategyState.RESEARCH:
         run = _latest_passing_research(quant_store, strategy_id)
         if run is None:
             print("Promotion refused: no passing real research run.", file=sys.stderr)
             return 1
+        if strategy_id == ADAPTIVE_STRATEGY_ID:
+            research_universe = universe_from_research_run(run)
+            if research_universe is None:
+                print(
+                    "Promotion refused: adaptive research run has no valid 6-12 symbol universe.",
+                    file=sys.stderr,
+                )
+                return 1
         evidence.research_run = run
 
     elif state is StrategyState.SHADOW:
@@ -189,6 +206,16 @@ def promote(args, quant_store, state_store) -> int:
                 file=sys.stderr,
             )
             return 1
+        if strategy_id == ADAPTIVE_STRATEGY_ID:
+            locked = locked_deployment_universe(quant_store)
+            rerun_universe = universe_from_research_run(run)
+            if locked is None or rerun_universe != locked:
+                print(
+                    "Promotion refused: measured-cost adaptive research must use the "
+                    f"exact locked universe. locked={locked}, rerun={rerun_universe}",
+                    file=sys.stderr,
+                )
+                return 1
         quality = state_store.execution_quality()
         measured_samples = int(quality.get("samples") or 0)
         measured_slippage = quality.get("avg_slippage_bps")
@@ -263,6 +290,17 @@ def promote(args, quant_store, state_store) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if (
+        strategy_id == ADAPTIVE_STRATEGY_ID
+        and decision.from_state is StrategyState.RESEARCH
+        and decision.to_state is StrategyState.SHADOW
+    ):
+        if research_universe is None:
+            raise RuntimeError("Adaptive promotion approved without a research universe.")
+        lock_deployment_universe(quant_store, research_universe)
+        print(f"locked adaptive deployment universe={research_universe}")
+
     print(f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}.")
     return 0
 
