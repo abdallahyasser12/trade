@@ -1,9 +1,9 @@
 """Immutable research/deployment identity for adaptive intraday v2.
 
 A profitable report is meaningless if production later changes timeframe, universe,
-parameters or code.  Every recorded adaptive research run therefore gets a manifest.
+parameters or code. Every recorded adaptive research run therefore gets a manifest.
 RESEARCH -> SHADOW locks one passing manifest, and every forward runtime must match
-it exactly.  A measured-cost pre-CANARY rerun must evaluate the same locked model.
+it exactly. A measured-cost pre-CANARY rerun must evaluate the same locked model.
 """
 
 from __future__ import annotations
@@ -74,7 +74,10 @@ class AdaptiveManifest:
             errors.append("universe must contain BTC/USD")
         try:
             config = AdaptiveIntradayConfig(**dict(self.params))
-            errors.extend(config.validate())
+            errors.extend(
+                f"adaptive params invalid: {error}"
+                for error in config.validate()
+            )
         except (TypeError, ValueError) as error:
             errors.append(f"adaptive params invalid: {error}")
         return errors
