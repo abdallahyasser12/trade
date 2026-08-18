@@ -5,9 +5,14 @@ on:
     paths:
       - "equity_market_data.py"
       - "equity_marketwide_engine.py"
+      - "equity_marketwide_deployment.py"
       - "quant/equity_marketwide.py"
+      - "quant/equity_manifest.py"
       - "scripts/run_marketwide_equity_runtime.py"
+      - "scripts/run_marketwide_equity_research.py"
+      - "scripts/manage_marketwide_equity_lifecycle.py"
       - "tests/test_equity_marketwide*.py"
+      - "tests/test_equity_manifest.py"
       - ".github/workflows/marketwide-equity-ci.yml"
   push:
     branches: ["feature/marketwide-equity-opportunity-engine"]
@@ -37,9 +42,15 @@ jobs:
           python -m py_compile \
             equity_market_data.py \
             equity_marketwide_engine.py \
+            equity_marketwide_deployment.py \
             quant/equity_marketwide.py \
+            quant/equity_manifest.py \
             scripts/run_marketwide_equity_runtime.py \
-            tests/test_equity_marketwide.py >> marketwide-ci.log 2>&1
+            scripts/run_marketwide_equity_research.py \
+            scripts/manage_marketwide_equity_lifecycle.py \
+            tests/test_equity_marketwide.py \
+            tests/test_equity_manifest.py \
+            tests/test_equity_marketwide_recovery.py >> marketwide-ci.log 2>&1
           compile_status=$?
 
           echo "=== install ===" >> marketwide-ci.log
@@ -51,7 +62,10 @@ jobs:
           test_status=0
           if [ "$compile_status" -eq 0 ] && [ "$pip_upgrade_status" -eq 0 ] && [ "$install_status" -eq 0 ]; then
             echo "=== pytest ===" >> marketwide-ci.log
-            python -m pytest -q tests/test_equity_marketwide.py >> marketwide-ci.log 2>&1
+            python -m pytest -q \
+              tests/test_equity_marketwide.py \
+              tests/test_equity_manifest.py \
+              tests/test_equity_marketwide_recovery.py >> marketwide-ci.log 2>&1
             test_status=$?
           else
             echo "=== pytest skipped because compile/install failed ===" >> marketwide-ci.log
