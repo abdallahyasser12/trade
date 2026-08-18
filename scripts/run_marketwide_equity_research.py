@@ -2,10 +2,10 @@
 """Run real-data walk-forward research for the market-wide US-equity desk.
 
 The discovery stage considers every active/tradable Alpaca US equity and uses only
-current executability/liquidity fields to choose the research universe.  Historical
-return never chooses symbols.  One common ordered universe is then frozen for all
-three strategy families and recorded in immutable manifests with the exact git commit
-and runtime configuration.
+current executability/liquidity fields to choose the research universe. Historical
+return never chooses symbols. One common ordered universe is then frozen for all three
+strategy families and recorded in immutable manifests with the exact git commit and
+runtime configuration.
 
 Exit codes: 0 = every requested strategy passed, 1 = research ran but at least one
 strategy failed promotion gates, 2 = the research protocol could not be completed.
@@ -14,7 +14,6 @@ strategy failed promotion gates, 2 = the research protocol could not be complete
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +53,7 @@ STRATEGY_ORDER = (
     "vwap_reversion",
     "volatility_squeeze",
 )
+MAX_DEPLOYABLE_UNIVERSE = 48
 
 
 def _fail(message: str) -> int:
@@ -87,7 +87,7 @@ def _aligned_research_universe(
 ) -> tuple[tuple[str, ...], dict[str, pd.DataFrame]]:
     """Greedily retain liquid names that preserve the fixed research horizon.
 
-    The input order is current-liquidity order.  A symbol may be dropped only for
+    The input order is current-liquidity order. A symbol may be dropped only for
     insufficient/alignment data; no return, Sharpe, hit rate or strategy output enters
     this decision.
     """
@@ -115,7 +115,11 @@ def _aligned_research_universe(
     return tuple(kept), trimmed
 
 
-def _strategy_factory(strategy_id: str, universe: tuple[str, ...], config: MarketWideEquityConfig):
+def _strategy_factory(
+    strategy_id: str,
+    universe: tuple[str, ...],
+    config: MarketWideEquityConfig,
+):
     def build(_params):
         entries = build_equity_scan_strategies(universe, config=config)
         matching = [entry for entry in entries if entry.strategy_id == strategy_id]
@@ -123,7 +127,7 @@ def _strategy_factory(strategy_id: str, universe: tuple[str, ...], config: Marke
             raise ValueError(
                 f"Research requires one unsharded {strategy_id} instance; got {len(matching)}."
             )
-        # OwnershipAwareStrategy is a production routing guard.  Research needs the
+        # OwnershipAwareStrategy is a production routing guard. Research needs the
         # underlying hypothesis so its own held-symbol exit logic is exercised.
         return matching[0].strategy.delegate
 
@@ -211,13 +215,16 @@ def main() -> int:
     )
     parser.add_argument("--timeframe", choices=("5Min", "15Min"), default="15Min")
     parser.add_argument("--feed", choices=("iex", "sip"), default="iex")
-    parser.add_argument("--universe-size", type=int, default=48)
+    parser.add_argument("--universe-size", type=int, default=MAX_DEPLOYABLE_UNIVERSE)
     parser.add_argument("--history-bars", type=int, default=6_500)
     parser.add_argument("--db", default=DEFAULT_QUANT_DB_PATH)
     args = parser.parse_args()
 
-    if not 12 <= args.universe_size <= 64:
-        return _fail("--universe-size must be between 12 and 64 for one research shard.")
+    if not 12 <= args.universe_size <= MAX_DEPLOYABLE_UNIVERSE:
+        return _fail(
+            f"--universe-size must be between 12 and {MAX_DEPLOYABLE_UNIVERSE}; "
+            "the deployable desk is intentionally one strategy shard."
+        )
     if args.history_bars < 5_750:
         return _fail("--history-bars must be at least 5750 for five untouched OOS folds.")
 
@@ -231,7 +238,7 @@ def main() -> int:
     runtime_config = MarketWideEquityConfig(
         timeframe=args.timeframe,
         max_scan_symbols=args.universe_size,
-        shard_size=min(48, args.universe_size),
+        shard_size=args.universe_size,
     )
     errors = runtime_config.validate()
     if errors:
@@ -261,7 +268,8 @@ def main() -> int:
         )
         if len(universe_report.selected) < 12:
             return _fail(
-                f"Only {len(universe_report.selected)} symbols passed current executability/liquidity filters."
+                f"Only {len(universe_report.selected)} symbols passed current "
+                "executability/liquidity filters."
             )
         raw_history = market_data.get_recent_bars_many(
             universe_report.selected,
