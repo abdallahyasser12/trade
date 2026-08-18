@@ -173,6 +173,14 @@ def promote(store: QuantStore, strategy_id: str, run_id: int | None) -> int:
     else:
         evidence.shadow_health = _health(store, strategy_id, StrategyState.SHADOW)
 
+    # Lock the immutable deployment identity BEFORE increasing lifecycle privilege.
+    # If the later promotion gate rejects the transition, a harmless manifest remains
+    # while the strategy is still RESEARCH.  The inverse ordering is unsafe: a crash
+    # after state promotion but before manifest persistence would leave a forward-state
+    # strategy that production must refuse to run and cannot automatically repair.
+    if manifest_to_lock is not None:
+        lock_deployment_manifest(store, manifest_to_lock)
+
     decision = lifecycle.request_promotion(
         strategy_id,
         evidence,
@@ -181,8 +189,6 @@ def promote(store: QuantStore, strategy_id: str, run_id: int | None) -> int:
     if not decision.approved:
         print("Promotion refused: " + ", ".join(decision.failures), file=sys.stderr)
         return 1
-    if manifest_to_lock is not None:
-        lock_deployment_manifest(store, manifest_to_lock)
     print(f"promoted {strategy_id}: {decision.from_state.value} -> {decision.to_state.value}")
     return 0
 
