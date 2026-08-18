@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Inspect or promote a Quant Desk strategy without editing SQLite by hand.
 
-High-velocity intraday strategies have stricter forward sample requirements:
-100 SHADOW trades, 200 PAPER trades, 50 measured executions and 100 CANARY trades.
-Each rung is measured only from attributions recorded since that rung began.
+Each forward rung is measured only from attributions recorded since that rung
+began. High-velocity intraday thresholds come from one centralized policy module
+shared with its runtime.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quant.contracts import StrategyState
+from quant.intraday_lifecycle import intraday_promotion_requirements
 from quant.lifecycle import LifecycleManager, PromotionEvidence, PromotionRequirements
 from quant.marketplace import compute_strategy_health
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
@@ -28,17 +29,11 @@ INTRADAY_STRATEGY_ID = "crypto_intraday_momentum"
 
 
 def _requirements(strategy_id: str) -> PromotionRequirements:
-    if strategy_id == INTRADAY_STRATEGY_ID:
-        return PromotionRequirements(
-            min_research_trades=100,
-            min_shadow_trades=100,
-            max_shadow_drawdown_r=6.0,
-            min_paper_trades=200,
-            min_measured_execution_samples=50,
-            min_canary_trades=100,
-            max_open_operational_defects=0,
-        )
-    return PromotionRequirements()
+    return (
+        intraday_promotion_requirements()
+        if strategy_id == INTRADAY_STRATEGY_ID
+        else PromotionRequirements()
+    )
 
 
 def _manager(store: QuantStore, strategy_id: str) -> LifecycleManager:
@@ -48,10 +43,10 @@ def _manager(store: QuantStore, strategy_id: str) -> LifecycleManager:
 def _parse_time(value) -> datetime | None:
     if not value:
         return None
-    ts = datetime.fromisoformat(str(value))
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+    timestamp = datetime.fromisoformat(str(value))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 def _latest_passing_research(store: QuantStore, strategy_id: str):
@@ -96,7 +91,13 @@ def show_status(quant_store, state_store, strategy_id) -> int:
     state = lifecycle.state(strategy_id)
     row = quant_store.get_strategy_state(strategy_id)
     include_shadow = state is StrategyState.SHADOW
-    health = _state_health(quant_store, strategy_id, state, row, include_shadow)
+    health = _state_health(
+        quant_store,
+        strategy_id,
+        state,
+        row,
+        include_shadow,
+    )
     latest = _latest_passing_research(quant_store, strategy_id)
     quality = state_store.execution_quality()
     req = lifecycle.requirements
@@ -107,9 +108,15 @@ def show_status(quant_store, state_store, strategy_id) -> int:
         f"PF={health.profit_factor} drawdown_R={health.max_drawdown_pct}"
     )
     print(
-        f"required samples: research={req.min_research_trades} shadow={req.min_shadow_trades} "
-        f"paper={req.min_paper_trades} executions={req.min_measured_execution_samples} "
-        f"canary={req.min_canary_trades}"
+        "requirements: "
+        f"research_trades>={req.min_research_trades}; "
+        f"shadow trades>={req.min_shadow_trades}, E[R]>={req.min_shadow_expectancy_r:.3f}, "
+        f"PF>={req.min_shadow_profit_factor:.2f}, DD<={req.max_shadow_drawdown_r:.1f}R; "
+        f"paper trades>={req.min_paper_trades}, E[R]>={req.min_paper_expectancy_r:.3f}, "
+        f"PF>={req.min_paper_profit_factor:.2f}, DD<={req.max_paper_drawdown_r:.1f}R; "
+        f"executions>={req.min_measured_execution_samples}; "
+        f"canary trades>={req.min_canary_trades}, E[R]>={req.min_canary_expectancy_r:.3f}, "
+        f"PF>={req.min_canary_profit_factor:.2f}, DD<={req.max_canary_drawdown_r:.1f}R"
     )
     print(
         f"execution samples={quality['samples']} avg_slippage_bps="
@@ -142,7 +149,11 @@ def promote(args, quant_store, state_store) -> int:
 
     elif state is StrategyState.SHADOW:
         evidence.shadow_health = _state_health(
-            quant_store, strategy_id, state, state_row, include_shadow=True
+            quant_store,
+            strategy_id,
+            state,
+            state_row,
+            include_shadow=True,
         )
 
     elif state is StrategyState.PAPER:
@@ -159,7 +170,11 @@ def promote(args, quant_store, state_store) -> int:
                 file=sys.stderr,
             )
             return 1
-        run = _research_run_by_id(quant_store, strategy_id, args.measured_research_run_id)
+        run = _research_run_by_id(
+            quant_store,
+            strategy_id,
+            args.measured_research_run_id,
+        )
         if run is None or not bool(run.get("passed")):
             print(
                 "Promotion refused: selected measured-cost research run is missing/failed.",
@@ -178,18 +193,25 @@ def promote(args, quant_store, state_store) -> int:
             )
             return 1
         if measured_slippage is None or modeled_slippage is None:
-            print("Promotion refused: measured/modelled slippage is unavailable.", file=sys.stderr)
+            print(
+                "Promotion refused: measured/modelled slippage is unavailable.",
+                file=sys.stderr,
+            )
             return 1
         if modeled_slippage + 1e-12 < max(0.0, float(measured_slippage)):
             print(
                 f"Promotion refused: research modeled {modeled_slippage:.2f} bps slippage "
-                f"but measured execution is {float(measured_slippage):.2f} bps. Rerun research "
-                "with at least the measured cost.",
+                f"but measured execution is {float(measured_slippage):.2f} bps. "
+                "Rerun research with at least the measured cost.",
                 file=sys.stderr,
             )
             return 1
         evidence.paper_health = _state_health(
-            quant_store, strategy_id, state, state_row, include_shadow=False
+            quant_store,
+            strategy_id,
+            state,
+            state_row,
+            include_shadow=False,
         )
         evidence.measured_execution_samples = measured_samples
         evidence.research_rerun_with_measured_costs = run
@@ -204,13 +226,18 @@ def promote(args, quant_store, state_store) -> int:
             )
             return 1
         evidence.canary_health = _state_health(
-            quant_store, strategy_id, state, state_row, include_shadow=False
+            quant_store,
+            strategy_id,
+            state,
+            state_row,
+            include_shadow=False,
         )
         operator_ack = True
 
     else:
         print(
-            f"Promotion refused from {state.value}; demotion/recovery must be handled explicitly.",
+            f"Promotion refused from {state.value}; "
+            "demotion/recovery must be handled explicitly.",
             file=sys.stderr,
         )
         return 1
@@ -228,7 +255,9 @@ def promote(args, quant_store, state_store) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}.")
+    print(
+        f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}."
+    )
     return 0
 
 
