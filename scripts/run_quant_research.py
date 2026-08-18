@@ -12,7 +12,6 @@ selection or promotion, preventing an optimize-until-pretty overfit loop.
 from __future__ import annotations
 
 import argparse
-import math
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -24,10 +23,14 @@ import numpy as np
 import pandas as pd
 
 from config import load_credentials
-from crypto_config import CryptoStrategyConfig, crypto_bars_per_year
+from crypto_config import crypto_bars_per_year
 from quant.contracts import Market
 from quant.exits import ExitPolicyConfig
-from quant.intraday import DEFAULT_INTRADAY_OBJECTIVE, make_high_velocity_strategy_config
+from quant.intraday import (
+    DEFAULT_INTRADAY_OBJECTIVE,
+    HIGH_VELOCITY_CRYPTO_UNIVERSE,
+    make_high_velocity_strategy_config,
+)
 from quant.research.factory import (
     QuantPromotionCriteria,
     QuantWalkForwardConfig,
@@ -112,9 +115,6 @@ def _strategy_factory(engine: str, symbols: tuple[str, ...], timeframe: str):
     def build(params):
         return IntradayMomentumStrategy(base, IntradayMomentumConfig(**params))
 
-    # Deliberately bounded grid: 18 distinct hypotheses, not hundreds of tiny
-    # parameter nudges. Stop/trailing values are fixed so selection focuses on
-    # signal horizon/quality instead of fitting exits to one market epoch.
     top_k = min(3, len(symbols))
     grid = [
         {
@@ -197,10 +197,10 @@ def _research_policy(engine: str):
     return (
         0.15,
         QuantWalkForwardConfig(
-            train_bars=2_016,      # 7 days of 5-minute bars
-            test_bars=576,         # 2 OOS days
+            train_bars=2_016,
+            test_bars=576,
             step_bars=576,
-            embargo_bars=12,       # one hour separation
+            embargo_bars=12,
             min_train_trades=20,
             max_candidates=32,
             stress_slippage_bps=20.0,
@@ -243,7 +243,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=ENGINES, default="donchian")
     parser.add_argument("--timeframe", default=None)
-    parser.add_argument("--symbols", nargs="+", default=list(DEFAULT_UNIVERSE))
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=None,
+        help="Universe override. Intraday defaults to the verified 12-pair USD universe.",
+    )
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--synthetic-bars", type=int, default=None)
@@ -254,7 +259,10 @@ def main() -> int:
     timeframe = args.timeframe or ("5Min" if args.engine == "intraday" else "1Hour")
     days = args.days or (90 if args.engine == "intraday" else 730)
     synthetic_bars = args.synthetic_bars or (10_000 if args.engine == "intraday" else 2_500)
-    symbols = tuple(args.symbols)
+    default_symbols = (
+        HIGH_VELOCITY_CRYPTO_UNIVERSE if args.engine == "intraday" else DEFAULT_UNIVERSE
+    )
+    symbols = tuple(args.symbols) if args.symbols else tuple(default_symbols)
     if args.engine == "intraday" and len(symbols) < 3:
         return _fail("Intraday cross-sectional research requires at least three symbols.")
 
