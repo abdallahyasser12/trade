@@ -23,8 +23,8 @@ if str(ROOT) not in sys.path:
 from broker import AlpacaPaperBroker
 from config import AccountMode, load_credentials
 from equity_market_data import AlpacaEquityMarketData, EquityMarketDataConfig
-from equity_marketwide_deployment import ManifestLockedMarketWideEquityTradeEngine
 from equity_marketwide_engine import clear_marketwide_equity_kill_switch
+from equity_marketwide_production_engine import ProductionMarketWideEquityTradeEngine
 from quant.equity_lifecycle import marketwide_equity_promotion_requirements
 from quant.equity_marketwide import MarketWideEquityConfig
 from quant.lifecycle import LifecycleManager
@@ -105,7 +105,7 @@ def main() -> int:
             quant_store,
             requirements=marketwide_equity_promotion_requirements(),
         )
-        engine = ManifestLockedMarketWideEquityTradeEngine(
+        engine = ProductionMarketWideEquityTradeEngine(
             broker,
             market_data,
             store,
