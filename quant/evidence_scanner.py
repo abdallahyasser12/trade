@@ -1,21 +1,22 @@
-"""Production scanner extension with evidence confidence and live microstructure.
+"""Production scanner extension with evidence, microstructure and sleeve supervision.
 
-Trade hit-rate is not treated as confidence: positive expectancy can coexist with a
-sub-50% win rate.  Confidence is derived from trade-level expectancy evidence.
+Trade hit-rate is not confidence: positive expectancy can coexist with sub-50% hit
+rate.  Confidence is derived from trade-level expectancy evidence.
 
-Live bid/ask depth is used only as an *adverse-selection penalty*.  Positive order-
-book imbalance never manufactures alpha or increases expected return; ask-heavy depth
-can only reduce a candidate's liquidity quality.  This keeps research bar-driven and
-causal while letting production react to current market state immediately before an
-entry.
+Live bid/ask depth is used only as an adverse-selection penalty.  Favorable imbalance
+never manufactures alpha.  Adaptive-v2 sleeve supervision is also negative-only:
+after enough current-lifecycle real trades, deteriorating sleeves can reduce or lose
+entry privilege, but recent winners never receive a confidence boost above baseline.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 from quant.marketplace import MIN_SAMPLE
 from quant.scanner import QuantScanner
+from quant.sleeve_supervision import compute_sleeve_health, sleeve_from_entry_reason
 
 
 def expectancy_confidence(health) -> float:
@@ -66,8 +67,22 @@ def adverse_depth_quality(imbalance: float | None) -> float:
     return max(0.50, 1.0 + 0.50 * imbalance)
 
 
+def _state_since(store, strategy_id: str):
+    row = store.get_strategy_state(strategy_id)
+    raw = row.get("since") if row else None
+    if not raw:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
 class EvidenceQuantScanner(QuantScanner):
-    """QuantScanner whose confidence is statistical and execution is depth-aware."""
+    """Scanner whose entry confidence is evidence- and adverse-selection-aware."""
 
     def _candidate_from_decision(
         self,
@@ -95,9 +110,24 @@ class EvidenceQuantScanner(QuantScanner):
         if candidate is None:
             return candidate, context
 
-        candidate.confidence = expectancy_confidence(health)
+        base_confidence = expectancy_confidence(health)
+        candidate.confidence = base_confidence
         candidate.details["hit_rate"] = health.hit_rate
-        candidate.details["expectancy_confidence"] = candidate.confidence
+        candidate.details["expectancy_confidence"] = base_confidence
+
+        # Adaptive v2: current-state forward evidence can only remove privilege.
+        # No sleeve ever receives >1x confidence from recent PnL.
+        sleeve = sleeve_from_entry_reason(candidate.signal_reason)
+        if sleeve is not None and entry.strategy_id == "crypto_intraday_adaptive":
+            sleeve_health = compute_sleeve_health(
+                self.store,
+                entry.strategy_id,
+                sleeve,
+                since=_state_since(self.store, entry.strategy_id),
+            )
+            candidate.details["sleeve_health"] = sleeve_health.to_dict()
+            candidate.confidence *= sleeve_health.confidence_multiplier
+            candidate.confidence = max(0.0, min(base_confidence, candidate.confidence))
 
         imbalance = depth_imbalance(quotes.get(decision.symbol))
         quality = adverse_depth_quality(imbalance)
