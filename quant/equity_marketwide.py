@@ -36,6 +36,8 @@ from quant.strategies.vwap_reversion import (
     VwapReversionStrategy,
 )
 
+MARKET_BENCHMARK = "SPY"
+
 
 @dataclass(frozen=True)
 class MarketWideEquityConfig:
@@ -60,6 +62,8 @@ class MarketWideEquityConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
+        if self.timeframe not in {"5Min", "15Min"}:
+            errors.append("timeframe must be 5Min or 15Min.")
         for label, value in {
             "min_price": self.min_price,
             "min_avg_dollar_volume": self.min_avg_dollar_volume,
@@ -271,7 +275,17 @@ class MarketWideEquitySelector:
             (metric for metric in metrics if metric.eligible),
             key=lambda metric: (-metric.liquidity_score, metric.symbol),
         )
-        selected = tuple(metric.symbol for metric in eligible[: cfg.max_scan_symbols])
+        # SPY is a benchmark anchor, not an alpha winner. If it passes the exact same
+        # executability gates, reserve one slot and put it first so every normal
+        # one-shard production run uses a stable market benchmark. No return metric is
+        # consulted and SPY is not forced in when it is itself unexecutable.
+        benchmark = next((metric for metric in eligible if metric.symbol == MARKET_BENCHMARK), None)
+        ordered = (
+            [benchmark] + [metric for metric in eligible if metric.symbol != MARKET_BENCHMARK]
+            if benchmark is not None
+            else eligible
+        )
+        selected = tuple(metric.symbol for metric in ordered[: cfg.max_scan_symbols])
         selected_set = set(selected)
         metrics = [
             EquityUniverseMetric(
@@ -366,7 +380,7 @@ def build_equity_scan_strategies(
     for shard in _shards(symbols, config.shard_size):
         if not shard:
             continue
-        benchmark = shard[0]
+        benchmark = MARKET_BENCHMARK if MARKET_BENCHMARK in shard else shard[0]
         families = (
             (
                 "opening_range_breakout",
