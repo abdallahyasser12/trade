@@ -1,0 +1,59 @@
+name: Quant Upgrade Smoke
+
+on:
+  push:
+    branches: ["chatgpt/production-quant-intraday-upgrade"]
+  pull_request:
+    paths:
+      - "quant/**.py"
+      - "crypto_config.py"
+      - "cross_sectional_engine.py"
+      - "advanced_crypto_engine.py"
+      - "intraday_crypto_engine.py"
+      - "scripts/run_quant_research.py"
+      - "scripts/run_intraday_runtime.py"
+      - "scripts/manage_strategy_lifecycle.py"
+      - ".github/workflows/quant-smoke.yml"
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Byte-compile changed production modules
+        run: |
+          python -m py_compile \
+            crypto_config.py \
+            cross_sectional_engine.py \
+            advanced_crypto_engine.py \
+            intraday_crypto_engine.py \
+            quant/evidence_scanner.py \
+            quant/intraday.py \
+            quant/intraday_lifecycle.py \
+            quant/lifecycle.py \
+            quant/marketplace.py \
+            quant/production_runtime.py \
+            quant/realtime_feed.py \
+            quant/research/factory.py \
+            quant/scanner.py \
+            quant/strategies/intraday_momentum.py \
+            scripts/run_quant_research.py \
+            scripts/run_intraday_runtime.py \
+            scripts/manage_strategy_lifecycle.py
+      - name: Byte-compile new regression tests
+        run: |
+          python -m py_compile \
+            tests/test_intraday_momentum.py \
+            tests/test_quant_evidence_scanner.py \
+            tests/test_quant_factory_fail_closed.py \
+            tests/test_quant_intraday_profile.py \
+            tests/test_quant_lifecycle_forward_health.py \
+            tests/test_quant_live_boundary.py \
+            tests/test_quant_marketplace_state_window.py \
+            tests/test_quant_production_runtime.py \
+            tests/test_quant_realtime_feed.py \
+            tests/test_quant_scanner_production.py
