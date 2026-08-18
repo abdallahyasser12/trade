@@ -30,13 +30,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-mobile-api.txt
-      - name: Compile market-wide production modules
+      - name: Compile and test market-wide path
+        id: verify
+        shell: bash
         run: |
+          set +e
+          : > marketwide-ci.log
           python -m py_compile \
             equity_market_data.py \
             equity_marketwide_engine.py \
             quant/equity_marketwide.py \
             scripts/run_marketwide_equity_runtime.py \
-            tests/test_equity_marketwide.py
-      - name: Run market-wide regression tests
-        run: python -m pytest -q tests/test_equity_marketwide.py
+            tests/test_equity_marketwide.py >> marketwide-ci.log 2>&1
+          compile_status=$?
+          test_status=0
+          if [ "$compile_status" -eq 0 ]; then
+            python -m pytest -q tests/test_equity_marketwide.py >> marketwide-ci.log 2>&1
+            test_status=$?
+          fi
+          cat marketwide-ci.log
+          if [ "$compile_status" -ne 0 ] || [ "$test_status" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketwide-equity-ci-log
+          path: marketwide-ci.log
+          if-no-files-found: error
