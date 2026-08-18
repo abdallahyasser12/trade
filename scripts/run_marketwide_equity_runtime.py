@@ -31,6 +31,9 @@ from quant.lifecycle import LifecycleManager
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
 
+MIN_DEPLOYABLE_UNIVERSE = 12
+MAX_DEPLOYABLE_UNIVERSE = 48
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -41,8 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-scan-symbols",
         type=int,
-        default=48,
-        help="Must exactly match the promoted research configuration in SHADOW/PAPER.",
+        default=MAX_DEPLOYABLE_UNIVERSE,
+        help=(
+            f"Deployable researched universe size ({MIN_DEPLOYABLE_UNIVERSE}-"
+            f"{MAX_DEPLOYABLE_UNIVERSE}); must exactly match the promoted manifest."
+        ),
     )
     parser.add_argument("--max-positions", type=int, default=6)
     parser.add_argument("--risk-per-trade-pct", type=float, default=0.15)
@@ -67,6 +73,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not MIN_DEPLOYABLE_UNIVERSE <= args.max_scan_symbols <= MAX_DEPLOYABLE_UNIVERSE:
+        print(
+            "Invalid runtime configuration: --max-scan-symbols must be between "
+            f"{MIN_DEPLOYABLE_UNIVERSE} and {MAX_DEPLOYABLE_UNIVERSE}; deployable "
+            "market-wide research uses exactly one strategy shard.",
+            file=sys.stderr,
+        )
+        return 2
+
     credentials = load_credentials(account_mode=AccountMode.PAPER)
     if not credentials.is_configured:
         print(
@@ -79,7 +94,7 @@ def main() -> int:
     config = MarketWideEquityConfig(
         timeframe=args.timeframe,
         max_scan_symbols=args.max_scan_symbols,
-        shard_size=min(48, args.max_scan_symbols),
+        shard_size=args.max_scan_symbols,
         max_positions=args.max_positions,
         risk_per_trade_pct=args.risk_per_trade_pct,
         max_session_loss_pct=args.max_session_loss_pct,
