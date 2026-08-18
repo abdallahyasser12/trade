@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Inspect or promote a Quant Desk strategy without editing SQLite by hand.
+"""Inspect or promote Quant Desk strategies without editing SQLite by hand.
 
-Forward rungs use only evidence recorded since that rung began. High-velocity
-strategies use stricter thresholds. Adaptive v2 additionally locks the exact universe
-from its promoted research run; measured-cost reruns and deployed runtimes must use
-the same symbols/order until a new research cycle is explicitly adopted.
+Adaptive v2 promotions are manifest-bound.  RESEARCH -> SHADOW locks the exact
+passing research identity (git commit, strategy version, timeframe, ordered universe
+and parameters).  PAPER -> LIVE_CANARY requires a passing measured-cost run whose
+manifest describes that exact same strategy.
 """
 
 from __future__ import annotations
@@ -17,14 +17,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from quant.adaptive_manifest import (
+    load_research_manifest,
+    lock_deployment_manifest,
+    locked_deployment_manifest,
+)
 from quant.contracts import StrategyState
 from quant.intraday_lifecycle import intraday_promotion_requirements
 from quant.lifecycle import LifecycleManager, PromotionEvidence, PromotionRequirements
-from quant.liquidity_universe import (
-    lock_deployment_universe,
-    locked_deployment_universe,
-    universe_from_research_run,
-)
+from quant.liquidity_universe import lock_deployment_universe
 from quant.marketplace import compute_strategy_health
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 from state_store import StateStore
@@ -104,34 +105,44 @@ def show_status(quant_store, state_store, strategy_id) -> int:
     lifecycle = _manager(quant_store, strategy_id)
     state = lifecycle.state(strategy_id)
     row = quant_store.get_strategy_state(strategy_id)
-    include_shadow = state is StrategyState.SHADOW
     health = _state_health(
         quant_store,
         strategy_id,
         state,
         row,
-        include_shadow,
+        include_shadow=state is StrategyState.SHADOW,
     )
     latest = _latest_passing_research(quant_store, strategy_id)
     quality = state_store.execution_quality()
     req = lifecycle.requirements
+
     print(f"strategy={strategy_id}")
     print(f"state={state.value} since={(row or {}).get('since') or 'not-recorded'}")
     if strategy_id == ADAPTIVE_STRATEGY_ID:
-        print(f"locked_universe={locked_deployment_universe(quant_store)}")
+        manifest = locked_deployment_manifest(quant_store)
+        if manifest is None:
+            print("deployment_manifest=not-locked")
+        else:
+            print(
+                f"deployment_manifest=run#{manifest.research_run_id} "
+                f"commit={manifest.git_commit} version={manifest.strategy_version} "
+                f"timeframe={manifest.timeframe}"
+            )
+            print(f"locked_universe={manifest.universe}")
+            print(f"locked_params={manifest.params}")
     print(
         f"current-state trades={health.trades} expectancy_R={health.expectancy_r} "
         f"PF={health.profit_factor} drawdown_R={health.max_drawdown_pct}"
     )
     print(
         "requirements: "
-        f"research_trades>={req.min_research_trades}; "
-        f"shadow trades>={req.min_shadow_trades}, E[R]>={req.min_shadow_expectancy_r:.3f}, "
+        f"research>={req.min_research_trades}; "
+        f"shadow>={req.min_shadow_trades}, E[R]>={req.min_shadow_expectancy_r:.3f}, "
         f"PF>={req.min_shadow_profit_factor:.2f}, DD<={req.max_shadow_drawdown_r:.1f}R; "
-        f"paper trades>={req.min_paper_trades}, E[R]>={req.min_paper_expectancy_r:.3f}, "
+        f"paper>={req.min_paper_trades}, E[R]>={req.min_paper_expectancy_r:.3f}, "
         f"PF>={req.min_paper_profit_factor:.2f}, DD<={req.max_paper_drawdown_r:.1f}R; "
         f"executions>={req.min_measured_execution_samples}; "
-        f"canary trades>={req.min_canary_trades}, E[R]>={req.min_canary_expectancy_r:.3f}, "
+        f"canary>={req.min_canary_trades}, E[R]>={req.min_canary_expectancy_r:.3f}, "
         f"PF>={req.min_canary_profit_factor:.2f}, DD<={req.max_canary_drawdown_r:.1f}R"
     )
     print(
@@ -155,7 +166,7 @@ def promote(args, quant_store, state_store) -> int:
     state_row = quant_store.get_strategy_state(strategy_id)
     evidence = PromotionEvidence()
     operator_ack = False
-    research_universe = None
+    research_manifest = None
 
     if state is StrategyState.RESEARCH:
         run = _latest_passing_research(quant_store, strategy_id)
@@ -163,10 +174,20 @@ def promote(args, quant_store, state_store) -> int:
             print("Promotion refused: no passing real research run.", file=sys.stderr)
             return 1
         if strategy_id == ADAPTIVE_STRATEGY_ID:
-            research_universe = universe_from_research_run(run)
-            if research_universe is None:
+            research_manifest = load_research_manifest(
+                quant_store,
+                int(run.get("id") or 0),
+            )
+            if research_manifest is None:
                 print(
-                    "Promotion refused: adaptive research run has no valid 6-12 symbol universe.",
+                    "Promotion refused: adaptive passing run has no immutable research manifest.",
+                    file=sys.stderr,
+                )
+                return 1
+            run_commit = str(run.get("git_commit") or "").lower()
+            if run_commit != research_manifest.git_commit.lower():
+                print(
+                    "Promotion refused: research row and manifest git commits differ.",
                     file=sys.stderr,
                 )
                 return 1
@@ -206,16 +227,27 @@ def promote(args, quant_store, state_store) -> int:
                 file=sys.stderr,
             )
             return 1
+
         if strategy_id == ADAPTIVE_STRATEGY_ID:
-            locked = locked_deployment_universe(quant_store)
-            rerun_universe = universe_from_research_run(run)
-            if locked is None or rerun_universe != locked:
+            locked = locked_deployment_manifest(quant_store)
+            rerun = load_research_manifest(
+                quant_store,
+                args.measured_research_run_id,
+            )
+            if locked is None or rerun is None:
                 print(
-                    "Promotion refused: measured-cost adaptive research must use the "
-                    f"exact locked universe. locked={locked}, rerun={rerun_universe}",
+                    "Promotion refused: adaptive deployment/measured-run manifest is missing.",
                     file=sys.stderr,
                 )
                 return 1
+            if not locked.same_strategy(rerun):
+                print(
+                    "Promotion refused: measured-cost rerun is not the exact promoted "
+                    "strategy (commit/version/timeframe/universe/params mismatch).",
+                    file=sys.stderr,
+                )
+                return 1
+
         quality = state_store.execution_quality()
         measured_samples = int(quality.get("samples") or 0)
         measured_slippage = quality.get("avg_slippage_bps")
@@ -236,11 +268,11 @@ def promote(args, quant_store, state_store) -> int:
         if modeled_slippage + 1e-12 < max(0.0, float(measured_slippage)):
             print(
                 f"Promotion refused: research modeled {modeled_slippage:.2f} bps slippage "
-                f"but measured execution is {float(measured_slippage):.2f} bps. "
-                "Rerun research with at least the measured cost.",
+                f"but measured execution is {float(measured_slippage):.2f} bps.",
                 file=sys.stderr,
             )
             return 1
+
         evidence.paper_health = _state_health(
             quant_store,
             strategy_id,
@@ -271,8 +303,7 @@ def promote(args, quant_store, state_store) -> int:
 
     else:
         print(
-            f"Promotion refused from {state.value}; "
-            "demotion/recovery must be handled explicitly.",
+            f"Promotion refused from {state.value}; demotion/recovery must be explicit.",
             file=sys.stderr,
         )
         return 1
@@ -296,10 +327,16 @@ def promote(args, quant_store, state_store) -> int:
         and decision.from_state is StrategyState.RESEARCH
         and decision.to_state is StrategyState.SHADOW
     ):
-        if research_universe is None:
-            raise RuntimeError("Adaptive promotion approved without a research universe.")
-        lock_deployment_universe(quant_store, research_universe)
-        print(f"locked adaptive deployment universe={research_universe}")
+        if research_manifest is None:
+            raise RuntimeError("Adaptive promotion approved without a research manifest.")
+        lock_deployment_manifest(quant_store, research_manifest)
+        lock_deployment_universe(quant_store, research_manifest.universe)
+        print(
+            "locked adaptive deployment manifest: "
+            f"run#{research_manifest.research_run_id} {research_manifest.git_commit} "
+            f"{research_manifest.timeframe} {research_manifest.universe} "
+            f"params={research_manifest.params}"
+        )
 
     print(f"Promotion APPROVED: {decision.from_state.value}->{decision.to_state.value}.")
     return 0
@@ -312,11 +349,7 @@ def main() -> int:
         cmd = sub.add_parser(name)
         cmd.add_argument("--strategy", required=True)
         cmd.add_argument("--quant-db", default=DEFAULT_QUANT_DB_PATH)
-        cmd.add_argument(
-            "--state-db",
-            default=None,
-            help="Defaults to the strategy-specific intraday execution DB.",
-        )
+        cmd.add_argument("--state-db", default=None)
         if name == "promote":
             cmd.add_argument("--measured-research-run-id", type=int, default=None)
             cmd.add_argument("--operational-defects", type=int, default=0)
