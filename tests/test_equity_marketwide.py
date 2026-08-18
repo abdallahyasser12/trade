@@ -54,6 +54,8 @@ def daily(price=50.0, volume=500_000.0, rows=20):
 
 def test_marketwide_config_is_bounded():
     assert not MarketWideEquityConfig().validate()
+    assert MarketWideEquityConfig().timeframe == "15Min"
+    assert MarketWideEquityConfig().max_scan_symbols == 48
     assert MarketWideEquityConfig(shard_size=65).validate()
     assert MarketWideEquityConfig(risk_per_trade_pct=1.01).validate()
     assert MarketWideEquityConfig(max_total_exposure_pct=101).validate()
@@ -133,7 +135,7 @@ def test_strategy_builder_shards_without_changing_strategy_identity():
         assert family_symbols == list(symbols)
 
 
-def test_ownership_wrapper_does_not_let_other_strategy_claim_positions():
+def test_ownership_wrapper_filters_real_owned_context_but_preserves_shadow_context():
     class Delegate:
         config = object()
 
@@ -155,6 +157,10 @@ def test_ownership_wrapper_does_not_let_other_strategy_claim_positions():
         def ratchet_stop(self, *args):
             return args[0], args[1]
 
-    wrapped = OwnershipAwareStrategy(Delegate(), {"AAPL"})
-    assert wrapped.evaluate_prepared({}, NOW, {"AAPL", "MSFT"}) == frozenset({"AAPL"})
-    assert wrapped.evaluate({}, {"AAPL", "MSFT"}) == frozenset({"AAPL"})
+    paper_owned = OwnershipAwareStrategy(Delegate(), {"AAPL"})
+    assert paper_owned.evaluate_prepared({}, NOW, {"AAPL", "MSFT"}) == frozenset({"AAPL"})
+    assert paper_owned.evaluate({}, {"AAPL", "MSFT"}) == frozenset({"AAPL"})
+
+    shadow_no_real_position = OwnershipAwareStrategy(Delegate(), frozenset())
+    assert shadow_no_real_position.evaluate_prepared({}, NOW, {"MSFT"}) == frozenset({"MSFT"})
+    assert shadow_no_real_position.evaluate({}, {"MSFT"}) == frozenset({"MSFT"})
