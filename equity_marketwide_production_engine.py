@@ -3,7 +3,7 @@
 A forward strategy has two distinct symbol sets:
 
 * **entry-eligible** — researched symbols that still pass the latest hard current
-  executability/liquidity screen; only these may receive a new broker allocation.
+  executability/liquidity screen; only these may receive a new PAPER or SHADOW entry.
 * **management-only** — already-held SHADOW symbols (real PAPER positions are added by
   the base engine independently) that must keep receiving completed bars even when a
   later universe refresh temporarily makes them ineligible for a fresh entry.
@@ -15,6 +15,7 @@ held management symbol back into a valid new-entry candidate.
 
 from __future__ import annotations
 
+from models import BotAction
 from equity_marketwide_deployment import ManifestLockedMarketWideEquityTradeEngine
 from equity_marketwide_engine import MarketWideEquityTradeEngine
 from quant.contracts import StrategyState
@@ -51,6 +52,39 @@ def partition_locked_universe(
     return entry_eligible, management
 
 
+class EntryGatedShadowExecutor:
+    """Delegate SHADOW position management while refusing ineligible fresh BUYs.
+
+    QuantScanner sends SHADOW decisions straight to its ShadowExecutor before the
+    normal ranked PAPER allocation path. Therefore the current executable-universe
+    gate has to exist here too; otherwise SHADOW evidence could include entries that
+    PAPER would never be permitted to submit.
+    """
+
+    def __init__(self, delegate, entry_symbols_provider):
+        self._delegate = delegate
+        self._entry_symbols_provider = entry_symbols_provider
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def held_symbols(self, strategy_id: str):
+        return self._delegate.held_symbols(strategy_id)
+
+    def process_cycle(self, *, decisions, **kwargs):
+        entry_symbols = frozenset(self._entry_symbols_provider())
+        for decision in decisions:
+            if decision.action is BotAction.BUY and decision.symbol not in entry_symbols:
+                original_reason = decision.reason
+                decision.action = BotAction.HOLD
+                decision.reason = f"current_universe_entry_block:{original_reason}"
+                decision.filters = dict(decision.filters)
+                decision.filters["current_entry_eligible"] = False
+                decision.details = dict(decision.details)
+                decision.details["entry_gate"] = "current_executability_or_breadth"
+        return self._delegate.process_cycle(decisions=decisions, **kwargs)
+
+
 class ProductionMarketWideEquityTradeEngine(ManifestLockedMarketWideEquityTradeEngine):
     """Manifest-locked runtime with state-aware management-only symbol handling."""
 
@@ -58,6 +92,10 @@ class ProductionMarketWideEquityTradeEngine(ManifestLockedMarketWideEquityTradeE
         super().__init__(*args, **kwargs)
         self._hard_selected_symbols: tuple[str, ...] = ()
         self._entry_eligible_symbols: frozenset[str] = frozenset()
+        self.scanner.shadow = EntryGatedShadowExecutor(
+            self.scanner.shadow,
+            lambda: self._entry_eligible_symbols,
+        )
 
     @property
     def entry_eligible_symbols(self) -> frozenset[str]:
