@@ -16,7 +16,7 @@ on:
       - "scripts/run_adaptive_intraday_runtime.py"
       - "scripts/manage_strategy_lifecycle.py"
       - "tests/test_intraday_adaptive.py"
-      - "tests/test_adaptive_intraday_lifecycle_cli.py"
+      - "tests/test_adaptive_*.py"
       - ".github/workflows/quant-smoke.yml"
 
 jobs:
@@ -39,6 +39,7 @@ jobs:
             quant/intraday.py \
             quant/intraday_lifecycle.py \
             quant/lifecycle.py \
+            quant/liquidity_universe.py \
             quant/marketplace.py \
             quant/production_runtime.py \
             quant/realtime_feed.py \
@@ -58,6 +59,9 @@ jobs:
             tests/test_intraday_momentum.py \
             tests/test_intraday_adaptive.py \
             tests/test_adaptive_intraday_lifecycle_cli.py \
+            tests/test_adaptive_intraday_registry.py \
+            tests/test_adaptive_intraday_research_policy.py \
+            tests/test_adaptive_liquidity_universe.py \
             tests/test_quant_evidence_scanner.py \
             tests/test_quant_factory_fail_closed.py \
             tests/test_quant_intraday_profile.py \
