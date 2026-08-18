@@ -2,10 +2,10 @@
 """Inspect/promote market-wide US-equity strategies through PAPER.
 
 RESEARCH -> SHADOW requires a passing real-data research row plus its immutable
-manifest.  The promoted manifest must match the checked-out commit and any other
-already-forward market-wide strategy.  SHADOW -> PAPER requires measured forward
-strategy health.  Promotion beyond PAPER is deliberately refused because the stock
-broker boundary in this repository does not permit live US-equity orders.
+manifest. The promoted manifest must match the checked-out commit and any other
+already-forward market-wide strategy. SHADOW -> PAPER requires 100 current-state
+trades, >=+0.03R expectancy, PF >=1.10 and <=5R drawdown. Promotion beyond PAPER is
+refused because the repository intentionally blocks live US-equity orders.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ if str(ROOT) not in sys.path:
 
 from quant.adaptive_manifest import current_git_commit
 from quant.contracts import StrategyState
+from quant.equity_lifecycle import marketwide_equity_promotion_requirements
 from quant.equity_manifest import (
     EQUITY_STRATEGY_IDS,
     load_research_manifest,
     lock_deployment_manifest,
     locked_deployment_manifest,
 )
-from quant.lifecycle import LifecycleManager, PromotionEvidence, PromotionRequirements
+from quant.lifecycle import LifecycleManager, PromotionEvidence
 from quant.marketplace import compute_strategy_health
 from quant.store import DEFAULT_QUANT_DB_PATH, QuantStore
 
@@ -36,6 +37,13 @@ STRATEGIES = (
     "vwap_reversion",
     "volatility_squeeze",
 )
+
+
+def _lifecycle(store: QuantStore) -> LifecycleManager:
+    return LifecycleManager(
+        store,
+        requirements=marketwide_equity_promotion_requirements(),
+    )
 
 
 def _parse_time(value):
@@ -73,10 +81,11 @@ def _health(store: QuantStore, strategy_id: str, state: StrategyState):
 
 
 def _assert_manifest_compatible_with_desk(store: QuantStore, strategy_id: str, manifest) -> None:
+    lifecycle = _lifecycle(store)
     for other_id in STRATEGIES:
         if other_id == strategy_id:
             continue
-        other_state = LifecycleManager(store).state(other_id)
+        other_state = lifecycle.state(other_id)
         if other_state is StrategyState.RESEARCH:
             continue
         other = locked_deployment_manifest(store, other_id)
@@ -97,7 +106,7 @@ def _assert_manifest_compatible_with_desk(store: QuantStore, strategy_id: str, m
 
 
 def show_status(store: QuantStore, strategy_id: str) -> int:
-    lifecycle = LifecycleManager(store, requirements=PromotionRequirements())
+    lifecycle = _lifecycle(store)
     state = lifecycle.state(strategy_id)
     health = _health(store, strategy_id, state)
     manifest = locked_deployment_manifest(store, strategy_id)
@@ -129,7 +138,7 @@ def show_status(store: QuantStore, strategy_id: str) -> int:
 
 
 def promote(store: QuantStore, strategy_id: str, run_id: int | None) -> int:
-    lifecycle = LifecycleManager(store, requirements=PromotionRequirements())
+    lifecycle = _lifecycle(store)
     state = lifecycle.state(strategy_id)
     if state is StrategyState.PAPER:
         print(
@@ -173,11 +182,8 @@ def promote(store: QuantStore, strategy_id: str, run_id: int | None) -> int:
     else:
         evidence.shadow_health = _health(store, strategy_id, StrategyState.SHADOW)
 
-    # Lock the immutable deployment identity BEFORE increasing lifecycle privilege.
-    # If the later promotion gate rejects the transition, a harmless manifest remains
-    # while the strategy is still RESEARCH.  The inverse ordering is unsafe: a crash
-    # after state promotion but before manifest persistence would leave a forward-state
-    # strategy that production must refuse to run and cannot automatically repair.
+    # Persist identity before increasing privilege. A failed promotion can safely leave
+    # a manifest in RESEARCH; the opposite ordering could create SHADOW without identity.
     if manifest_to_lock is not None:
         lock_deployment_manifest(store, manifest_to_lock)
 
@@ -198,8 +204,7 @@ def demote(store: QuantStore, strategy_id: str, target: str, reason: str) -> int
     if to_state not in {StrategyState.RESEARCH, StrategyState.SHADOW}:
         print("Demotion target must be RESEARCH or SHADOW for this paper-only desk.", file=sys.stderr)
         return 1
-    lifecycle = LifecycleManager(store, requirements=PromotionRequirements())
-    lifecycle.demote(strategy_id, to_state, reason=reason)
+    _lifecycle(store).demote(strategy_id, to_state, reason=reason)
     print(f"demoted {strategy_id} -> {to_state.value}: {reason}")
     return 0
 
