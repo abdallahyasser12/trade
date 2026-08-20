@@ -84,6 +84,9 @@ class GapStore:
     def set_bot_position(self, symbol, record):
         self.positions[symbol] = dict(record)
 
+    def get_bot_position(self, symbol):
+        return self.positions.get(symbol)
+
     def delete_kv(self, key):
         self.deleted.append(key)
         self.values.pop(key, None)

@@ -1,3 +1,5 @@
+import pytest
+
 from datetime import datetime, timedelta, timezone
 
 from quant.contracts import StrategyState
@@ -90,7 +92,7 @@ def test_new_paper_rung_bridges_only_immediately_prior_shadow_evidence():
     assert source == "bridge_shadow_to_paper"
     assert health.trades == 100
     # The deliberately huge attribution before SHADOW began must not leak in.
-    assert health.expectancy_r == 0.10
+    assert health.expectancy_r == pytest.approx(0.10)
 
 
 def test_current_rung_becomes_authoritative_after_40_real_trades():
@@ -104,4 +106,4 @@ def test_current_rung_becomes_authoritative_after_40_real_trades():
     )
     assert source == "current_rung"
     assert health.trades == CURRENT_RUNG_AUTHORITY_TRADES
-    assert health.expectancy_r == 0.08
+    assert health.expectancy_r == pytest.approx(0.08)

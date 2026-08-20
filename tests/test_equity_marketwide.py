@@ -109,7 +109,7 @@ def test_selector_cap_is_liquidity_only_and_deterministic():
         "BBB": daily(volume=600_000),
         "CCC": daily(volume=900_000),
     }
-    cfg = MarketWideEquityConfig(max_scan_symbols=2)
+    cfg = MarketWideEquityConfig(max_scan_symbols=2, shard_size=2)
     report = MarketWideEquitySelector(cfg).select(assets, quotes, bars, now=NOW)
     assert report.selected == ("CCC", "AAA")
     assert report.rejected["BBB"] == "beyond_scan_cap"
@@ -127,7 +127,7 @@ def test_selector_reserves_executable_spy_as_stable_benchmark_anchor():
         "CCC": daily(volume=800_000),
     }
     report = MarketWideEquitySelector(
-        MarketWideEquityConfig(max_scan_symbols=2)
+        MarketWideEquityConfig(max_scan_symbols=2, shard_size=2)
     ).select(assets, quotes, bars, now=NOW)
     assert report.selected == (MARKET_BENCHMARK, "AAA")
     assert report.rejected["CCC"] == "beyond_scan_cap"

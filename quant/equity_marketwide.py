@@ -238,12 +238,12 @@ class MarketWideEquitySelector:
                 reason = "quote_timestamp_missing"
             elif age > cfg.max_quote_age_seconds:
                 reason = "stale_quote"
-            elif spread_bps is None or spread_bps > cfg.max_spread_bps:
-                reason = "spread_too_wide"
             elif midpoint < cfg.min_price:
                 reason = "below_min_price"
             elif cfg.max_price is not None and midpoint > cfg.max_price:
                 reason = "above_max_price"
+            elif spread_bps is None or spread_bps > cfg.max_spread_bps:
+                reason = "spread_too_wide"
             elif history_bars < cfg.min_daily_history_bars:
                 reason = "insufficient_daily_history"
             elif avg_dollar_volume is None or avg_dollar_volume < cfg.min_avg_dollar_volume:
