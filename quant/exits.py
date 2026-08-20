@@ -2,7 +2,9 @@
 
 One deterministic policy object owns everything that happens after a fill:
 protective-stop ratcheting, optional partial profit-taking, optional
-break-even, optional time stops, and the extreme-winner state machine
+break-even, optional time stops, optional scalp-style profit targets,
+optional hold-intelligence exits/trail-tightening (quant/exit_intelligence.py
+supplies the causal hold score), and the extreme-winner state machine
 
     NORMAL_POSITION -> STRONG_WINNER -> RUNNER
 
@@ -73,6 +75,23 @@ class ExitPolicyConfig:
     enable_time_stop: bool = False
     time_stop_bars: int = 20
     time_stop_max_r: float = 0.5
+    # Scalp-style profit capture: bank a configured fraction of the ORIGINAL
+    # quantity once the completed close reaches profit_target_r.  A fraction of
+    # 1.0 (or >= what remains) is a full exit.  Skipped once a position has
+    # been promoted to RUNNER — runners are managed by their wide trail.
+    enable_profit_target: bool = False
+    profit_target_r: float = 1.5
+    profit_target_fraction: float = 1.0
+    # Hold-intelligence consumers (quant/exit_intelligence.py).  Both read the
+    # caller-supplied hold_score and are inert when no score is provided, so
+    # research environments that do not compute hold intelligence — and every
+    # existing deployed configuration — behave exactly as before.
+    enable_smart_exit: bool = False
+    smart_exit_hold_score: float = 35.0
+    smart_exit_min_r: float = 0.0
+    enable_adaptive_trail: bool = False
+    tightened_trail_atr_multiplier: float = 1.5
+    tighten_hold_score: float = 55.0
     enable_runner: bool = False
     strong_winner_trigger_r: float = 2.5
     strong_winner_lock_r: float = 1.0
@@ -90,6 +109,8 @@ class ExitPolicyConfig:
             "trailing ATR multiplier": self.trailing_atr_multiplier,
             "partial-take trigger": self.partial_take_r,
             "break-even trigger": self.break_even_trigger_r,
+            "profit-target trigger": self.profit_target_r,
+            "tightened trail multiplier": self.tightened_trail_atr_multiplier,
             "strong-winner trigger": self.strong_winner_trigger_r,
             "runner trigger": self.runner_trigger_r,
             "runner trail multiplier": self.runner_trail_atr_multiplier,
@@ -99,6 +120,16 @@ class ExitPolicyConfig:
                 errors.append(f"{label} must be finite and greater than zero.")
         if not (0.0 < self.partial_take_fraction < 1.0):
             errors.append("Partial-take fraction must be in (0, 1).")
+        if not (0.0 < self.profit_target_fraction <= 1.0):
+            errors.append("Profit-target fraction must be in (0, 1].")
+        if not math.isfinite(self.smart_exit_min_r):
+            errors.append("Smart-exit R floor must be finite.")
+        if not (0.0 <= self.smart_exit_hold_score <= 100.0):
+            errors.append("Smart-exit hold score must be within [0, 100].")
+        if not (0.0 <= self.tighten_hold_score <= 100.0):
+            errors.append("Tighten hold score must be within [0, 100].")
+        if self.tightened_trail_atr_multiplier > self.trailing_atr_multiplier:
+            errors.append("Tightened trail cannot be wider than the normal trail.")
         if not (0.0 < self.runner_fraction < 1.0):
             errors.append("Runner fraction must be in (0, 1).")
         if self.enable_time_stop and self.time_stop_bars < 1:
@@ -135,6 +166,7 @@ class ManagedPosition:
     remaining_fraction: float = 1.0
     phase: PositionPhase = PositionPhase.NORMAL
     partial_taken: bool = False
+    target_taken: bool = False
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -187,12 +219,17 @@ class TradeManagementPolicy:
         close: float,
         atr_value: float,
         efficiency_ratio: Optional[float] = None,
+        hold_score: Optional[float] = None,
     ) -> ManagementUpdate:
         """Evaluate management rules on one completed bar.
 
         Returns the next position snapshot plus instructions.  A FULL_EXIT
         instruction ends evaluation; stop updates returned here must be
         applied to future execution only.
+
+        ``hold_score`` is the optional causal 0-100 hold assessment from
+        ``quant.exit_intelligence``; when omitted (or non-finite) every
+        hold-driven behavior is inert regardless of its flag.
         """
         errors = position.validate()
         if errors:
@@ -208,8 +245,10 @@ class TradeManagementPolicy:
         r_now = position.r_multiple(close)
         phase = position.phase
         partial_taken = position.partial_taken
+        target_taken = position.target_taken
         remaining = position.remaining_fraction
         stop = position.current_stop_price
+        hold_known = hold_score is not None and math.isfinite(hold_score)
 
         # --- time stop: stagnant trades only -----------------------------
         if (
@@ -228,6 +267,30 @@ class TradeManagementPolicy:
                     ExitInstruction(
                         kind=ExitInstructionKind.FULL_EXIT,
                         reason="time_stop_stagnant",
+                    )
+                ],
+            )
+
+        # --- smart exit: measured edge decay ------------------------------
+        # Only a KNOWN collapsed hold score exits; an unmeasurable state is
+        # neutral and leaves the position to its protective stop.
+        if (
+            cfg.enable_smart_exit
+            and hold_known
+            and hold_score < cfg.smart_exit_hold_score
+            and r_now >= cfg.smart_exit_min_r
+        ):
+            updated = replace(
+                position,
+                highest_close=highest,
+                bars_held=position.bars_held + 1,
+            )
+            return ManagementUpdate(
+                position=updated,
+                instructions=[
+                    ExitInstruction(
+                        kind=ExitInstructionKind.FULL_EXIT,
+                        reason="edge_decay_exit",
                     )
                 ],
             )
@@ -263,6 +326,42 @@ class TradeManagementPolicy:
                 )
                 remaining = cfg.runner_fraction
 
+        # --- profit target: scalp-style banked gain ----------------------
+        if (
+            cfg.enable_profit_target
+            and not target_taken
+            and phase is not PositionPhase.RUNNER
+            and r_now >= cfg.profit_target_r
+        ):
+            take = min(cfg.profit_target_fraction, remaining)
+            if take >= remaining:
+                updated = replace(
+                    position,
+                    highest_close=highest,
+                    bars_held=position.bars_held + 1,
+                    target_taken=True,
+                )
+                return ManagementUpdate(
+                    position=updated,
+                    instructions=instructions
+                    + [
+                        ExitInstruction(
+                            kind=ExitInstructionKind.FULL_EXIT,
+                            reason="profit_target",
+                        )
+                    ],
+                )
+            if take > 0:
+                instructions.append(
+                    ExitInstruction(
+                        kind=ExitInstructionKind.PARTIAL_EXIT,
+                        reason="profit_target",
+                        exit_fraction=take,
+                    )
+                )
+                remaining -= take
+                target_taken = True
+
         # --- standard partial take ---------------------------------------
         if (
             cfg.enable_partial_take
@@ -285,11 +384,19 @@ class TradeManagementPolicy:
         # --- stop management ----------------------------------------------
         candidates = [stop]
         if cfg.enable_trailing_stop:
-            trail_multiplier = (
-                cfg.runner_trail_atr_multiplier
-                if phase is PositionPhase.RUNNER
-                else cfg.trailing_atr_multiplier
-            )
+            if phase is PositionPhase.RUNNER:
+                trail_multiplier = cfg.runner_trail_atr_multiplier
+            else:
+                trail_multiplier = cfg.trailing_atr_multiplier
+                # Adaptive trail: a measurably weakening hold tightens the
+                # trail toward the tightened multiplier; runners keep their
+                # wide trail because that is the entire point of a runner.
+                if (
+                    cfg.enable_adaptive_trail
+                    and hold_known
+                    and hold_score < cfg.tighten_hold_score
+                ):
+                    trail_multiplier = cfg.tightened_trail_atr_multiplier
             candidates.append(highest - atr_value * trail_multiplier)
         if cfg.enable_break_even and r_now >= cfg.break_even_trigger_r:
             candidates.append(position.entry_price)
@@ -317,5 +424,38 @@ class TradeManagementPolicy:
             remaining_fraction=remaining,
             phase=phase,
             partial_taken=partial_taken,
+            target_taken=target_taken,
         )
         return ManagementUpdate(position=updated, instructions=instructions)
+
+
+def scalp_exit_policy() -> ExitPolicyConfig:
+    """Research preset for scalp-style management: many small banked wins.
+
+    Everything a scalp needs is expressed through the existing flags: a quick
+    partial profit target, early break-even, a short stagnation stop, a tight
+    trail that tightens further on measured edge decay, and a hold-score exit
+    so a stalled scalp releases its capital for the next ranked opportunity.
+
+    This is a HYPOTHESIS preset for the research simulator.  Nothing deploys
+    it; a deployed configuration must come from the usual chronological
+    research -> OOS -> lifecycle evidence path.
+    """
+    return ExitPolicyConfig(
+        trailing_atr_multiplier=1.8,
+        enable_trailing_stop=True,
+        enable_break_even=True,
+        break_even_trigger_r=0.8,
+        enable_time_stop=True,
+        time_stop_bars=12,
+        time_stop_max_r=0.3,
+        enable_profit_target=True,
+        profit_target_r=1.2,
+        profit_target_fraction=0.6,
+        enable_smart_exit=True,
+        smart_exit_hold_score=35.0,
+        smart_exit_min_r=0.0,
+        enable_adaptive_trail=True,
+        tightened_trail_atr_multiplier=1.1,
+        tighten_hold_score=55.0,
+    )

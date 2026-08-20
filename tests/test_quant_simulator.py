@@ -355,3 +355,57 @@ def test_result_r_multiples_are_finite():
     assert result.r_multiples
     assert all(math.isfinite(r) for r in result.r_multiples)
     assert isinstance(result.config_snapshot["exit_policy"], dict)
+
+
+def test_profit_target_full_exit_fills_next_open():
+    # Entry, then a +2R completed close queues the full profit-target exit,
+    # which fills on the following open.
+    rows = [(100, 101, 99, 100)] * 4 + [
+        (100, 101, 99, 100),    # BUY signal, stop distance 5
+        (100, 101, 99, 100),    # entry at 100, stop 95
+        (110, 111, 109, 110),   # completed close 110 = +2R -> target queued
+        (111, 112, 110, 111),   # exit fills at open 111
+        (111, 112, 110, 111),
+    ]
+    bars = make_bars(rows)
+    strategy = ScriptedStrategy({("TEST", 4): (BotAction.BUY, 100.0, 95.0, "buy")})
+    policy = ExitPolicyConfig(
+        enable_trailing_stop=False,
+        enable_profit_target=True,
+        profit_target_r=1.5,
+        profit_target_fraction=1.0,
+    )
+    result = run_simulation(
+        strategy, {"TEST": bars}, config=frictionless_config(), exit_policy=policy
+    )
+    trade = result.trades[0]
+    assert len(trade.exit_legs) == 1
+    assert trade.exit_legs[0].reason == "profit_target"
+    assert trade.exit_legs[0].price == pytest.approx(111.0)
+    assert trade.is_closed
+
+
+def test_scalp_policy_runs_with_hold_wiring_and_journals_config():
+    # The scalp preset enables hold-consuming behaviors; with tiny scripted
+    # frames the hold assessment is neutral (unmeasurable), so the wiring must
+    # be exercised without changing hold-independent behavior or crashing.
+    from quant.exits import scalp_exit_policy
+
+    rows = [(100, 101, 99, 100)] * 4 + [
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),    # entry at 100, stop 95
+        (107, 108, 106, 107),   # +1.4R: above 1.2R target -> partial queued
+        (108, 109, 107, 108),   # partial fills at open 108
+        (108, 109, 107, 108),
+        (108, 109, 107, 108),
+    ]
+    bars = make_bars(rows)
+    strategy = ScriptedStrategy({("TEST", 4): (BotAction.BUY, 100.0, 95.0, "buy")})
+    result = run_simulation(
+        strategy, {"TEST": bars}, config=frictionless_config(), exit_policy=scalp_exit_policy()
+    )
+    trade = result.trades[0]
+    target_legs = [leg for leg in trade.exit_legs if leg.reason == "profit_target"]
+    assert len(target_legs) == 1
+    assert target_legs[0].qty == pytest.approx(trade.qty * 0.6)
+    assert result.config_snapshot["hold_intelligence"] is not None

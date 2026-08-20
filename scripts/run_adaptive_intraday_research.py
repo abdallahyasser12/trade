@@ -32,7 +32,7 @@ from quant.adaptive_manifest import (
     locked_deployment_manifest,
     record_research_manifest,
 )
-from quant.exits import ExitPolicyConfig
+from quant.exits import ExitPolicyConfig, scalp_exit_policy
 from quant.intraday import DEFAULT_INTRADAY_OBJECTIVE, make_high_velocity_strategy_config
 from quant.liquidity_universe import (
     ADAPTIVE_USD_CANDIDATE_POOL,
@@ -283,10 +283,28 @@ def main() -> int:
     parser.add_argument("--spread-bps", type=float, default=8.0)
     parser.add_argument("--fee-bps", type=float, default=25.0)
     parser.add_argument("--no-record", action="store_true")
+    parser.add_argument(
+        "--exit-profile",
+        choices=("standard", "scalp"),
+        default="standard",
+        help=(
+            "Exit-management hypothesis to measure: 'standard' keeps the "
+            "trailing+runner policy every promotion to date was measured "
+            "under; 'scalp' measures quick profit capture with "
+            "hold-intelligence exits (quant/exits.scalp_exit_policy)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.days < 45:
         print("Adaptive research requires at least 45 calendar days.", file=sys.stderr)
+        return 2
+    if args.exit_profile != "standard" and args.locked_config:
+        print(
+            "Locked-config verification must reproduce the promoted configuration "
+            "exactly; it always uses the standard exit policy. Drop --exit-profile.",
+            file=sys.stderr,
+        )
         return 2
     for label, value in (
         ("slippage-bps", args.slippage_bps),
@@ -367,7 +385,11 @@ def main() -> int:
                 fee_bps=args.fee_bps,
                 annualization_factor=crypto_bars_per_year(timeframe),
             ),
-            exit_policy=ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True),
+            exit_policy=(
+                scalp_exit_policy()
+                if args.exit_profile == "scalp"
+                else ExitPolicyConfig(enable_trailing_stop=True, enable_runner=True)
+            ),
             walk_config=QuantWalkForwardConfig(
                 train_bars=4_032,
                 test_bars=1_152,

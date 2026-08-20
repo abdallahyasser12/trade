@@ -64,6 +64,15 @@ class IntradayObjective:
 
 DEFAULT_INTRADAY_OBJECTIVE = IntradayObjective()
 
+# Scalp objective: more, shorter trades — but the same absolute session-loss
+# ceiling. Frequency may never buy itself extra risk budget.
+SCALP_INTRADAY_OBJECTIVE = IntradayObjective(
+    aspirational_daily_return_pct=2.0,
+    target_trades_per_day_min=15.0,
+    target_trades_per_day_max=80.0,
+    max_session_loss_pct=2.0,
+)
+
 
 def make_high_velocity_strategy_config(
     *,
@@ -115,6 +124,73 @@ def make_high_velocity_risk_config() -> CryptoRiskConfig:
         max_live_order_notional=1_000.0,
         max_live_total_exposure_pct=10.0,
         max_cost_to_risk=0.35,
+        max_portfolio_heat_pct=0.90,
+    )
+
+
+def make_scalp_strategy_config(
+    *,
+    symbols: tuple[str, ...] = HIGH_VELOCITY_CRYPTO_UNIVERSE,
+    timeframe: str = "1Min",
+) -> CryptoStrategyConfig:
+    """One-minute scalp scaffolding: the same gates, horizons rescaled.
+
+    This is a RESEARCH hypothesis config for the scalp sleeve (many very short
+    trades targeting small profits, exits from quant/exits.scalp_exit_policy).
+    It deploys through exactly the same chronological research -> OOS ->
+    lifecycle evidence path as every other configuration; nothing here reaches
+    a broker by existing.
+    """
+    return CryptoStrategyConfig(
+        symbols=symbols,
+        timeframe=timeframe,
+        benchmark_symbol="BTC/USD",
+        fast_ma_period=9,
+        slow_ma_period=30,
+        regime_ma_period=90,
+        regime_slope_period=10,
+        breakout_period=15,
+        momentum_period=10,
+        relative_strength_period=30,
+        rsi_period=14,
+        atr_period=14,
+        atr_stop_multiplier=1.5,
+        trailing_atr_multiplier=1.8,
+        atr_percentile_lookback=120,
+        max_atr_percentile=95.0,
+        adx_period=14,
+        min_adx=12.0,
+        efficiency_period=10,
+        min_efficiency_ratio=0.12,
+        volume_period=30,
+        min_volume_ratio=0.8,
+        min_relative_strength=-0.05,
+    )
+
+
+def make_scalp_risk_config() -> CryptoRiskConfig:
+    """Scalp risk: smaller unit risk and a stricter cost gate, same ceilings.
+
+    A scalp's edge per trade is small, so execution cost may consume at most
+    30% of the risked amount (vs 35% for the 5-minute profile) and each trade
+    risks less equity. The session-loss ceiling, exposure caps, correlation
+    and heat limits are identical — higher frequency never relaxes them.
+    """
+    return CryptoRiskConfig(
+        risk_per_trade_pct=0.10,
+        max_position_pct=7.5,
+        max_total_exposure_pct=30.0,
+        max_session_loss_pct=SCALP_INTRADAY_OBJECTIVE.max_session_loss_pct,
+        max_positions=6,
+        min_order_notional=20.0,
+        max_pairwise_correlation=0.80,
+        correlation_lookback=120,
+        min_risk_scale=0.25,
+        drawdown_risk_reduction_start_pct=0.75,
+        volatility_target_percentile=50.0,
+        max_live_order_notional=1_000.0,
+        max_live_total_exposure_pct=10.0,
+        max_cost_to_risk=0.30,
         max_portfolio_heat_pct=0.90,
     )
 

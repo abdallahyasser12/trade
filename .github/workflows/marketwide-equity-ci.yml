@@ -1,0 +1,124 @@
+name: Market-wide Equity CI
+
+on:
+  pull_request:
+    paths:
+      - "alpaca_intraday_margin_broker.py"
+      - "equity_market_data.py"
+      - "equity_marketwide_engine.py"
+      - "equity_marketwide_deployment.py"
+      - "equity_marketwide_production_engine.py"
+      - "quant/equity_marketwide.py"
+      - "quant/equity_manifest.py"
+      - "quant/equity_attribution.py"
+      - "quant/equity_lifecycle.py"
+      - "quant/evidence_scanner.py"
+      - "quant/opportunity.py"
+      - "quant/edge_intelligence.py"
+      - "scripts/run_marketwide_equity_runtime.py"
+      - "scripts/run_marketwide_equity_research.py"
+      - "scripts/manage_marketwide_equity_lifecycle.py"
+      - "tests/test_alpaca_intraday_margin_broker.py"
+      - "tests/test_equity_marketwide*.py"
+      - "tests/test_equity_production_partition.py"
+      - "tests/test_equity_manifest.py"
+      - "tests/test_equity_attribution.py"
+      - "tests/test_equity_lifecycle.py"
+      - "tests/test_quant_evidence_scanner.py"
+      - "tests/test_evidence_scanner_integration.py"
+      - "tests/test_edge_intelligence.py"
+      - ".github/workflows/marketwide-equity-ci.yml"
+  push:
+    branches: ["feature/marketwide-equity-opportunity-engine"]
+
+concurrency:
+  group: marketwide-equity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Compile, install, and test with durable diagnostics
+        id: verify
+        shell: bash
+        run: |
+          set +e
+          : > marketwide-ci.log
+
+          echo "=== compile ===" >> marketwide-ci.log
+          python -m py_compile \
+            alpaca_intraday_margin_broker.py \
+            equity_market_data.py \
+            equity_marketwide_engine.py \
+            equity_marketwide_deployment.py \
+            equity_marketwide_production_engine.py \
+            quant/equity_marketwide.py \
+            quant/equity_manifest.py \
+            quant/equity_attribution.py \
+            quant/equity_lifecycle.py \
+            quant/evidence_scanner.py \
+            quant/opportunity.py \
+            quant/edge_intelligence.py \
+            scripts/run_marketwide_equity_runtime.py \
+            scripts/run_marketwide_equity_research.py \
+            scripts/manage_marketwide_equity_lifecycle.py \
+            tests/test_alpaca_intraday_margin_broker.py \
+            tests/test_equity_marketwide.py \
+            tests/test_equity_manifest.py \
+            tests/test_equity_marketwide_recovery.py \
+            tests/test_equity_attribution.py \
+            tests/test_equity_lifecycle.py \
+            tests/test_equity_production_partition.py \
+            tests/test_quant_evidence_scanner.py \
+            tests/test_evidence_scanner_integration.py \
+            tests/test_edge_intelligence.py >> marketwide-ci.log 2>&1
+          compile_status=$?
+
+          echo "=== install ===" >> marketwide-ci.log
+          python -m pip install --upgrade pip >> marketwide-ci.log 2>&1
+          pip_upgrade_status=$?
+          python -m pip install -r requirements.txt -r requirements-mobile-api.txt >> marketwide-ci.log 2>&1
+          install_status=$?
+
+          test_status=0
+          if [ "$compile_status" -eq 0 ] && [ "$pip_upgrade_status" -eq 0 ] && [ "$install_status" -eq 0 ]; then
+            echo "=== pytest ===" >> marketwide-ci.log
+            python -m pytest -q \
+              tests/test_alpaca_intraday_margin_broker.py \
+              tests/test_equity_marketwide.py \
+              tests/test_equity_manifest.py \
+              tests/test_equity_marketwide_recovery.py \
+              tests/test_equity_attribution.py \
+              tests/test_equity_lifecycle.py \
+              tests/test_equity_production_partition.py \
+              tests/test_quant_evidence_scanner.py \
+              tests/test_evidence_scanner_integration.py \
+              tests/test_edge_intelligence.py >> marketwide-ci.log 2>&1
+            test_status=$?
+          else
+            echo "=== pytest skipped because compile/install failed ===" >> marketwide-ci.log
+          fi
+
+          echo "compile_status=$compile_status" >> marketwide-ci.log
+          echo "pip_upgrade_status=$pip_upgrade_status" >> marketwide-ci.log
+          echo "install_status=$install_status" >> marketwide-ci.log
+          echo "test_status=$test_status" >> marketwide-ci.log
+          cat marketwide-ci.log
+
+          if [ "$compile_status" -ne 0 ] || [ "$pip_upgrade_status" -ne 0 ] || [ "$install_status" -ne 0 ] || [ "$test_status" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketwide-equity-ci-log
+          path: marketwide-ci.log
+          if-no-files-found: error

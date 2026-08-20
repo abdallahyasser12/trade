@@ -46,3 +46,41 @@ def test_two_percent_is_measurement_not_a_promotion_shortcut():
     assert evaluation.activity_target_met
     assert not evaluation.aspirational_return_met
     assert 11.9 <= evaluation.trades_per_day <= 12.1
+
+
+def test_scalp_profile_is_one_minute_with_unweakened_protections():
+    from quant.intraday import (
+        SCALP_INTRADAY_OBJECTIVE,
+        make_scalp_risk_config,
+        make_scalp_strategy_config,
+    )
+
+    strategy_cfg = make_scalp_strategy_config()
+    assert strategy_cfg.timeframe == "1Min"
+    assert strategy_cfg.validate() == []
+    assert SCALP_INTRADAY_OBJECTIVE.validate() == []
+
+    base = make_high_velocity_risk_config()
+    scalp = make_scalp_risk_config()
+    assert scalp.validate() == []
+    # More trades never buys more risk: unit risk and the cost gate get
+    # STRICTER, every absolute ceiling stays identical.
+    assert scalp.risk_per_trade_pct < base.risk_per_trade_pct
+    assert scalp.max_cost_to_risk < base.max_cost_to_risk
+    assert scalp.max_session_loss_pct == base.max_session_loss_pct
+    assert scalp.max_total_exposure_pct == base.max_total_exposure_pct
+    assert scalp.max_positions == base.max_positions
+    assert scalp.max_live_order_notional == base.max_live_order_notional
+    assert scalp.max_live_total_exposure_pct == base.max_live_total_exposure_pct
+
+
+def test_scalp_exit_policy_is_a_quick_capital_recycling_profile():
+    from quant.exits import ExitPolicyConfig, scalp_exit_policy
+
+    scalp = scalp_exit_policy()
+    default = ExitPolicyConfig()
+    assert scalp.validate() == []
+    assert scalp.enable_profit_target and scalp.profit_target_r <= 1.5
+    assert scalp.enable_time_stop and scalp.time_stop_bars < default.time_stop_bars
+    assert scalp.enable_smart_exit and scalp.enable_adaptive_trail
+    assert scalp.trailing_atr_multiplier < default.trailing_atr_multiplier

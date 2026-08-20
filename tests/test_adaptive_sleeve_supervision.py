@@ -1,3 +1,5 @@
+import pytest
+
 from datetime import datetime, timedelta, timezone
 
 from quant.sleeve_supervision import (
@@ -81,5 +83,5 @@ def test_only_current_lifecycle_rows_are_counted():
         since=since,
     )
     assert health.trades == 40
-    assert health.expectancy_r == 0.20
+    assert health.expectancy_r == pytest.approx(0.20)
     assert health.confidence_multiplier == 1.0
