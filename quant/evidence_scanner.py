@@ -231,7 +231,9 @@ class EvidenceQuantScanner(QuantScanner):
             config=_EDGE_CONFIG,
         )
         candidate.details["edge_intelligence"] = edge.to_dict()
-        candidate.details["edge_score"] = edge.score
+        # A non-measurable assessment journals None so aggregate consumers can
+        # never mistake "could not measure" for a genuinely measured mid score.
+        candidate.details["edge_score"] = edge.score if edge.measurable else None
         if ranker_input is not None:
             ranker_input.setup_quality = min(
                 float(ranker_input.setup_quality),

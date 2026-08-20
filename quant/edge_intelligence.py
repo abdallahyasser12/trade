@@ -17,6 +17,13 @@ path/microstructure diagnostics:
 * VWAP stretch: rolling VWAP displacement normalized by ATR;
 * volatility release: short/long realized-volatility ratio;
 * candle pressure: close location inside the current completed candle;
+* flow pressure: signed-volume balance (an order-flow proxy from bars);
+* wick rejection: lower-wick versus upper-wick dominance over recent bars;
+* structure persistence: higher-close and higher-low frequency (micro
+  market structure rather than a smoothed average);
+* horizon agreement: whether fast and medium impulse point the same way,
+  interpreted per profile (a reversion entry *wants* the medium horizon
+  still stretched while the fast horizon turns);
 * agreement quality: penalizes internally contradictory directional evidence.
 
 All calculations slice data at ``timestamp`` before doing any rolling work.  Future
@@ -66,6 +73,7 @@ def _triangular(value: float, center: float, half_width: float) -> float:
 class EdgeIntelligenceConfig:
     min_bars: int = 64
     impulse_lookback: int = 5
+    impulse_medium_lookback: int = 15
     efficiency_lookback: int = 12
     range_lookback: int = 20
     volume_lookback: int = 20
@@ -75,6 +83,9 @@ class EdgeIntelligenceConfig:
     trend_fast_span: int = 8
     trend_slow_span: int = 21
     atr_lookback: int = 14
+    flow_lookback: int = 10
+    wick_lookback: int = 8
+    structure_lookback: int = 10
     min_quality_multiplier: float = 0.55
 
     def validate(self) -> list[str]:
@@ -82,6 +93,7 @@ class EdgeIntelligenceConfig:
         lookbacks = {
             "min_bars": self.min_bars,
             "impulse_lookback": self.impulse_lookback,
+            "impulse_medium_lookback": self.impulse_medium_lookback,
             "efficiency_lookback": self.efficiency_lookback,
             "range_lookback": self.range_lookback,
             "volume_lookback": self.volume_lookback,
@@ -91,6 +103,9 @@ class EdgeIntelligenceConfig:
             "trend_fast_span": self.trend_fast_span,
             "trend_slow_span": self.trend_slow_span,
             "atr_lookback": self.atr_lookback,
+            "flow_lookback": self.flow_lookback,
+            "wick_lookback": self.wick_lookback,
+            "structure_lookback": self.structure_lookback,
         }
         for name, value in lookbacks.items():
             if not isinstance(value, int) or value < 2:
@@ -101,6 +116,8 @@ class EdgeIntelligenceConfig:
             errors.append(
                 "volatility_short_lookback must be below volatility_long_lookback."
             )
+        if self.impulse_lookback >= self.impulse_medium_lookback:
+            errors.append("impulse_lookback must be below impulse_medium_lookback.")
         required = max(
             self.range_lookback + 2,
             self.volume_lookback + 2,
@@ -110,6 +127,10 @@ class EdgeIntelligenceConfig:
             self.atr_lookback + 2,
             self.efficiency_lookback + 2,
             self.impulse_lookback + 2,
+            self.impulse_medium_lookback + 2,
+            self.flow_lookback + 2,
+            self.wick_lookback + 2,
+            self.structure_lookback + 2,
         )
         if self.min_bars < required:
             errors.append(f"min_bars must be at least {required} for configured lookbacks.")
@@ -144,6 +165,8 @@ class EdgeAssessment:
 
 def edge_profile(strategy_id: str, signal_reason: str) -> str:
     text = f"{strategy_id} {signal_reason}".lower()
+    if "scalp" in text:
+        return "scalp"
     if "reversion" in text or "mean_revert" in text or "mean-revert" in text:
         return "mean_reversion"
     if "pullback" in text:
@@ -196,22 +219,56 @@ def _quote_diagnostics(quote: Any) -> dict[str, Optional[float]]:
 
 
 def _profile_components(profile: str, raw: dict[str, float], diagnostics: dict[str, Optional[float]]):
+    """Reinterpret raw evidence so every component means 'fit for this profile'.
+
+    After this transformation a HIGH value always means the evidence supports
+    the profile's kind of entry, which is what lets the agreement factor treat
+    all profiles uniformly.
+    """
     components = dict(raw)
     range_location = components["range_location"]
     vwap_stretch = diagnostics.get("vwap_stretch_atr")
     volatility_ratio = diagnostics.get("volatility_release_ratio")
+    trend_atr = diagnostics.get("trend_atr")
+    impulse_z = diagnostics.get("impulse_z")
+    flow_balance = diagnostics.get("flow_balance")
+    structure_raw = diagnostics.get("structure_raw")
+    fast_sig = diagnostics.get("impulse_fast_sigmoid")
+    medium_sig = diagnostics.get("impulse_medium_sigmoid")
 
     if profile == "mean_reversion":
+        # A reversion long buys a controlled dip: chop is fine, a fresh
+        # bullish impulse is late, heavy one-way selling is a falling knife.
         components["path_efficiency"] = 1.0 - components["path_efficiency"]
         components["range_location"] = _triangular(range_location, 0.35, 0.55)
         if vwap_stretch is not None:
             components["vwap_location"] = _triangular(vwap_stretch, -0.55, 1.45)
         if volatility_ratio is not None:
             components["volatility_release"] = _sigmoid((1.05 - volatility_ratio) * 2.0)
+        if trend_atr is not None:
+            components["trend_alignment"] = _triangular(trend_atr, -0.35, 1.35)
+        if impulse_z is not None:
+            components["impulse_to_noise"] = _triangular(impulse_z, -0.90, 2.00)
+        if flow_balance is not None:
+            components["flow_pressure"] = _triangular(flow_balance, -0.20, 0.80)
+        if structure_raw is not None:
+            components["structure_persistence"] = _triangular(structure_raw, 0.45, 0.45)
+        if fast_sig is not None and medium_sig is not None:
+            # Reversion timing: fast horizon turning up while the medium
+            # horizon is still stretched down.
+            components["horizon_agreement"] = _clip01(
+                math.sqrt(fast_sig * (1.0 - medium_sig))
+            )
     elif profile == "trend_pullback":
         components["range_location"] = _triangular(range_location, 0.62, 0.55)
         if vwap_stretch is not None:
             components["vwap_location"] = _triangular(vwap_stretch, 0.30, 1.50)
+        if fast_sig is not None and medium_sig is not None:
+            # The medium horizon carries the trend; the fast horizon only has
+            # to be turning back up, not already extended.
+            components["horizon_agreement"] = _clip01(
+                (medium_sig**0.65) * (fast_sig**0.35)
+            )
     elif profile == "breakout":
         components["range_location"] = _clip01((range_location - 0.45) / 0.55)
         if vwap_stretch is not None:
@@ -220,6 +277,16 @@ def _profile_components(profile: str, raw: dict[str, float], diagnostics: dict[s
         components["range_location"] = _clip01((range_location - 0.25) / 0.75)
         if vwap_stretch is not None:
             components["vwap_location"] = _triangular(vwap_stretch, 0.45, 1.80)
+    elif profile == "scalp":
+        # Scalps need immediate continuation in an active tape: constructive
+        # but not extended location, with the fast horizon dominant.
+        components["range_location"] = _clip01((range_location - 0.40) / 0.60)
+        if vwap_stretch is not None:
+            components["vwap_location"] = _triangular(vwap_stretch, 0.35, 1.40)
+        if fast_sig is not None and medium_sig is not None:
+            components["horizon_agreement"] = _clip01(
+                (fast_sig**0.65) * (medium_sig**0.35)
+            )
     else:
         if vwap_stretch is not None:
             components["vwap_location"] = _clip01(1.0 - max(0.0, abs(vwap_stretch) - 1.0) / 2.5)
@@ -229,57 +296,92 @@ def _profile_components(profile: str, raw: dict[str, float], diagnostics: dict[s
 def _weights(profile: str) -> dict[str, float]:
     if profile == "breakout":
         return {
-            "trend_alignment": 0.14,
-            "impulse_to_noise": 0.18,
-            "path_efficiency": 0.12,
-            "range_location": 0.18,
-            "participation": 0.14,
-            "vwap_location": 0.06,
-            "volatility_release": 0.10,
-            "candle_pressure": 0.08,
+            "trend_alignment": 0.10,
+            "impulse_to_noise": 0.14,
+            "path_efficiency": 0.09,
+            "range_location": 0.14,
+            "participation": 0.11,
+            "vwap_location": 0.05,
+            "volatility_release": 0.08,
+            "candle_pressure": 0.07,
+            "flow_pressure": 0.08,
+            "wick_rejection": 0.04,
+            "structure_persistence": 0.04,
+            "horizon_agreement": 0.06,
         }
     if profile == "mean_reversion":
         return {
-            "trend_alignment": 0.05,
-            "impulse_to_noise": 0.12,
-            "path_efficiency": 0.14,
-            "range_location": 0.14,
-            "participation": 0.10,
-            "vwap_location": 0.22,
-            "volatility_release": 0.08,
-            "candle_pressure": 0.15,
+            "trend_alignment": 0.04,
+            "impulse_to_noise": 0.09,
+            "path_efficiency": 0.11,
+            "range_location": 0.11,
+            "participation": 0.08,
+            "vwap_location": 0.17,
+            "volatility_release": 0.06,
+            "candle_pressure": 0.12,
+            "flow_pressure": 0.07,
+            "wick_rejection": 0.07,
+            "structure_persistence": 0.03,
+            "horizon_agreement": 0.05,
         }
     if profile == "trend_pullback":
         return {
-            "trend_alignment": 0.20,
-            "impulse_to_noise": 0.12,
-            "path_efficiency": 0.14,
-            "range_location": 0.12,
-            "participation": 0.09,
-            "vwap_location": 0.16,
-            "volatility_release": 0.07,
-            "candle_pressure": 0.10,
+            "trend_alignment": 0.16,
+            "impulse_to_noise": 0.09,
+            "path_efficiency": 0.11,
+            "range_location": 0.09,
+            "participation": 0.07,
+            "vwap_location": 0.12,
+            "volatility_release": 0.05,
+            "candle_pressure": 0.08,
+            "flow_pressure": 0.07,
+            "wick_rejection": 0.05,
+            "structure_persistence": 0.05,
+            "horizon_agreement": 0.06,
         }
     if profile == "trend":
         return {
-            "trend_alignment": 0.20,
-            "impulse_to_noise": 0.17,
-            "path_efficiency": 0.15,
-            "range_location": 0.11,
-            "participation": 0.10,
-            "vwap_location": 0.11,
-            "volatility_release": 0.07,
-            "candle_pressure": 0.09,
+            "trend_alignment": 0.16,
+            "impulse_to_noise": 0.13,
+            "path_efficiency": 0.12,
+            "range_location": 0.08,
+            "participation": 0.08,
+            "vwap_location": 0.08,
+            "volatility_release": 0.05,
+            "candle_pressure": 0.07,
+            "flow_pressure": 0.08,
+            "wick_rejection": 0.04,
+            "structure_persistence": 0.05,
+            "horizon_agreement": 0.06,
+        }
+    if profile == "scalp":
+        return {
+            "trend_alignment": 0.05,
+            "impulse_to_noise": 0.16,
+            "path_efficiency": 0.08,
+            "range_location": 0.10,
+            "participation": 0.14,
+            "vwap_location": 0.06,
+            "volatility_release": 0.10,
+            "candle_pressure": 0.10,
+            "flow_pressure": 0.10,
+            "wick_rejection": 0.04,
+            "structure_persistence": 0.03,
+            "horizon_agreement": 0.04,
         }
     return {
-        "trend_alignment": 0.15,
-        "impulse_to_noise": 0.15,
-        "path_efficiency": 0.13,
-        "range_location": 0.13,
-        "participation": 0.11,
-        "vwap_location": 0.12,
-        "volatility_release": 0.09,
-        "candle_pressure": 0.12,
+        "trend_alignment": 0.11,
+        "impulse_to_noise": 0.12,
+        "path_efficiency": 0.10,
+        "range_location": 0.10,
+        "participation": 0.09,
+        "vwap_location": 0.09,
+        "volatility_release": 0.07,
+        "candle_pressure": 0.09,
+        "flow_pressure": 0.08,
+        "wick_rejection": 0.05,
+        "structure_persistence": 0.05,
+        "horizon_agreement": 0.05,
     }
 
 
@@ -307,6 +409,11 @@ def assess_edge(
         return EdgeAssessment(False, profile, 50.0, 1.0, reasons=("missing_ohlcv",))
     if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
         return EdgeAssessment(False, profile, 50.0, 1.0, reasons=("invalid_time_index",))
+    # Defense in depth: production strategies already reject unsorted or
+    # duplicated indexes, but label slicing on such an index would not be
+    # causal, so an assessment is refused rather than risked.
+    if not frame.index.is_monotonic_increasing or frame.index.has_duplicates:
+        return EdgeAssessment(False, profile, 50.0, 1.0, reasons=("unsorted_time_index",))
     ts = pd.Timestamp(timestamp)
     if ts.tzinfo is None:
         return EdgeAssessment(False, profile, 50.0, 1.0, reasons=("naive_timestamp",))
@@ -323,6 +430,10 @@ def assess_edge(
             1.0,
             reasons=("insufficient_edge_history",),
         )
+    # dropna may have removed the evaluated bar itself; measuring the prior
+    # bar and presenting it as the assessment at ``ts`` would be a silent lie.
+    if history.index[-1] != ts:
+        return EdgeAssessment(False, profile, 50.0, 1.0, reasons=("evaluated_bar_invalid",))
 
     close = history["close"].astype(float)
     high = history["high"].astype(float)
@@ -349,6 +460,15 @@ def assess_edge(
     impulse_raw = math.log(latest_close / float(close.iloc[-1 - config.impulse_lookback]))
     impulse_z = impulse_raw / (long_sigma * math.sqrt(config.impulse_lookback) + _EPS)
     impulse_score = _sigmoid(1.15 * impulse_z)
+
+    medium_raw = math.log(
+        latest_close / float(close.iloc[-1 - config.impulse_medium_lookback])
+    )
+    impulse_medium_z = medium_raw / (
+        long_sigma * math.sqrt(config.impulse_medium_lookback) + _EPS
+    )
+    impulse_fast_sig = _sigmoid(1.10 * impulse_z)
+    impulse_medium_sig = _sigmoid(1.10 * impulse_medium_z)
 
     path = close.tail(config.efficiency_lookback + 1)
     travelled = float(path.diff().abs().dropna().sum())
@@ -389,9 +509,59 @@ def assess_edge(
     volatility_release = _sigmoid((volatility_release_ratio - 0.90) * 2.0)
 
     candle_range = float(high.iloc[-1] - low.iloc[-1])
-    candle_pressure = _clip01(
-        (latest_close - float(low.iloc[-1])) / (candle_range + _EPS)
+    # A zero-range bar carries no close-location information; scoring it as a
+    # close pinned at the low would fabricate bearish evidence.
+    candle_pressure = (
+        0.5
+        if candle_range <= 0
+        else _clip01((latest_close - float(low.iloc[-1])) / candle_range)
     )
+
+    # Order-flow proxy: volume signed by candle direction. Bars markets do not
+    # publish real trade signs; the close-vs-open sign weighted by volume is
+    # the standard causal approximation.
+    flow_slice = history.tail(config.flow_lookback)
+    flow_signs = np.sign(
+        flow_slice["close"].astype(float).to_numpy()
+        - flow_slice["open"].astype(float).to_numpy()
+    )
+    flow_volumes = flow_slice["volume"].astype(float).to_numpy()
+    flow_balance = float(
+        (flow_signs * flow_volumes).sum() / (flow_volumes.sum() + _EPS)
+    )
+    flow_pressure = _clip01(0.5 * (1.0 + flow_balance))
+
+    # Wick rejection: dominance of lower wicks (dip-buying) over upper wicks
+    # (rally-selling) across the recent window, normalized by total range.
+    wick_slice = history.tail(config.wick_lookback)
+    wick_open = wick_slice["open"].astype(float)
+    wick_close = wick_slice["close"].astype(float)
+    wick_high = wick_slice["high"].astype(float)
+    wick_low = wick_slice["low"].astype(float)
+    body_top = pd.concat([wick_open, wick_close], axis=1).max(axis=1)
+    body_bottom = pd.concat([wick_open, wick_close], axis=1).min(axis=1)
+    upper_wicks = float((wick_high - body_top).sum())
+    lower_wicks = float((body_bottom - wick_low).sum())
+    total_ranges = float((wick_high - wick_low).sum())
+    wick_balance = (
+        (lower_wicks - upper_wicks) / total_ranges if total_ranges > 0 else 0.0
+    )
+    wick_rejection = _clip01(0.5 * (1.0 + wick_balance))
+
+    # Micro market structure: how persistently the last bars print higher
+    # closes and higher lows — structure, not a smoothed average.
+    structure_slice = history.tail(config.structure_lookback + 1)
+    higher_closes = structure_slice["close"].astype(float).diff().dropna()
+    higher_lows = structure_slice["low"].astype(float).diff().dropna()
+    structure_raw = 0.5 * float((higher_closes > 0).mean()) + 0.5 * float(
+        (higher_lows > 0).mean()
+    )
+    structure_persistence = _clip01(structure_raw)
+
+    # Multi-horizon agreement: default bullish continuation form; profiles
+    # reinterpret it below (a reversion entry wants the medium horizon still
+    # stretched down while the fast horizon turns).
+    horizon_agreement = math.sqrt(impulse_fast_sig * impulse_medium_sig)
 
     raw_components = {
         "trend_alignment": trend_score,
@@ -402,10 +572,17 @@ def assess_edge(
         "vwap_location": vwap_location,
         "volatility_release": volatility_release,
         "candle_pressure": candle_pressure,
+        "flow_pressure": flow_pressure,
+        "wick_rejection": wick_rejection,
+        "structure_persistence": structure_persistence,
+        "horizon_agreement": _clip01(horizon_agreement),
     }
     diagnostics = {
         "atr": atr_value,
         "impulse_z": impulse_z,
+        "impulse_medium_z": impulse_medium_z,
+        "impulse_fast_sigmoid": impulse_fast_sig,
+        "impulse_medium_sigmoid": impulse_medium_sig,
         "path_efficiency": efficiency,
         "trend_atr": trend_atr,
         "range_location_raw": range_location,
@@ -413,28 +590,39 @@ def assess_edge(
         "rolling_vwap": rolling_vwap,
         "vwap_stretch_atr": vwap_stretch_atr,
         "volatility_release_ratio": volatility_release_ratio,
+        "flow_balance": flow_balance,
+        "wick_balance": wick_balance,
+        "structure_raw": structure_raw,
         **_quote_diagnostics(quote),
     }
     components = _profile_components(profile, raw_components, diagnostics)
     weights = _weights(profile)
     weighted = sum(weights[name] * components[name] for name in weights)
 
-    directional = [
+    # Internal coherence, computed AFTER profile transformation so that every
+    # input means "fit for this profile" — a textbook dip-buy no longer reads
+    # as disagreement just because its raw momentum is bearish.  Dispersion is
+    # mean absolute deviation across the fit evidence (0 = unanimous).
+    fit_evidence = [
         components["trend_alignment"],
         components["impulse_to_noise"],
         components["range_location"],
         components["candle_pressure"],
+        components["flow_pressure"],
+        components["wick_rejection"],
     ]
-    directional_mean = sum(directional) / len(directional)
-    disagreement = 1.0 - abs(2.0 * directional_mean - 1.0)
-    bullish_agreement = _clip01(directional_mean * (1.0 - 0.45 * disagreement))
-    agreement_factor = 0.78 + 0.22 * bullish_agreement
+    fit_mean = sum(fit_evidence) / len(fit_evidence)
+    fit_dispersion = _clip01(
+        2.0 * sum(abs(value - fit_mean) for value in fit_evidence) / len(fit_evidence)
+    )
+    fit_agreement = _clip01(fit_mean * (1.0 - 0.45 * fit_dispersion))
+    agreement_factor = 0.78 + 0.22 * fit_agreement
     setup_quality = _clip01(weighted * agreement_factor)
     multiplier = config.min_quality_multiplier + (
         1.0 - config.min_quality_multiplier
     ) * setup_quality
-    diagnostics["directional_mean"] = directional_mean
-    diagnostics["directional_disagreement"] = disagreement
+    diagnostics["fit_mean"] = fit_mean
+    diagnostics["fit_dispersion"] = fit_dispersion
     diagnostics["agreement_factor"] = agreement_factor
 
     return EdgeAssessment(
