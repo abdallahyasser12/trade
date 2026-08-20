@@ -10,8 +10,13 @@ execution estimate minus an uncertainty margin), then scored:
             x regime_compatibility        (measured, neutral when unmeasured)
             x strategy_reliability        (measured, neutral prior when not)
             x liquidity_quality
+            x setup_quality               (causal edge intelligence, never > 1)
             x (1 - drawdown_penalty)
             x (1 - tail_risk_penalty)
+
+``setup_quality`` is deliberately negative-only.  It can demote a noisy or
+internally contradictory setup but it cannot manufacture alpha or lift a
+candidate above the score supplied by measured expectancy/cost/regime evidence.
 
 Every input yields exactly one journaled decision: EXECUTE candidates get
 ranks 1..N, everything else keeps its named rejection or abstention
@@ -68,15 +73,17 @@ def score_components(
     regime_compatibility: Optional[float] = None,
     strategy_reliability: Optional[float] = None,
     liquidity_quality: float = 1.0,
+    setup_quality: float = 1.0,
     drawdown_pct: float = 0.0,
     atr_percentile: Optional[float] = None,
 ) -> dict[str, float]:
     """Multiplier/penalty components, each bounded and documented.
 
     regime_compatibility / strategy_reliability are in (0, 1] when
-    measured; None maps to neutral (1.0 / the neutral prior).  Drawdown
-    and tail penalties are in [0, 0.95] so a deep-drawdown book shrinks
-    scores without ever flipping their sign.
+    measured; None maps to neutral (1.0 / the neutral prior).  Liquidity and
+    setup quality are hard-bounded to [0, 1].  Drawdown and tail penalties are
+    in [0, 0.95] so a deep-drawdown book shrinks scores without ever flipping
+    their sign.
     """
     regime_multiplier = 1.0 if regime_compatibility is None else max(0.0, min(1.0, regime_compatibility))
     reliability_multiplier = (
@@ -85,6 +92,7 @@ def score_components(
         else max(0.0, min(1.0, strategy_reliability))
     )
     liquidity = max(0.0, min(1.0, liquidity_quality))
+    setup = max(0.0, min(1.0, setup_quality))
     drawdown_penalty = min(0.95, max(0.0, drawdown_pct) * config.drawdown_penalty_per_pct)
     tail_penalty = 0.0
     if atr_percentile is not None and math.isfinite(atr_percentile):
@@ -99,6 +107,7 @@ def score_components(
         * regime_multiplier
         * reliability_multiplier
         * liquidity
+        * setup
         * (1.0 - drawdown_penalty)
         * (1.0 - tail_penalty)
     )
@@ -108,6 +117,7 @@ def score_components(
         "regime_multiplier": regime_multiplier,
         "reliability_multiplier": reliability_multiplier,
         "liquidity_quality": liquidity,
+        "setup_quality": setup,
         "drawdown_penalty": drawdown_penalty,
         "tail_penalty": tail_penalty,
         "score": score,
@@ -116,7 +126,12 @@ def score_components(
 
 @dataclass
 class RankerInput:
-    """One candidate plus everything the ranker needs to judge it."""
+    """One candidate plus everything the ranker needs to judge it.
+
+    ``setup_quality`` is appended to the historical field order so any legacy
+    positional construction keeps its original meaning. New code should still use
+    keyword arguments.
+    """
 
     candidate: OpportunityCandidate
     execution_estimate: ExecutionEstimate
@@ -127,6 +142,7 @@ class RankerInput:
     drawdown_pct: float = 0.0
     atr_percentile: Optional[float] = None
     abstention_kwargs: dict[str, Any] = field(default_factory=dict)
+    setup_quality: float = 1.0
 
 
 class GlobalOpportunityRanker:
@@ -252,6 +268,7 @@ class GlobalOpportunityRanker:
                 regime_compatibility=item.regime_compatibility,
                 strategy_reliability=item.strategy_reliability,
                 liquidity_quality=item.liquidity_quality,
+                setup_quality=item.setup_quality,
                 drawdown_pct=item.drawdown_pct,
                 atr_percentile=item.atr_percentile,
             )
