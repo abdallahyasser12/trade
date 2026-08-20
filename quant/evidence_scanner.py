@@ -1,4 +1,4 @@
-"""Production scanner extension with evidence, microstructure and sleeve supervision.
+"""Production scanner extension with evidence, microstructure and setup intelligence.
 
 Adaptive-v2 execution evidence is lifecycle-scoped.  A newly promoted rung cannot
 bootstrap from zero trades, so it may temporarily bridge only the immediately
@@ -6,8 +6,9 @@ preceding qualified rung.  After 40 current-rung real trades, current-rung evide
 becomes authoritative.  Arbitrary old history is never pooled into v2 entry
 confidence.
 
-Live depth and sleeve adaptation remain negative-only: neither can manufacture or
-boost alpha above baseline.
+Live depth, sleeve adaptation and edge intelligence remain negative-only: none of
+them can manufacture or boost alpha above the evidence-backed baseline.  The edge
+layer only demotes internally weak/noisy setups in the global opportunity ranking.
 """
 
 from __future__ import annotations
@@ -16,12 +17,14 @@ import math
 from datetime import datetime, timezone
 
 from quant.contracts import StrategyState
+from quant.edge_intelligence import EdgeIntelligenceConfig, assess_edge
 from quant.marketplace import MIN_SAMPLE, compute_strategy_health
 from quant.scanner import QuantScanner
 from quant.sleeve_supervision import compute_sleeve_health, sleeve_from_entry_reason
 
 ADAPTIVE_STRATEGY_ID = "crypto_intraday_adaptive"
 CURRENT_RUNG_AUTHORITY_TRADES = 40
+_EDGE_CONFIG = EdgeIntelligenceConfig()
 
 
 def expectancy_confidence(health) -> float:
@@ -154,7 +157,7 @@ def adaptive_deployment_health(store, lifecycle, strategy_id: str):
 
 
 class EvidenceQuantScanner(QuantScanner):
-    """Scanner whose entries are evidence- and adverse-selection-aware."""
+    """Scanner whose entries are evidence-, setup- and adverse-selection-aware."""
 
     def _candidate_from_decision(
         self,
@@ -208,7 +211,8 @@ class EvidenceQuantScanner(QuantScanner):
             candidate.confidence *= sleeve_health.confidence_multiplier
             candidate.confidence = max(0.0, min(base_confidence, candidate.confidence))
 
-        imbalance = depth_imbalance(quotes.get(decision.symbol))
+        quote = quotes.get(decision.symbol)
+        imbalance = depth_imbalance(quote)
         quality = adverse_depth_quality(imbalance)
         candidate.details["depth_imbalance"] = imbalance
         candidate.details["adverse_depth_quality"] = quality
@@ -216,5 +220,21 @@ class EvidenceQuantScanner(QuantScanner):
         if ranker_input is not None:
             ranker_input.liquidity_quality = min(
                 float(ranker_input.liquidity_quality), quality
+            )
+
+        edge = assess_edge(
+            prepared.get(decision.symbol),
+            decision.timestamp,
+            strategy_id=entry.strategy_id,
+            signal_reason=candidate.signal_reason,
+            quote=quote,
+            config=_EDGE_CONFIG,
+        )
+        candidate.details["edge_intelligence"] = edge.to_dict()
+        candidate.details["edge_score"] = edge.score
+        if ranker_input is not None:
+            ranker_input.setup_quality = min(
+                float(ranker_input.setup_quality),
+                float(edge.quality_multiplier),
             )
         return candidate, context
