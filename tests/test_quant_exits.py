@@ -151,3 +151,161 @@ def test_invalid_inputs_raise():
         policy.on_completed_bar(
             make_position(initial_stop_price=101.0), close=100.0, atr_value=1.0
         )
+
+
+def test_profit_target_full_exit_and_only_once():
+    config = ExitPolicyConfig(
+        enable_profit_target=True,
+        profit_target_r=1.5,
+        profit_target_fraction=1.0,
+        trailing_atr_multiplier=3.0,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position()
+    # +1.0R: below target, nothing happens.
+    update = policy.on_completed_bar(position, close=105.0, atr_value=2.0)
+    assert all(i.kind is not ExitInstructionKind.FULL_EXIT for i in update.instructions)
+    # +1.6R: full exit at target, evaluation ends.
+    update2 = policy.on_completed_bar(update.position, close=108.0, atr_value=2.0)
+    assert [i.kind for i in update2.instructions] == [ExitInstructionKind.FULL_EXIT]
+    assert update2.instructions[0].reason == "profit_target"
+    assert update2.position.target_taken
+
+
+def test_profit_target_partial_banks_once_and_leaves_runner_path_open():
+    config = runner_config(
+        enable_profit_target=True,
+        profit_target_r=1.2,
+        profit_target_fraction=0.6,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position()
+    update = policy.on_completed_bar(position, close=107.0, atr_value=2.0)
+    partials = [i for i in update.instructions if i.kind is ExitInstructionKind.PARTIAL_EXIT]
+    assert len(partials) == 1
+    assert partials[0].reason == "profit_target"
+    assert partials[0].exit_fraction == pytest.approx(0.6)
+    assert update.position.remaining_fraction == pytest.approx(0.4)
+    assert update.position.target_taken
+    # The target never fires twice.
+    update2 = policy.on_completed_bar(update.position, close=108.0, atr_value=2.0)
+    assert all(i.reason != "profit_target" for i in update2.instructions)
+
+
+def test_profit_target_is_skipped_for_promoted_runner():
+    config = runner_config(
+        enable_profit_target=True,
+        profit_target_r=1.0,
+        profit_target_fraction=1.0,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position(
+        phase=PositionPhase.RUNNER,
+        remaining_fraction=0.25,
+        highest_close=125.0,
+        current_stop_price=105.0,
+        bars_held=10,
+    )
+    update = policy.on_completed_bar(position, close=126.0, atr_value=2.0)
+    assert all(i.reason != "profit_target" for i in update.instructions)
+
+
+def test_smart_exit_requires_known_collapsed_hold_score():
+    config = ExitPolicyConfig(
+        enable_smart_exit=True,
+        smart_exit_hold_score=35.0,
+        smart_exit_min_r=0.0,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position()
+    # No hold score: the flag alone must be inert.
+    update = policy.on_completed_bar(position, close=104.0, atr_value=2.0, hold_score=None)
+    assert all(i.kind is not ExitInstructionKind.FULL_EXIT for i in update.instructions)
+    # Healthy hold score: no exit.
+    update2 = policy.on_completed_bar(position, close=104.0, atr_value=2.0, hold_score=70.0)
+    assert all(i.kind is not ExitInstructionKind.FULL_EXIT for i in update2.instructions)
+    # Collapsed hold score in profit: full exit.
+    update3 = policy.on_completed_bar(position, close=104.0, atr_value=2.0, hold_score=20.0)
+    assert [i.kind for i in update3.instructions] == [ExitInstructionKind.FULL_EXIT]
+    assert update3.instructions[0].reason == "edge_decay_exit"
+
+
+def test_smart_exit_respects_r_floor():
+    config = ExitPolicyConfig(
+        enable_smart_exit=True,
+        smart_exit_hold_score=35.0,
+        smart_exit_min_r=0.5,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position()
+    # +0.2R with a collapsed hold score: below the floor, stop stays in charge.
+    update = policy.on_completed_bar(position, close=101.0, atr_value=2.0, hold_score=10.0)
+    assert all(i.kind is not ExitInstructionKind.FULL_EXIT for i in update.instructions)
+
+
+def test_adaptive_trail_tightens_only_on_weak_hold():
+    config = ExitPolicyConfig(
+        trailing_atr_multiplier=3.0,
+        enable_adaptive_trail=True,
+        tightened_trail_atr_multiplier=1.5,
+        tighten_hold_score=55.0,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position()
+    strong = policy.on_completed_bar(position, close=110.0, atr_value=2.0, hold_score=80.0)
+    assert strong.position.current_stop_price == pytest.approx(110.0 - 3.0 * 2.0)
+    weak = policy.on_completed_bar(position, close=110.0, atr_value=2.0, hold_score=40.0)
+    assert weak.position.current_stop_price == pytest.approx(110.0 - 1.5 * 2.0)
+    # Without a hold score the flag is inert.
+    unknown = policy.on_completed_bar(position, close=110.0, atr_value=2.0)
+    assert unknown.position.current_stop_price == pytest.approx(104.0)
+
+
+def test_adaptive_trail_never_tightens_a_runner():
+    config = runner_config(
+        enable_adaptive_trail=True,
+        tightened_trail_atr_multiplier=1.5,
+        tighten_hold_score=55.0,
+    )
+    policy = TradeManagementPolicy(config)
+    position = make_position(
+        phase=PositionPhase.RUNNER,
+        remaining_fraction=0.25,
+        highest_close=130.0,
+        current_stop_price=105.0,
+        bars_held=10,
+    )
+    update = policy.on_completed_bar(position, close=140.0, atr_value=2.0, hold_score=10.0)
+    # Runner trail = 140 - 5*2 = 130, not the tightened 140 - 3.
+    assert update.position.current_stop_price == pytest.approx(130.0)
+
+
+def test_new_flags_default_off_and_hold_score_alone_changes_nothing():
+    policy = TradeManagementPolicy(ExitPolicyConfig())
+    position = make_position()
+    plain = policy.on_completed_bar(position, close=110.0, atr_value=2.0)
+    with_hold = policy.on_completed_bar(position, close=110.0, atr_value=2.0, hold_score=1.0)
+    assert plain.position == with_hold.position
+    assert [ (i.kind, i.reason) for i in plain.instructions ] == [
+        (i.kind, i.reason) for i in with_hold.instructions
+    ]
+
+
+def test_scalp_preset_validates_and_new_config_bounds_are_enforced():
+    from quant.exits import scalp_exit_policy
+
+    TradeManagementPolicy(scalp_exit_policy())  # must not raise
+    assert any(
+        "Profit-target fraction" in error
+        for error in ExitPolicyConfig(profit_target_fraction=0.0).validate()
+    )
+    assert any(
+        "Smart-exit hold score" in error
+        for error in ExitPolicyConfig(smart_exit_hold_score=150.0).validate()
+    )
+    assert any(
+        "Tightened trail" in error
+        for error in ExitPolicyConfig(
+            trailing_atr_multiplier=2.0, tightened_trail_atr_multiplier=3.0
+        ).validate()
+    )

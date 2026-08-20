@@ -25,6 +25,7 @@ on:
       - "tests/test_equity_attribution.py"
       - "tests/test_equity_lifecycle.py"
       - "tests/test_quant_evidence_scanner.py"
+      - "tests/test_evidence_scanner_integration.py"
       - "tests/test_edge_intelligence.py"
       - ".github/workflows/marketwide-equity-ci.yml"
   push:
@@ -76,6 +77,7 @@ jobs:
             tests/test_equity_lifecycle.py \
             tests/test_equity_production_partition.py \
             tests/test_quant_evidence_scanner.py \
+            tests/test_evidence_scanner_integration.py \
             tests/test_edge_intelligence.py >> marketwide-ci.log 2>&1
           compile_status=$?
 
@@ -97,6 +99,7 @@ jobs:
               tests/test_equity_lifecycle.py \
               tests/test_equity_production_partition.py \
               tests/test_quant_evidence_scanner.py \
+              tests/test_evidence_scanner_integration.py \
               tests/test_edge_intelligence.py >> marketwide-ci.log 2>&1
             test_status=$?
           else

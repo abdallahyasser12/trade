@@ -36,15 +36,20 @@ jobs:
             advanced_crypto_engine.py \
             intraday_crypto_engine.py \
             quant/adaptive_manifest.py \
+            quant/edge_intelligence.py \
             quant/evidence_scanner.py \
+            quant/exit_intelligence.py \
+            quant/exits.py \
             quant/intraday.py \
             quant/intraday_lifecycle.py \
             quant/lifecycle.py \
             quant/liquidity_universe.py \
             quant/marketplace.py \
+            quant/opportunity.py \
             quant/production_runtime.py \
             quant/realtime_feed.py \
             quant/research/factory.py \
+            quant/research/simulator.py \
             quant/scanner.py \
             quant/sleeve_supervision.py \
             quant/strategies/intraday_momentum.py \
@@ -68,7 +73,12 @@ jobs:
             tests/test_adaptive_intraday_research_policy.py \
             tests/test_adaptive_liquidity_universe.py \
             tests/test_adaptive_sleeve_supervision.py \
+            tests/test_edge_intelligence.py \
+            tests/test_evidence_scanner_integration.py \
+            tests/test_exit_intelligence.py \
             tests/test_quant_evidence_scanner.py \
+            tests/test_quant_exits.py \
+            tests/test_quant_simulator.py \
             tests/test_quant_factory_fail_closed.py \
             tests/test_quant_intraday_profile.py \
             tests/test_quant_lifecycle_forward_health.py \

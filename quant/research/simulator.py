@@ -35,6 +35,7 @@ import pandas as pd
 
 from cost_model import round_trip_cost_bps
 from models import BotAction
+from quant.exit_intelligence import HoldIntelligenceConfig, assess_hold
 from quant.exits import (
     ExitInstruction,
     ExitInstructionKind,
@@ -259,6 +260,7 @@ def run_simulation(
     *,
     config: SimulationConfig,
     exit_policy: Optional[ExitPolicyConfig] = None,
+    hold_config: Optional[HoldIntelligenceConfig] = None,
     benchmark_symbol: Optional[str] = None,
 ) -> SimulationResult:
     """Simulate ``strategy`` over the common history of ``bars_by_symbol``.
@@ -271,6 +273,10 @@ def run_simulation(
     if errors:
         raise ValueError("Invalid simulation configuration: " + "; ".join(errors))
     policy = TradeManagementPolicy(exit_policy or ExitPolicyConfig())
+    # Hold intelligence is only computed when a policy behavior consumes it;
+    # the default configuration therefore simulates exactly as before.
+    needs_hold = policy.config.enable_smart_exit or policy.config.enable_adaptive_trail
+    hold_settings = hold_config or HoldIntelligenceConfig()
 
     prepared = strategy.prepare_universe(bars_by_symbol)
     _validate_prepared(prepared)
@@ -497,11 +503,23 @@ def run_simulation(
                 if efficiency is not None and math.isfinite(float(efficiency))
                 else None
             )
+            hold_value = None
+            if needs_hold:
+                hold = assess_hold(
+                    prepared[symbol],
+                    timestamp,
+                    strategy_id=getattr(strategy, "strategy_id", "") or "",
+                    signal_reason=position.trade.entry_reason or "",
+                    config=hold_settings,
+                )
+                if hold.measurable:
+                    hold_value = hold.hold_score
             update = policy.on_completed_bar(
                 position.managed,
                 close=close,
                 atr_value=atr_value,
                 efficiency_ratio=efficiency_value,
+                hold_score=hold_value,
             )
             position.managed = update.position
             if position.managed.phase.value != position.trade.phase_reached:
@@ -627,6 +645,9 @@ def run_simulation(
         config_snapshot={
             "simulation": config.to_dict(),
             "exit_policy": asdict(exit_policy or ExitPolicyConfig()),
+            "hold_intelligence": (
+                asdict(hold_settings) if needs_hold else None
+            ),
             "benchmark_symbol": bench,
         },
     )
