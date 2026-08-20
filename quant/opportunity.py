@@ -126,7 +126,12 @@ def score_components(
 
 @dataclass
 class RankerInput:
-    """One candidate plus everything the ranker needs to judge it."""
+    """One candidate plus everything the ranker needs to judge it.
+
+    ``setup_quality`` is appended to the historical field order so any legacy
+    positional construction keeps its original meaning. New code should still use
+    keyword arguments.
+    """
 
     candidate: OpportunityCandidate
     execution_estimate: ExecutionEstimate
@@ -134,10 +139,10 @@ class RankerInput:
     regime_compatibility: Optional[float] = None
     strategy_reliability: Optional[float] = None
     liquidity_quality: float = 1.0
-    setup_quality: float = 1.0
     drawdown_pct: float = 0.0
     atr_percentile: Optional[float] = None
     abstention_kwargs: dict[str, Any] = field(default_factory=dict)
+    setup_quality: float = 1.0
 
 
 class GlobalOpportunityRanker:
