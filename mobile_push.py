@@ -6,7 +6,7 @@ new fill is persisted. Push failures never affect trading or reconciliation.
 
 The notifier may observe a different StateStore from the one that owns Expo tokens.
 That lets the production mobile API keep its existing token/auth database while the
-notification observer watches the dedicated Bybit Demo engine database.  A separate
+notification observer watches the dedicated Bybit Demo engine database. A separate
 operator-preference SQLite file can disable delivery without restarting services.
 """
 
@@ -98,12 +98,18 @@ def _is_armed(value: dict[str, Any]) -> bool:
 
 def snapshot(store: StateStore) -> dict[str, Any]:
     trades = store.get_trades(limit=1)
+    # A zero-id sentinel has two important properties:
+    # 1) if the notifier starts with no historical trades, the first real fill
+    #    (SQLite id >= 1) is observable as a transition and produces a notification;
+    # 2) if the notifier restarts after historical fills exist, the baseline is the
+    #    latest real id, so that old fill is not replayed as new.
+    latest_trade = trades[0] if trades else {"id": 0}
     return {
         "stock_status": _json(store.get_kv(ENGINE_STATUS_KEY)),
         "crypto_status": _json(store.get_kv(CRYPTO_ENGINE_STATUS_KEY)),
         "stock_kill": _json(store.get_kv(KILL_SWITCH_KEY)),
         "crypto_kill": _json(store.get_kv(CRYPTO_KILL_SWITCH_KEY)),
-        "latest_trade": trades[0] if trades else None,
+        "latest_trade": latest_trade,
     }
 
 
@@ -125,7 +131,13 @@ def events_between(previous: dict[str, Any], current: dict[str, Any]) -> list[Pu
             else:
                 title = f"{label} engine {after_state.lower()}"
                 body = "Server-side engine state changed."
-            events.append(PushEvent(title=title, body=body, data={"kind": "engine_state", "engine": label.lower(), "state": after_state}))
+            events.append(
+                PushEvent(
+                    title=title,
+                    body=body,
+                    data={"kind": "engine_state", "engine": label.lower(), "state": after_state},
+                )
+            )
 
     for key, label in (("stock_kill", "Stocks"), ("crypto_kill", "Crypto")):
         before = previous.get(key) or {}
@@ -217,7 +229,7 @@ class MobilePushNotifier:
     """Low-frequency observer of durable engine state.
 
     ``store`` is the state being observed. ``token_store`` owns Expo device tokens and
-    defaults to the same store for backward compatibility.  A preference database may
+    defaults to the same store for backward compatibility. A preference database may
     disable delivery. None of these paths can mutate trading/protection state.
     """
 
