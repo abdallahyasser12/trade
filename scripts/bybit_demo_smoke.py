@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Opt-in economic smoke against Bybit DEMO Spot only.
 
-No automated CI invokes this script.  It requires an explicit confirmation string and
-BYBIT_DEMO credentials.  It buys the smallest safely representable BTCUSDT quantity
-within the configured notional cap, reconciles the fill, then sells only proven
-bot-owned inventory and verifies that no bot-owned residual remains.
+No automated CI invokes this script. It requires an explicit confirmation string and
+BYBIT_DEMO credentials. It buys the smallest safely representable Spot quantity within
+the configured notional cap, reconciles the fill, then sells only proven bot-owned
+inventory and verifies that no bot-owned residual remains.
 """
 from __future__ import annotations
 
@@ -41,13 +41,21 @@ def _wait_order(broker, client_id: str, timeout_seconds: float = 30.0):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--confirm", required=True)
-    parser.add_argument("--symbol", choices=("BTC/USD", "ETH/USD", "SOL/USD"), default="BTC/USD")
+    parser.add_argument(
+        "--confirm",
+        "--acknowledge-demo-order",
+        dest="confirm",
+        required=True,
+        help=f"Required exact value: {ACK}",
+    )
+    parser.add_argument(
+        "--symbol", choices=("BTC/USD", "ETH/USD", "SOL/USD"), default="BTC/USD"
+    )
     parser.add_argument("--max-notional-usdt", type=float, default=25.0)
     parser.add_argument("--state-db", default="data/bybit_demo_smoke.db")
     args = parser.parse_args()
     if args.confirm != ACK:
-        print(f"Economic Demo smoke requires --confirm {ACK}", file=sys.stderr)
+        print(f"Economic Demo smoke requires --acknowledge-demo-order {ACK}", file=sys.stderr)
         return 2
     if not math.isfinite(args.max_notional_usdt) or args.max_notional_usdt <= 0:
         print("max-notional-usdt must be positive", file=sys.stderr)
@@ -73,10 +81,11 @@ def main() -> int:
     )
     session = "smoke" + uuid.uuid4().hex[:8]
     entry_id = make_client_order_id(session, "entry", datetime.now(timezone.utc), args.symbol)
-    exit_id = None
     try:
         env = broker.verify_environment()
-        metadata = broker.instrument_provider.get_instrument_metadata(args.symbol, force_refresh=True)
+        metadata = broker.instrument_provider.get_instrument_metadata(
+            args.symbol, force_refresh=True
+        )
         feed.start()
         private.start()
         quote = feed.get_latest_quotes([args.symbol])[args.symbol]
@@ -110,7 +119,9 @@ def main() -> int:
         if position is None or position.qty <= 0:
             if entry.is_open and entry.broker_order_id:
                 broker.cancel_order(entry.broker_order_id)
-            raise BrokerError(f"Demo entry did not produce reconciled bot-owned inventory ({entry.status})")
+            raise BrokerError(
+                f"Demo entry did not produce reconciled bot-owned inventory ({entry.status})"
+            )
 
         exit_id = make_client_order_id(
             session,
