@@ -35,6 +35,8 @@ Operational summary:
 - open bot-owned exposure
 - persistent emergency kill-switch state
 
+If credentials are missing, HOME gives a one-line quick-start instruction pointing to SETTINGS.
+
 Top opportunities show at most the strongest configured symbols with an operator-friendly decision:
 
 - BUY SETUP
@@ -42,9 +44,9 @@ Top opportunities show at most the strongest configured symbols with an operator
 - NO TRADE
 - AVOID
 
-Cards show score, price, dynamic target description, stop, risk/reward when measurable, and a one-line reason.
+Cards show score, price, accepted structure/ATR/R target when one exists, protective stop, risk/reward and target logic. The +0.5/+0.75/+1.0 research families are not hardcoded profit orders.
 
-Open positions show only proven bot-owned Spot inventory, not unexplained wallet holdings. The current protective stop is projected from engine-authoritative persisted position state.
+Open positions show only proven bot-owned Spot inventory, not unexplained wallet holdings. The current protective stop is projected from engine-authoritative persisted position state and the accepted target plan is shown when available.
 
 Recent activity includes decisions, no-trade decisions, order/execution events, position management and operational events.
 
@@ -54,18 +56,20 @@ The configured BTC / ETH / SOL cards show:
 
 - price
 - 24-hour move
+- decision
 - regime
 - spread
+- approximate 10-level ask depth
 - trend
 - momentum
 - volatility
-- setup score
+- accepted target when available
 
-The **Why?** expander converts the model state into plain-language trend, momentum, liquidity, regime, cost and decision explanations. Raw details/microstructure remain available only in the nested Advanced expander.
+The **Why?** expander converts model state into plain-language setup, liquidity, target-room and cost information. Raw details/microstructure/target plan remain available only in the nested Advanced expander.
 
 ## PERFORMANCE
 
-The dashboard never hides losing trades. It displays the current time-causal burn-in evidence:
+The dashboard never hides losing trades. It displays current time-causal burn-in evidence:
 
 - net P&L
 - trade count
@@ -76,28 +80,65 @@ The dashboard never hides losing trades. It displays the current time-causal bur
 - fees
 - average winner/loss
 - equity curve
-- +0.5%, +0.75% and +1.0% MFE reach rates
+- +0.25%, +0.50%, +0.75% and +1.00% MFE reach rates
 
 Operational and preliminary-edge verdicts are shown separately. The screen always states that a 3–5 day run does not prove a durable strategy.
 
 ## SETTINGS
 
+SETTINGS is intentionally a three-step workflow.
+
+### 1. Connect Bybit Demo
+
+The operator can paste the Bybit Demo API key and secret directly into password-masked fields. The form clears after submit.
+
+Actions:
+
+- **Test connection** — read-only Demo environment/account verification; no order is submitted.
+- **Test & Save** — verifies first, then stores the credentials in the isolated server-side credential vault.
+- **Test saved connection** — re-validates the current saved/environment credentials.
+- **Clear dashboard-saved credentials** — deletes only the dashboard vault copy while the backend is stopped.
+
+The secret is never displayed back to the browser. It is not stored in SQLite, logs, reports or subprocess arguments.
+
+### 2. Choose run settings
+
 Normal settings are limited to:
 
-- Venue: Bybit
-- Environment: Demo
-- server credential status (configured/missing only; values never displayed)
-- strategy lifecycle eligibility
+- strategy lifecycle/readiness status
 - capital allocation
-- conservative risk profile
 - allowed BTC / ETH / SOL universe
 - 72h / 120h duration
+- researched smart-exit consumers switch
+- phone push-notification preference
 - optional display-only EGP reference
-- Start Bybit Demo
-- Stop gracefully
-- EMERGENCY STOP
 
-The Start button is disabled unless credentials exist, the strategy is lifecycle-eligible, at least one permitted symbol is selected, no backend is already running, and the kill switch is clear.
+The smart-exit switch enables existing `TradeManagementPolicy` consumers. It does not create another exit engine.
+
+The phone-notification preference controls the existing mobile push observer when that service/device registration is configured. Notification failure never affects trading.
+
+### 3. Start / stop
+
+A readiness row shows clear pass/fail markers for:
+
+- Demo API configured
+- lifecycle eligible
+- permitted universe non-empty
+- safety latch clear
+
+Controls:
+
+- **Start Bybit Demo**
+- **Stop gracefully**
+- **EMERGENCY STOP**
+
+Start is disabled until all readiness checks pass and no backend is already running.
+
+## Credential vault
+
+Local dashboard-saved credentials live under `secrets/`, which is Git-ignored. Production Docker mounts a dedicated `trade_secrets` volume only into the operator dashboard container. The research dashboard and mobile API do not mount it.
+
+The vault is written atomically with `0600` permissions. The detached backend receives the Demo key and secret only in its process environment; no secret-bearing command-line argument exists.
 
 ## Emergency latch
 
@@ -107,7 +148,7 @@ Clearing the latch requires an explicit acknowledgement in Settings and is refus
 
 ## Backend ownership
 
-Streamlit is presentation/control only. Start creates a detached server-side process. No API secret is passed on the command line or written into Streamlit session state.
+Streamlit is presentation/control only. Start creates a detached server-side process.
 
 Closing the browser does not stop orders, protection, reconciliation or WebSocket handling.
 
