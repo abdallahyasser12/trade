@@ -6,14 +6,14 @@ It is a negative-only venue layer:
 * the existing :class:`EvidenceQuantScanner` remains responsible for measured edge,
   regime, costs, setup intelligence, global ranking and portfolio risk;
 * Bybit multi-level order-book state may only demote/reject a candidate;
-* a causal target plan is frozen at an accepted entry candidate and persisted in the
-  existing engine state database;
-* post-entry execution feeds that target into the existing ``TradeManagementPolicy``
-  rather than creating a second exit system.
+* a causal target plan is frozen only after a candidate survives global ranking and
+  receives a positive executable risk grant;
+* post-entry execution feeds that frozen target into the existing
+  ``TradeManagementPolicy`` rather than creating a second exit system.
 
 The target planner is deliberately structural instead of a hard-coded +0.5/+1% order:
 it combines initial R, ATR, recent realized movement, nearby completed-bar resistance
-and current measured/assumed execution costs.  The 0.5/0.75/1.0 families are recorded
+and current measured/assumed execution costs. The 0.5/0.75/1.0 families are recorded
 for burn-in research only; they are not a quota and are not selected merely because a
 return target was requested.
 """
@@ -133,7 +133,11 @@ def _target_plan(
     if math.isfinite(overhead_room) and profile != "breakout":
         candidates["structure"] = overhead_room * config.structure_buffer
 
-    positive = {name: value for name, value in candidates.items() if value > 0 and math.isfinite(value)}
+    positive = {
+        name: value
+        for name, value in candidates.items()
+        if value > 0 and math.isfinite(value)
+    }
     if not positive:
         return {"tradeable": False, "reason": "no_positive_target_candidate"}
     selected_family, selected_distance = min(positive.items(), key=lambda item: item[1])
@@ -245,7 +249,11 @@ class BybitEvidenceQuantScanner(EvidenceQuantScanner):
 
         notional = max(0.0, float(context.get("notional") or 0.0))
         if market_context is not None:
-            snapshot = market_context.to_dict() if hasattr(market_context, "to_dict") else dict(market_context)
+            snapshot = (
+                market_context.to_dict()
+                if hasattr(market_context, "to_dict")
+                else dict(market_context)
+            )
             candidate.details["bybit_microstructure"] = snapshot
             quote_age_ms = _finite(snapshot.get("quote_age_ms"))
             spread_bps = _finite(snapshot.get("spread_bps"))
@@ -261,7 +269,9 @@ class BybitEvidenceQuantScanner(EvidenceQuantScanner):
                 if ask is not None and ask_depth is not None and ask > 0 and ask_depth > 0
                 else 0.0
             )
-            depth_multiple = ask_depth_quote / max(notional, _EPS) if notional > 0 else math.inf
+            depth_multiple = (
+                ask_depth_quote / max(notional, _EPS) if notional > 0 else math.inf
+            )
             participation = notional / max(ask_depth_quote, _EPS) if notional > 0 else 0.0
             impact_proxy_bps = (spread_bps or 0.0) * 0.5 + participation * 50.0
             candidate.details["bybit_depth_quote"] = ask_depth_quote
@@ -283,7 +293,8 @@ class BybitEvidenceQuantScanner(EvidenceQuantScanner):
             if imbalance is not None and imbalance < 0:
                 adverse += min(1.0, abs(imbalance)) * 0.20
             ranker_input.liquidity_quality = min(
-                float(ranker_input.liquidity_quality), max(0.50, 1.0 - adverse)
+                float(ranker_input.liquidity_quality),
+                max(0.50, 1.0 - adverse),
             )
 
         frame = prepared.get(decision.symbol)
@@ -305,10 +316,6 @@ class BybitEvidenceQuantScanner(EvidenceQuantScanner):
                 config=self.bybit_quality_config,
             )
         candidate.details["bybit_target_plan"] = plan
-        self.target_plan_store.set_kv(
-            _TARGET_KEY_PREFIX + decision.symbol,
-            json.dumps(plan, sort_keys=True, default=str),
-        )
         if not plan.get("tradeable"):
             reasons.append("bybit_" + str(plan.get("reason") or "target_plan_rejected"))
 
@@ -316,6 +323,47 @@ class BybitEvidenceQuantScanner(EvidenceQuantScanner):
             candidate.details["bybit_entry_rejection_reasons"] = sorted(set(reasons))
             self._reject_execution(context, sorted(set(reasons))[0])
         return candidate, context
+
+    def scan(self, *args, **kwargs):
+        """Persist target plans only for candidates that actually receive risk.
+
+        Candidate construction happens before global ranking and portfolio allocation.
+        Persisting there would make a rejected candidate look like an accepted trade
+        plan in the operator UI.  We therefore let the normal scanner complete first,
+        then freeze the target only for ``report.executable`` decisions. Rejected
+        current candidates clear stale pre-entry plans; held positions are unaffected
+        because held symbols do not create BUY candidates in this strategy.
+        """
+        report = super().scan(*args, **kwargs)
+        executable_symbols: set[str] = set()
+        for decision in report.executable:
+            plan = decision.candidate.details.get("bybit_target_plan")
+            if not isinstance(plan, dict) or not plan.get("tradeable"):
+                continue
+            frozen = dict(plan)
+            frozen.update(
+                {
+                    "frozen_for_execution": True,
+                    "decision_timestamp": str(decision.candidate.timestamp),
+                    "strategy_id": decision.candidate.strategy_id,
+                    "signal_reason": decision.candidate.signal_reason,
+                    "risk_allocation_pct": decision.risk_allocation_pct,
+                }
+            )
+            self.target_plan_store.set_kv(
+                _TARGET_KEY_PREFIX + decision.candidate.symbol,
+                json.dumps(frozen, sort_keys=True, default=str),
+            )
+            executable_symbols.add(decision.candidate.symbol)
+
+        for decision in report.decisions:
+            details = getattr(decision.candidate, "details", {}) or {}
+            if "bybit_target_plan" not in details:
+                continue
+            symbol = decision.candidate.symbol
+            if symbol not in executable_symbols:
+                self.target_plan_store.delete_kv(_TARGET_KEY_PREFIX + symbol)
+        return report
 
 
 class TargetAwareBybitTradeManagementExecutor(BybitTradeManagementExecutor):
@@ -330,7 +378,11 @@ class TargetAwareBybitTradeManagementExecutor(BybitTradeManagementExecutor):
                     plan = json.loads(raw)
                 except (TypeError, json.JSONDecodeError):
                     plan = None
-                if isinstance(plan, dict) and plan.get("tradeable"):
+                if (
+                    isinstance(plan, dict)
+                    and plan.get("tradeable")
+                    and plan.get("frozen_for_execution")
+                ):
                     target_r = _finite(plan.get("target_r"))
                     target_fraction = _finite(plan.get("target_fraction"))
                     if (
