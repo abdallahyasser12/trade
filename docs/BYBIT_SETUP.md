@@ -2,38 +2,19 @@
 
 This integration is **Bybit Spot Demo only** for the production acceptance mission. It does not enable margin, leverage, perpetuals, futures, inverse contracts, options, shorts, lending, borrowing, martingale, averaging down, grid-loss recovery, or loss-doubling.
 
-The ordinary operator uses the Streamlit dashboard. The CLI runner remains an implementation/service entry point and troubleshooting tool; it is not required for normal start/stop operation.
+The ordinary operator uses the Streamlit dashboard. The CLI runner remains a service/recovery entry point; it is not required for normal operation.
 
-## 1. Create a Bybit Demo account and API credentials
+## 1. Create Bybit Demo credentials
 
-Use Bybit **Demo Trading** credentials. Demo trading is distinct from Testnet and from a live-money account.
+Use credentials created under Bybit **Demo Trading**. Demo Trading is distinct from Testnet and from a live-money account.
 
 Create an API key with only the read/trade permissions required for Spot Demo operation. **Do not grant withdrawal permission.** No withdrawal permission is needed by this application.
 
-Keep Demo and future Live credentials separate. Never put Live credentials in the Demo variables.
+Keep Demo and future Live credentials separate. Never paste a Live credential into the Demo dashboard.
 
-## 2. Configure the server environment
+## 2. Start the dashboard
 
-Copy the template and edit the private `.env` file:
-
-```bash
-cp .env.example .env
-```
-
-Set only:
-
-```text
-BYBIT_DEMO_API_KEY=...
-BYBIT_DEMO_API_SECRET=...
-```
-
-Do not commit `.env`. The application does not store these secrets in SQLite, reports, frontend payloads, or command-line arguments.
-
-`BYBIT_LIVE_API_KEY` and `BYBIT_LIVE_API_SECRET` should remain blank. The current Bybit operator path cannot construct a Live broker.
-
-## 3. Install and start the dashboard
-
-Local development:
+Local:
 
 ```bash
 python -m venv .venv
@@ -50,16 +31,42 @@ docker compose -f docker-compose.production.yml up -d --build
 
 The production root route serves the simple Bybit operator dashboard. The existing full research application is preserved at `/research`.
 
-## 4. Verify connectivity
+## 3. Add the API key through SETTINGS
 
-Open **SETTINGS** in the dashboard. Verify:
+Open **SETTINGS → Connect Bybit Demo**.
 
-- Venue: Bybit
-- Environment: DEMO
-- Demo credentials: Configured
+1. Paste the **Bybit Demo API key**.
+2. Paste the **Bybit Demo API secret**.
+3. Click **Test connection** if you only want to verify it, or **Test & Save** to verify and store it for future dashboard starts.
+
+The fields are password-masked and clear after form submission. The dashboard never renders the saved key or secret back to the browser.
+
+A dashboard-saved credential is stored only in the server-side credential vault (`secrets/bybit_demo_credentials.json` locally, `/app/secrets/...` in production). The vault is written atomically with restrictive `0600` permissions. It is excluded from Git and production Docker mounts it through a dedicated volume that is available to the operator dashboard only. The research dashboard and mobile API do not mount that secret volume.
+
+Credentials are **not** stored in SQLite, reports, logs, URLs, or subprocess arguments. When a run starts, the detached Bybit backend receives them only through its process environment.
+
+You can click **Test saved connection** at any time while the backend is stopped. **Clear dashboard-saved credentials** removes the vault copy.
+
+### Optional deployment-managed fallback
+
+Existing deployments may still set:
+
+```text
+BYBIT_DEMO_API_KEY=...
+BYBIT_DEMO_API_SECRET=...
+```
+
+in the private server `.env`. Dashboard-saved credentials take precedence when present. `BYBIT_LIVE_API_KEY` and `BYBIT_LIVE_API_SECRET` remain separate and the normal Bybit operator path cannot select Live trading.
+
+## 4. Readiness checks
+
+SETTINGS shows a simple readiness row before Start:
+
+- Demo API: ready
 - Strategy lifecycle: PAPER or another already-approved broker-backed state
-- Backend: Stopped before starting a new run
-- Kill switch: not armed
+- Coin universe: non-empty BTC/ETH/SOL subset
+- Safety latch: clear
+- Backend: stopped
 
 The dashboard never auto-promotes a strategy from RESEARCH/SHADOW just to obtain more trades.
 
@@ -77,7 +84,7 @@ The dashboard maps these to the canonical strategy symbols `BTC/USD`, `ETH/USD`,
 
 No meme coin or microcap is added automatically. Software does not certify Sharia compliance; the list is simply a user-controlled permitted Spot universe.
 
-## 6. Set capital and burn-in duration
+## 6. Capital, duration, smart exits and notifications
 
 Set a **strategy capital allocation** in USDT. This is independent of the total virtual wallet balance in Bybit Demo. Sizing is capped by the configured allocation and does not automatically scale to the full Demo wallet.
 
@@ -85,6 +92,12 @@ Choose either:
 
 - 72 hours / 3 days
 - 120 hours / 5 days
+
+The **researched smart-exit consumers** switch uses the existing `TradeManagementPolicy` for partial profit, break-even, time/smart exit and adaptive trailing. It does not tune thresholds to chase a requested return.
+
+The Bybit-specific entry layer additionally uses current multi-level order-book depth, an impact proxy, structural room, ATR, initial R and expected round-trip costs as negative-only gates. Accepted target plans feed into that same existing `TradeManagementPolicy`; there is still only one post-entry exit policy.
+
+If the existing mobile app / Expo push service is configured, the **Phone push notifications** switch controls delivery of Bybit engine-state, safety-lock and new-fill notifications. The notifier watches the Bybit engine database while device tokens remain in the existing mobile API database. Notification failure can never affect trading or protection.
 
 An optional EGP reference rate in the UI is display-only and does not affect sizing or risk mathematics.
 
@@ -132,12 +145,12 @@ HOME and PERFORMANCE read persisted evidence while a run is active. Final JSON a
 
 A 72–120 hour run is an operational acceptance experiment and preliminary forward sample. The software never labels it "strategy proven" and never claims a guaranteed return.
 
-## Service/diagnostic commands
+## Service / diagnostic commands
 
 Normal operators do not need these, but they remain useful for service supervision and acceptance evidence:
 
 ```bash
-python scripts/bybit_demo_smoke.py --acknowledge-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+python scripts/bybit_demo_smoke.py --confirm I_ACCEPT_BYBIT_DEMO_ORDER
 python scripts/run_bybit_demo_burnin.py --hours 72
 python scripts/run_bybit_demo_burnin.py --hours 120
 python scripts/generate_bybit_burnin_report.py --run-id <RUN_ID>
