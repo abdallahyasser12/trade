@@ -27,18 +27,18 @@ Normal operation is dashboard-first:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt -r requirements-mobile-api.txt
-cp .env.example .env
 streamlit run bybit_operator_ui.py
 ```
 
-Set only the Bybit Demo credentials in `.env`:
+Then open **SETTINGS** and follow three steps:
 
-```text
-BYBIT_DEMO_API_KEY=...
-BYBIT_DEMO_API_SECRET=...
-```
+1. Paste your **Bybit Demo API key + secret** and click **Test & Save**.
+2. Choose the capital allocation, BTC/ETH/SOL subset and 3-day or 5-day burn-in.
+3. Click **Start Bybit Demo**.
 
-Create the key from **Bybit Demo Trading** with only the read/trade permissions needed for Spot Demo. **Do not grant withdrawal permission.**
+Create the key under **Bybit Demo Trading**, not Testnet or Live. Grant only the read/trade permissions needed for Spot Demo. **Do not grant withdrawal permission.**
+
+Dashboard-saved credentials are written to a server-only credential vault with restrictive permissions. They are not stored in SQLite, reports, logs, URLs or subprocess arguments, and are never rendered back to the browser. Production Docker mounts the vault only into the operator dashboard container. Existing deployments may still use `BYBIT_DEMO_API_KEY` / `BYBIT_DEMO_API_SECRET` in a private `.env` as an optional fallback.
 
 The dashboard navigation is intentionally small:
 
@@ -49,7 +49,7 @@ PERFORMANCE
 SETTINGS
 ```
 
-From SETTINGS you choose the strategy capital allocation, 72h/120h burn-in duration and permitted BTC/ETH/SOL subset, then click **Start Bybit Demo**. The browser is not the trading process: the UI launches a detached server-side backend, so closing the browser does not terminate protection or reconciliation.
+The browser is not the trading process: Start launches a detached server-side backend, so closing the browser does not terminate protection, reconciliation or WebSocket supervision.
 
 The existing comprehensive research application remains available separately as Advanced / Research.
 
@@ -65,7 +65,7 @@ Production routing:
 - `/research` → existing full research/Alpaca/Quant Desk Streamlit application
 - `/api/*` → existing mobile API
 
-Runtime data, burn-in reports and logs use persistent Docker volumes.
+Persistent volumes are separated for runtime state, reports, logs and the dashboard-only secret vault.
 
 ## Architecture
 
@@ -80,6 +80,7 @@ Quant-controlled adaptive crypto engine
         |
 +-- existing regime/adaptive strategy
 +-- existing EvidenceQuantScanner / Edge Intelligence
++-- Bybit-only depth / impact / target-room rejection layer
 +-- existing portfolio + risk governor
 +-- existing lifecycle/degradation supervision
 +-- existing execution-quality journal
@@ -146,11 +147,16 @@ The production entry path remains evidence/risk driven:
 completed causal data
   -> adaptive setup/regime
   -> EvidenceQuantScanner + Edge Intelligence
-  -> execution-quality/cost gate
+  -> spread/slippage/fee/participation cost gate
+  -> Bybit multi-level depth + impact proxy + structural target-room gate
   -> portfolio/risk governor
   -> burn-in rolling-loss/cooldown/entry ceiling
   -> Bybit Spot Demo order intent
 ```
+
+The Bybit-specific layer is negative-only: favorable depth/order flow cannot manufacture alpha; adverse liquidity, stale/gapped books, excessive impact or insufficient target room can only demote/reject a candidate.
+
+Target selection is not a fixed `+0.5%` order. An accepted target plan combines initial R, ATR, recent realized movement, completed-bar resistance and expected round-trip costs. The +0.25/+0.50/+0.75/+1.00 families remain research measurements in the burn-in report.
 
 BTC, ETH and SOL compete for capital. The maximum allowed high-quality entries per rolling 24h is five by default. The minimum required trades is zero.
 
@@ -170,8 +176,13 @@ Supported policy mechanics include:
 - adaptive trailing stop
 - runner management
 - emergency market exit
+- accepted structure/ATR/R target plan fed into the same policy
 
 The legacy strategy ATR ratchet is made inert on this path so the existing policy is the single source of post-entry decisions. Broker protection/reconciliation remains owned by the existing engine.
+
+## Notifications
+
+If the existing mobile/Expo push service is configured, SETTINGS exposes a **Phone push notifications** switch. Device tokens stay in the existing mobile API database while the push observer watches the dedicated Bybit engine database for new fills, safety locks and engine-state changes. Notification delivery is observational only and can never block or modify trading/protection.
 
 ## Burn-in evidence
 
@@ -214,7 +225,7 @@ python scripts/run_bybit_demo_burnin.py --hours 120
 The smoke is explicit, tiny, Spot-only and Demo-only:
 
 ```bash
-python scripts/bybit_demo_smoke.py --acknowledge-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+python scripts/bybit_demo_smoke.py --confirm I_ACCEPT_BYBIT_DEMO_ORDER
 ```
 
 It validates account/metadata/public/private connectivity, submits only a dynamically-valid tiny Demo Spot order inside the smoke cap, reconciles it, closes only proven bot-owned quantity and refuses to pass with residual bot-owned exposure.
@@ -230,7 +241,7 @@ Use **Stop gracefully** for ordinary shutdown.
 ## Documentation
 
 - [`docs/BYBIT_PRODUCTION_AUDIT.md`](docs/BYBIT_PRODUCTION_AUDIT.md) — source-of-truth architecture audit
-- [`docs/BYBIT_SETUP.md`](docs/BYBIT_SETUP.md) — Demo credentials and dashboard setup
+- [`docs/BYBIT_SETUP.md`](docs/BYBIT_SETUP.md) — dashboard credential and Demo setup
 - [`docs/BYBIT_DEMO_BURNIN.md`](docs/BYBIT_DEMO_BURNIN.md) — burn-in procedure and evidence
 - [`docs/TRADING_ENGINE_ARCHITECTURE.md`](docs/TRADING_ENGINE_ARCHITECTURE.md) — execution/data/ownership boundaries
 - [`docs/SIMPLE_UI.md`](docs/SIMPLE_UI.md) — normal operator UX
@@ -240,7 +251,7 @@ Use **Stop gracefully** for ordinary shutdown.
 
 ## Testing
 
-Hermetic unit/integration tests cover the legacy Alpaca workflows and the Bybit venue path, including Spot/leverage invariants, symbol mapping, dynamic metadata changes, deterministic IDs, timeout reconciliation, wallet ownership, execution idempotency, order-book gaps/staleness, WebSocket duplicate tolerance, smart-exit policy wiring, active-report causality, dashboard process ownership and emergency-latch behavior.
+Hermetic unit/integration tests cover the legacy Alpaca workflows and the Bybit venue path, including Spot/leverage invariants, symbol mapping, dynamic metadata changes, deterministic IDs, timeout reconciliation, wallet ownership, execution idempotency, order-book gaps/staleness, WebSocket duplicate tolerance, target-room intelligence, smart-exit single-policy wiring, secure dashboard credential storage, notification separation, active-report causality, dashboard process ownership and emergency-latch behavior.
 
 Run locally:
 
@@ -253,6 +264,6 @@ CI uses no trading credentials and cannot place economic orders.
 
 ## Security
 
-Never commit `.env` or API keys. The application does not require withdrawal permission. Bybit API secrets must not appear in SQLite, reports, logs, frontend state or API responses.
+Never commit `.env`, `secrets/` or API keys. The application does not require withdrawal permission. Bybit API secrets must not appear in SQLite, reports, logs, subprocess arguments, frontend status, or API responses.
 
 Live trading remains outside the current Bybit acceptance boundary and requires a separate future review.
