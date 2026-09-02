@@ -22,6 +22,7 @@ from typing import Optional
 
 DEFAULT_CONTROL_DB = "data/bybit_operator.db"
 DEFAULT_ENGINE_DB = "data/bybit_demo_trading.db"
+DEFAULT_VENUE_DB = "data/bybit_demo_venue.db"
 DEFAULT_LOG = "logs/bybit_demo_burnin.log"
 KILL_SWITCH_KEY = "crypto_kill_switch"
 
@@ -32,11 +33,14 @@ class OperatorControl:
         path: str = DEFAULT_CONTROL_DB,
         *,
         engine_db: str = DEFAULT_ENGINE_DB,
+        venue_db: str = DEFAULT_VENUE_DB,
     ) -> None:
         self.path = path
         self.engine_db = engine_db
+        self.venue_db = venue_db
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(engine_db).parent.mkdir(parents=True, exist_ok=True)
+        Path(venue_db).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, timeout=10.0)
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS operator_state (
@@ -71,7 +75,6 @@ class OperatorControl:
         except ProcessLookupError:
             return False
         except PermissionError:
-            # The process exists but is not signalable by this user.
             return True
         except OSError:
             return False
@@ -80,9 +83,6 @@ class OperatorControl:
     def _owned_backend_alive(cls, pid: Optional[int]) -> bool:
         if not cls._pid_alive(pid):
             return False
-        # Linux production containers expose /proc. Refuse to signal a recycled PID
-        # unless it is still our burn-in command. Other platforms fall back to the
-        # existence check because subprocess ownership cannot be inspected portably.
         proc = Path(f"/proc/{int(pid)}/cmdline") if pid else None
         if proc is not None and proc.exists():
             try:
@@ -92,7 +92,53 @@ class OperatorControl:
             return "run_bybit_demo_burnin.py" in command
         return True
 
+    def _sync_dashboard_protection(self) -> None:
+        """Mirror the engine-authoritative current stop into the UI evidence DB.
+
+        ``management_state`` predates the dashboard and originally stored only the
+        initial stop. This additive projection is intentionally derived from
+        StateStore's ``bot_position:*`` record, which remains authoritative. The
+        migration is idempotent and does not affect execution decisions.
+        """
+        if not Path(self.engine_db).exists() or not Path(self.venue_db).exists():
+            return
+        engine = sqlite3.connect(self.engine_db, timeout=2.0)
+        venue = sqlite3.connect(self.venue_db, timeout=2.0)
+        try:
+            columns = {
+                row[1]
+                for row in venue.execute("PRAGMA table_info(management_state)").fetchall()
+            }
+            if not columns:
+                return
+            if "current_stop_price" not in columns:
+                venue.execute("ALTER TABLE management_state ADD COLUMN current_stop_price REAL")
+            rows = engine.execute(
+                "SELECT key,value FROM kv WHERE key LIKE 'bot_position:%'"
+            ).fetchall()
+            for key, raw in rows:
+                try:
+                    payload = json.loads(raw)
+                    stop = float(payload.get("stop_price"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if stop <= 0:
+                    continue
+                symbol = str(key).split("bot_position:", 1)[-1]
+                venue.execute(
+                    "UPDATE management_state SET current_stop_price=?,updated_at=? WHERE strategy_symbol=?",
+                    (stop, self._now(), symbol),
+                )
+            venue.commit()
+        except sqlite3.Error:
+            # Dashboard projection failure must not mutate or stop the trading engine.
+            return
+        finally:
+            engine.close()
+            venue.close()
+
     def status(self) -> dict:
+        self._sync_dashboard_protection()
         row = self._conn.execute("SELECT * FROM operator_state WHERE id=1").fetchone()
         keys = ["id", "pid", "run_id", "state", "updated_at", "note"]
         result = dict(zip(keys, row)) if row else {"state": "STOPPED", "pid": None}
@@ -235,6 +281,8 @@ class OperatorControl:
             str(Path(self.path).resolve()),
             "--state-db",
             str(Path(self.engine_db).resolve()),
+            "--venue-db",
+            str(Path(self.venue_db).resolve()),
         ]
         if smart_exits:
             command.append("--enable-researched-smart-exits")
@@ -271,8 +319,6 @@ class OperatorControl:
         self._conn.commit()
 
     def emergency_stop(self) -> None:
-        # Persist first. Even if there is no live process, a later engine startup
-        # remains blocked until the operator explicitly acknowledges the latch.
         self.arm_kill_switch("EMERGENCY_STOP")
         status = self.status()
         pid = status.get("pid")
