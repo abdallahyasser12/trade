@@ -18,6 +18,14 @@ def test_demo_runner_has_no_live_selector_or_live_credential_reader():
     assert "BYBIT_LIVE" not in runner
 
 
+def test_dashboard_started_runner_wires_bybit_quality_layer_before_prepare():
+    runner = _read("scripts/run_bybit_demo_burnin.py")
+    assert "from bybit_entry_intelligence import wire_bybit_quality_layers" in runner
+    wire = runner.index("wire_bybit_quality_layers(service)")
+    prepare = runner.index("run_id = service.prepare()")
+    assert wire < prepare
+
+
 def test_demo_smoke_has_no_live_selector():
     smoke = _read("scripts/bybit_demo_smoke.py")
     assert "BYBIT_LIVE_API_KEY" not in smoke
