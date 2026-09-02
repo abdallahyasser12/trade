@@ -34,6 +34,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hours", type=float, choices=(72.0, 120.0), default=120.0)
     parser.add_argument("--capital-usdt", type=float, default=1_000.0)
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        choices=("BTC/USD", "ETH/USD", "SOL/USD"),
+        default=["BTC/USD", "ETH/USD", "SOL/USD"],
+        help="Explicit permitted Spot universe. No coins are added automatically.",
+    )
     parser.add_argument("--state-db", default="data/bybit_demo_trading.db")
     parser.add_argument("--venue-db", default="data/bybit_demo_venue.db")
     parser.add_argument("--quant-db", default="data/quant_desk.db")
@@ -64,6 +71,7 @@ def main() -> int:
 
     config = BybitBurnInConfig(
         hours=args.hours,
+        universe=tuple(args.symbols),
         strategy_capital_budget_usdt=args.capital_usdt,
         exit_policy=policy,
     )
