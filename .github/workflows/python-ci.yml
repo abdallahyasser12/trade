@@ -59,10 +59,12 @@ jobs:
             tests/test_bybit_state.py \
             tests/test_bybit_market_data.py \
             tests/test_bybit_management.py \
+            tests/test_bybit_entry_intelligence.py \
             tests/test_bybit_burnin.py \
             tests/test_bybit_operator_control.py \
             tests/test_bybit_security_contract.py \
-            tests/test_bybit_chaos.py
+            tests/test_bybit_chaos.py \
+            tests/test_mobile_push.py
 
       - name: Full Alpaca Quant Desk mobile and Bybit regression suite
         run: python -m pytest -q --durations=10
@@ -74,9 +76,9 @@ jobs:
             echo "::error::A credential-shaped literal is committed. Rotate the key and remove it."
             exit 1
           fi
-          # Private env files are forbidden even if someone bypasses .gitignore.
-          if git ls-files | grep -E '(^|/)\.env$'; then
-            echo "::error::.env is tracked. Remove it and rotate exposed credentials."
+          # Private env files and dashboard credential vaults are forbidden in git.
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)secrets/'; then
+            echo "::error::A private env/credential-vault file is tracked. Remove it and rotate exposed credentials."
             exit 1
           fi
-          echo "No committed credential-shaped literal or tracked .env found."
+          echo "No committed credential-shaped literal, .env, or dashboard vault found."
