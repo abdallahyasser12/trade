@@ -5,11 +5,14 @@ Examples:
     python scripts/run_bybit_demo_burnin.py --hours 72
     python scripts/run_bybit_demo_burnin.py --hours 120
 
-The runner never constructs BYBIT_LIVE and cannot accept live credentials.
+The runner never constructs BYBIT_LIVE and cannot accept live credentials. SIGTERM is
+a graceful operator stop. SIGUSR1 (where available) arms the emergency kill switch.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +25,7 @@ from bybit_burnin import (
     BybitDemoBurnInService,
     credentials_from_environment,
 )
+from bybit_operator_control import OperatorControl
 from bybit_report import BybitBurnInReport
 from quant.exits import ExitPolicyConfig
 
@@ -33,6 +37,7 @@ def main() -> int:
     parser.add_argument("--state-db", default="data/bybit_demo_trading.db")
     parser.add_argument("--venue-db", default="data/bybit_demo_venue.db")
     parser.add_argument("--quant-db", default="data/quant_desk.db")
+    parser.add_argument("--control-db", default="data/bybit_operator.db")
     parser.add_argument("--reports-dir", default="reports")
     parser.add_argument(
         "--enable-researched-smart-exits",
@@ -62,6 +67,9 @@ def main() -> int:
         strategy_capital_budget_usdt=args.capital_usdt,
         exit_policy=policy,
     )
+    control = OperatorControl(args.control_db)
+    service = None
+    run_id = None
     try:
         key, secret = credentials_from_environment()
         service = BybitDemoBurnInService(
@@ -72,16 +80,29 @@ def main() -> int:
             venue_db=args.venue_db,
             quant_db=args.quant_db,
         )
-        try:
-            run_id = service.prepare()
-            print(
-                f"BYBIT DEMO burn-in {run_id}: {args.hours:.0f}h, "
-                f"capital={args.capital_usdt:.2f} USDT, universe={config.universe}, "
-                "Spot only, isLeverage=0, live disabled."
-            )
-            code = service.run()
-        finally:
-            service.close()
+
+        def graceful_stop(_signum, _frame):
+            if service is not None:
+                service.request_stop()
+
+        def emergency_stop(_signum, _frame):
+            if service is not None:
+                service.emergency_stop()
+
+        signal.signal(signal.SIGTERM, graceful_stop)
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, emergency_stop)
+
+        run_id = service.prepare()
+        control.mark_running(os.getpid(), run_id)
+        print(
+            f"BYBIT DEMO burn-in {run_id}: {args.hours:.0f}h, "
+            f"capital={args.capital_usdt:.2f} USDT, universe={config.universe}, "
+            "Spot only, isLeverage=0, live disabled."
+        )
+        code = service.run()
+        service.close()
+        service = None
         report = BybitBurnInReport(args.venue_db, args.state_db)
         json_path, md_path, result = report.write(run_id, args.reports_dir)
         print(f"JSON report: {json_path}")
@@ -89,10 +110,16 @@ def main() -> int:
         print(f"Operational verdict: {result['verdict']['operational']}")
         print(f"Edge verdict: {result['verdict']['edge']}")
         print("Strategy proven: NO")
+        control.mark_stopped(f"run {run_id} exited with code {code}")
         return code
     except (BrokerError, RuntimeError, ValueError) as exc:
+        control.mark_stopped(str(exc))
         print(f"Bybit Demo burn-in refused/failed: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if service is not None:
+            service.close()
+        control.close()
 
 
 if __name__ == "__main__":
