@@ -1,9 +1,13 @@
 """Authenticated API for the standalone Trade mobile app.
 
-Trading stays on the server. The phone can be suspended or closed without
-stopping the Streamlit/engine process. This service exposes durable dashboard
-state and registers Expo push tokens for server-side fill/safety notifications.
-It intentionally does not add a second order-entry or live-unlock path.
+Trading stays on the server. The phone can be suspended or closed without stopping
+the Streamlit/engine process. This service exposes durable dashboard state and
+registers Expo push tokens for server-side fill/safety notifications. It intentionally
+does not add a second order-entry or live-unlock path.
+
+The API database and push-observation database may be different. Production keeps
+existing mobile tokens/auth state in ``MOBILE_API_DB_PATH`` while the notifier can
+watch the dedicated Bybit Demo engine through ``MOBILE_PUSH_SOURCE_DB_PATH``.
 """
 
 from __future__ import annotations
@@ -22,25 +26,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from config import APP_NAME, DEFAULT_DB_PATH
-from crypto_engine import (
-    CRYPTO_ENGINE_STATUS_KEY,
-    CRYPTO_KILL_SWITCH_KEY,
-    CRYPTO_LAST_SIGNALS_KEY,
-)
-from mobile_push import (
-    MobilePushNotifier,
-    get_push_tokens,
-    register_push_token,
-    unregister_push_token,
-)
+from crypto_engine import CRYPTO_ENGINE_STATUS_KEY, CRYPTO_KILL_SWITCH_KEY, CRYPTO_LAST_SIGNALS_KEY
+from mobile_push import MobilePushNotifier, get_push_tokens, register_push_token, unregister_push_token
 from state_store import StateStore
 from trade_engine import ENGINE_STATUS_KEY, KILL_SWITCH_KEY, LAST_SIGNAL_KEY
-
 
 API_VERSION = "2"
 MIN_TOKEN_LENGTH = 32
 DEFAULT_MAX_EQUITY_POINTS = 500
-
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -77,9 +70,7 @@ def _configured_token(explicit: Optional[str]) -> str:
     token = explicit if explicit is not None else os.environ.get("MOBILE_API_TOKEN", "")
     token = token.strip()
     if token and len(token) < MIN_TOKEN_LENGTH:
-        raise ValueError(
-            f"MOBILE_API_TOKEN must contain at least {MIN_TOKEN_LENGTH} characters."
-        )
+        raise ValueError(f"MOBILE_API_TOKEN must contain at least {MIN_TOKEN_LENGTH} characters.")
     return token
 
 
@@ -99,34 +90,38 @@ def create_mobile_api(
 ) -> FastAPI:
     """Build the mobile API with injectable persistence/auth for tests.
 
-    If ``store`` is omitted the service owns a StateStore instance and closes it
-    on shutdown. If no API token is configured, protected endpoints fail closed.
-    The optional push observer reads durable state only and never calls Alpaca.
+    If ``store`` is omitted the service owns a StateStore instance and closes it on
+    shutdown. If no API token is configured, protected endpoints fail closed. The
+    optional push observer reads durable state only and never calls a broker.
     """
 
     configured_token = _configured_token(token)
     owns_store = store is None
-    resolved_store = store or StateStore(
-        os.environ.get("MOBILE_API_DB_PATH", DEFAULT_DB_PATH)
-    )
-    resolved_dashboard_url = (
-        dashboard_url
-        if dashboard_url is not None
-        else os.environ.get("MOBILE_DASHBOARD_URL", "").strip()
-    )
-    push_enabled = (
-        _env_bool("MOBILE_PUSH_ENABLED", True)
-        if enable_push_notifier is None
-        else enable_push_notifier
-    )
+    api_db_path = os.environ.get("MOBILE_API_DB_PATH", DEFAULT_DB_PATH)
+    resolved_store = store or StateStore(api_db_path)
+    resolved_dashboard_url = dashboard_url if dashboard_url is not None else os.environ.get("MOBILE_DASHBOARD_URL", "").strip()
+    push_enabled = _env_bool("MOBILE_PUSH_ENABLED", True) if enable_push_notifier is None else enable_push_notifier
     push_interval = float(os.environ.get("MOBILE_PUSH_POLL_SECONDS", "10"))
+
+    source_path = os.environ.get("MOBILE_PUSH_SOURCE_DB_PATH", "").strip()
+    preference_db_path = os.environ.get("MOBILE_PUSH_PREFERENCE_DB_PATH", "").strip() or None
+    push_source_store = resolved_store
+    owns_push_source = False
+    if store is None and source_path and os.path.abspath(source_path) != os.path.abspath(api_db_path):
+        push_source_store = StateStore(source_path)
+        owns_push_source = True
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         notifier: Optional[MobilePushNotifier] = None
         task: Optional[asyncio.Task] = None
         if push_enabled:
-            notifier = MobilePushNotifier(resolved_store, push_interval)
+            notifier = MobilePushNotifier(
+                push_source_store,
+                push_interval,
+                token_store=resolved_store,
+                preference_db_path=preference_db_path,
+            )
             task = asyncio.create_task(notifier.run(), name="mobile-push-notifier")
         try:
             yield
@@ -138,6 +133,8 @@ def create_mobile_api(
                     await asyncio.wait_for(task, timeout=2.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     task.cancel()
+            if owns_push_source:
+                push_source_store.close()
             if owns_store:
                 resolved_store.close()
 
@@ -150,6 +147,7 @@ def create_mobile_api(
         lifespan=lifespan,
     )
     app.state.store = resolved_store
+    app.state.push_source_store = push_source_store
     app.state.mobile_api_token = configured_token
     app.state.dashboard_url = resolved_dashboard_url
     app.state.push_enabled = push_enabled
@@ -165,9 +163,7 @@ def create_mobile_api(
         )
 
     async def require_token(
-        credentials: Annotated[
-            Optional[HTTPAuthorizationCredentials], Depends(_bearer)
-        ],
+        credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(_bearer)],
     ) -> None:
         expected = app.state.mobile_api_token
         if not expected:
@@ -177,8 +173,7 @@ def create_mobile_api(
             )
         presented = (
             credentials.credentials
-            if credentials is not None
-            and credentials.scheme.lower() == "bearer"
+            if credentials is not None and credentials.scheme.lower() == "bearer"
             else ""
         )
         if not presented or not secrets.compare_digest(presented, expected):
@@ -228,41 +223,23 @@ def create_mobile_api(
         }
 
     @app.get("/v1/trades", dependencies=[auth])
-    async def trades(
-        limit: Annotated[int, Query(ge=1, le=100)] = 25,
-    ) -> dict[str, Any]:
+    async def trades(limit: Annotated[int, Query(ge=1, le=100)] = 25) -> dict[str, Any]:
         rows = app.state.store.get_trades(limit=limit)
-        return {
-            "items": _serializable(rows),
-            "count": len(rows),
-            "limit": limit,
-        }
+        return {"items": _serializable(rows), "count": len(rows), "limit": limit}
 
     @app.get("/v1/logs", dependencies=[auth])
-    async def logs(
-        limit: Annotated[int, Query(ge=1, le=100)] = 40,
-    ) -> dict[str, Any]:
+    async def logs(limit: Annotated[int, Query(ge=1, le=100)] = 40) -> dict[str, Any]:
         rows = app.state.store.get_logs(limit=limit)
-        return {
-            "items": _serializable(rows),
-            "count": len(rows),
-            "limit": limit,
-        }
+        return {"items": _serializable(rows), "count": len(rows), "limit": limit}
 
     @app.get("/v1/equity", dependencies=[auth])
-    async def equity(
-        limit: Annotated[int, Query(ge=2, le=DEFAULT_MAX_EQUITY_POINTS)] = 120,
-    ) -> dict[str, Any]:
+    async def equity(limit: Annotated[int, Query(ge=2, le=DEFAULT_MAX_EQUITY_POINTS)] = 120) -> dict[str, Any]:
         latest = app.state.store.get_latest_session()
         if latest is None:
             return {"session_id": None, "items": [], "count": 0}
         points = app.state.store.get_equity_curve(latest["session_id"])
         selected = points[-limit:]
-        return {
-            "session_id": latest["session_id"],
-            "items": _serializable(selected),
-            "count": len(selected),
-        }
+        return {"session_id": latest["session_id"], "items": _serializable(selected), "count": len(selected)}
 
     @app.post("/v1/devices/push", dependencies=[auth])
     async def add_push_device(payload: PushRegistration) -> dict[str, Any]:
@@ -274,25 +251,17 @@ def create_mobile_api(
         try:
             tokens = register_push_token(app.state.store, payload.token)
         except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=str(exc),
-            ) from exc
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
         return {"registered": True, "device_count": len(tokens)}
 
     @app.delete("/v1/devices/push", dependencies=[auth])
-    async def remove_push_device(
-        token_value: Annotated[str, Body(embed=True, alias="token")],
-    ) -> dict[str, Any]:
+    async def remove_push_device(token_value: Annotated[str, Body(embed=True, alias="token")]) -> dict[str, Any]:
         tokens = unregister_push_token(app.state.store, token_value)
         return {"registered": False, "device_count": len(tokens)}
 
     @app.get("/v1/devices/push", dependencies=[auth])
     async def push_device_status() -> dict[str, Any]:
-        return {
-            "enabled": app.state.push_enabled,
-            "device_count": len(get_push_tokens(app.state.store)),
-        }
+        return {"enabled": app.state.push_enabled, "device_count": len(get_push_tokens(app.state.store))}
 
     return app
 
