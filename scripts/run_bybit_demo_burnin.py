@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Run the frozen Bybit Spot Demo operational burn-in.
 
-Examples:
+Normal operators start this service from the dashboard. These commands remain the
+exact service equivalents used for acceptance/recovery:
+
     python scripts/run_bybit_demo_burnin.py --hours 72
     python scripts/run_bybit_demo_burnin.py --hours 120
 
@@ -14,12 +16,15 @@ import argparse
 import os
 import signal
 import sys
+import threading
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from broker import BrokerError
+from bybit_active_report import ActiveSafeBybitBurnInReport
 from bybit_burnin import (
     BybitBurnInConfig,
     BybitDemoBurnInService,
@@ -28,6 +33,8 @@ from bybit_burnin import (
 from bybit_operator_control import OperatorControl
 from bybit_report import BybitBurnInReport
 from quant.exits import ExitPolicyConfig
+
+DAILY_REPORT_SECONDS = 24 * 60 * 60
 
 
 def main() -> int:
@@ -51,15 +58,13 @@ def main() -> int:
         action="store_true",
         help=(
             "Exercise the existing smart-exit consumers during Demo. This enables "
-            "policy gates but does not tune their thresholds and is not a profitability claim."
+            "policy gates but does not tune thresholds and is not a profitability claim."
         ),
     )
     args = parser.parse_args()
 
     policy = ExitPolicyConfig()
     if args.enable_researched_smart_exits:
-        # Existing, already-researchable policy thresholds only. The burn-in runner
-        # never searches or changes them to make a desired return appear.
         policy = replace(
             policy,
             enable_partial_take=True,
@@ -75,8 +80,14 @@ def main() -> int:
         strategy_capital_budget_usdt=args.capital_usdt,
         exit_policy=policy,
     )
-    control = OperatorControl(args.control_db)
+    control = OperatorControl(
+        args.control_db,
+        engine_db=args.state_db,
+        venue_db=args.venue_db,
+    )
     service = None
+    daily_stop = threading.Event()
+    daily_thread = None
     run_id = None
     try:
         key, secret = credentials_from_environment()
@@ -95,6 +106,8 @@ def main() -> int:
 
         def emergency_stop(_signum, _frame):
             if service is not None:
+                # Service arms its normal engine kill switch; the dashboard path also
+                # persists it before sending this signal.
                 service.emergency_stop()
 
         signal.signal(signal.SIGTERM, graceful_stop)
@@ -103,14 +116,45 @@ def main() -> int:
 
         run_id = service.prepare()
         control.mark_running(os.getpid(), run_id)
+
+        def daily_reports() -> None:
+            reporter = ActiveSafeBybitBurnInReport(args.venue_db, args.state_db)
+            day = 1
+            while not daily_stop.wait(DAILY_REPORT_SECONDS):
+                try:
+                    label = f"day_{day}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                    json_path, md_path, _ = reporter.write_snapshot(
+                        run_id,
+                        args.reports_dir,
+                        label=label,
+                    )
+                    print(f"Daily JSON report: {json_path}", flush=True)
+                    print(f"Daily Markdown report: {md_path}", flush=True)
+                    day += 1
+                except Exception as exc:  # reporting must not place/manage orders
+                    print(f"Daily report generation failed: {exc}", file=sys.stderr, flush=True)
+
+        daily_thread = threading.Thread(
+            target=daily_reports,
+            name=f"bybit-daily-report-{run_id[-8:]}",
+            daemon=True,
+        )
+        daily_thread.start()
+
         print(
             f"BYBIT DEMO burn-in {run_id}: {args.hours:.0f}h, "
             f"capital={args.capital_usdt:.2f} USDT, universe={config.universe}, "
-            "Spot only, isLeverage=0, live disabled."
+            "Spot only, isLeverage=0, live disabled. Dashboard/backend process ownership active.",
+            flush=True,
         )
         code = service.run()
         service.close()
         service = None
+
+        daily_stop.set()
+        if daily_thread is not None:
+            daily_thread.join(2.0)
+
         report = BybitBurnInReport(args.venue_db, args.state_db)
         json_path, md_path, result = report.write(run_id, args.reports_dir)
         print(f"JSON report: {json_path}")
@@ -125,6 +169,9 @@ def main() -> int:
         print(f"Bybit Demo burn-in refused/failed: {exc}", file=sys.stderr)
         return 2
     finally:
+        daily_stop.set()
+        if daily_thread is not None and daily_thread.is_alive():
+            daily_thread.join(2.0)
         if service is not None:
             service.close()
         control.close()
