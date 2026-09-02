@@ -11,6 +11,6 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt -r requirements-mobile-api.txt
 
 COPY . .
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/reports /app/logs
 
-EXPOSE 8000 8501
+EXPOSE 8000 8501 8502
