@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -22,7 +23,42 @@ def _runner_root(tmp_path: Path) -> Path:
     return root
 
 
-def test_dashboard_start_freezes_selected_universe_without_secrets(tmp_path, monkeypatch):
+def _control(tmp_path: Path) -> OperatorControl:
+    return OperatorControl(
+        str(tmp_path / "operator.db"),
+        engine_db=str(tmp_path / "engine.db"),
+        venue_db=str(tmp_path / "venue.db"),
+        credentials_path=str(tmp_path / "secrets" / "bybit.json"),
+    )
+
+
+def test_dashboard_credential_vault_is_server_file_not_sqlite(tmp_path):
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    try:
+        assert control.credentials_status()["configured"] is False
+        control.save_demo_credentials(key, secret)
+        status = control.credentials_status()
+        assert status["configured"] is True
+        assert status["source"] == "dashboard_vault"
+        assert control.load_demo_credentials() == (key, secret)
+        vault = tmp_path / "secrets" / "bybit.json"
+        assert vault.exists()
+        if os.name == "posix":
+            assert vault.stat().st_mode & 0o777 == 0o600
+        db_bytes = (tmp_path / "operator.db").read_bytes()
+        assert key.encode() not in db_bytes
+        assert secret.encode() not in db_bytes
+        assert key not in json.dumps(status)
+        assert secret not in json.dumps(status)
+        control.clear_saved_demo_credentials()
+        assert not vault.exists()
+    finally:
+        control.close()
+
+
+def test_dashboard_start_freezes_selected_universe_and_passes_secrets_only_in_child_env(tmp_path, monkeypatch):
     root = _runner_root(tmp_path)
     captured = {}
 
@@ -32,12 +68,11 @@ def test_dashboard_start_freezes_selected_universe_without_secrets(tmp_path, mon
         return _Process()
 
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
-    control = OperatorControl(
-        str(tmp_path / "operator.db"),
-        engine_db=str(tmp_path / "engine.db"),
-        venue_db=str(tmp_path / "venue.db"),
-    )
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
     try:
+        control.save_demo_credentials(key, secret)
         pid = control.start_detached(
             hours=72,
             capital_usdt=750,
@@ -52,10 +87,30 @@ def test_dashboard_start_freezes_selected_universe_without_secrets(tmp_path, mon
         assert "BTC/USD" in command and "SOL/USD" in command
         assert "ETH/USD" not in command
         joined = " ".join(command)
-        assert "BYBIT_DEMO_API_KEY" not in joined
-        assert "BYBIT_DEMO_API_SECRET" not in joined
+        assert key not in joined
+        assert secret not in joined
+        assert "--api-key" not in joined
+        assert "--api-secret" not in joined
         assert "live" not in joined.lower()
+        child_env = captured["kwargs"]["env"]
+        assert child_env["BYBIT_DEMO_API_KEY"] == key
+        assert child_env["BYBIT_DEMO_API_SECRET"] == secret
         assert captured["kwargs"]["start_new_session"] is True
+    finally:
+        control.close()
+
+
+def test_start_refuses_when_demo_credentials_are_missing(tmp_path):
+    root = _runner_root(tmp_path)
+    control = _control(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="credentials are not configured"):
+            control.start_detached(
+                hours=72,
+                capital_usdt=100,
+                symbols=("BTC/USD",),
+                repo_root=str(root),
+            )
     finally:
         control.close()
 
@@ -63,12 +118,9 @@ def test_dashboard_start_freezes_selected_universe_without_secrets(tmp_path, mon
 def test_emergency_latch_blocks_restart_until_explicit_ack(tmp_path, monkeypatch):
     root = _runner_root(tmp_path)
     monkeypatch.setattr(OperatorControl, "_owned_backend_alive", classmethod(lambda cls, pid: False))
-    control = OperatorControl(
-        str(tmp_path / "operator.db"),
-        engine_db=str(tmp_path / "engine.db"),
-        venue_db=str(tmp_path / "venue.db"),
-    )
+    control = _control(tmp_path)
     try:
+        control.save_demo_credentials("demo-key-12345678", "demo-secret-12345678")
         control.emergency_stop()
         kill = control.read_kill_switch()
         assert kill and kill["armed"] is True
@@ -97,6 +149,7 @@ def test_corrupt_kill_switch_fails_closed(tmp_path):
         str(tmp_path / "operator.db"),
         engine_db=str(engine),
         venue_db=str(tmp_path / "venue.db"),
+        credentials_path=str(tmp_path / "secrets" / "bybit.json"),
     )
     try:
         assert control.read_kill_switch()["armed"] is True
@@ -109,10 +162,7 @@ def test_dashboard_projection_uses_engine_authoritative_current_stop(tmp_path):
     venue = tmp_path / "venue.db"
     e = sqlite3.connect(engine)
     e.execute("CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT)")
-    e.execute(
-        "INSERT INTO kv VALUES(?,?)",
-        ("bot_position:BTC/USD", json.dumps({"stop_price": 101.25})),
-    )
+    e.execute("INSERT INTO kv VALUES(?,?)", ("bot_position:BTC/USD", json.dumps({"stop_price": 101.25})))
     e.commit()
     e.close()
     v = sqlite3.connect(venue)
@@ -126,7 +176,10 @@ def test_dashboard_projection_uses_engine_authoritative_current_stop(tmp_path):
     v.close()
 
     control = OperatorControl(
-        str(tmp_path / "operator.db"), engine_db=str(engine), venue_db=str(venue)
+        str(tmp_path / "operator.db"),
+        engine_db=str(engine),
+        venue_db=str(venue),
+        credentials_path=str(tmp_path / "secrets" / "bybit.json"),
     )
     try:
         control.status()
@@ -140,3 +193,15 @@ def test_dashboard_projection_uses_engine_authoritative_current_stop(tmp_path):
         assert value == pytest.approx(101.25)
     finally:
         v.close()
+
+
+def test_notification_preference_is_persistent_and_contains_no_credentials(tmp_path):
+    control = _control(tmp_path)
+    try:
+        assert control.notifications_enabled() is True
+        control.set_notifications_enabled(False)
+        assert control.notifications_enabled() is False
+        control.set_notifications_enabled(True)
+        assert control.notifications_enabled() is True
+    finally:
+        control.close()
