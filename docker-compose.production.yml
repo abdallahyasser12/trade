@@ -19,6 +19,7 @@ services:
       - trade_data:/app/data
       - trade_reports:/app/reports
       - trade_logs:/app/logs
+      - trade_secrets:/app/secrets
     restart: unless-stopped
     healthcheck:
       test:
@@ -121,5 +122,6 @@ volumes:
   trade_data:
   trade_reports:
   trade_logs:
+  trade_secrets:
   caddy_data:
   caddy_config:
