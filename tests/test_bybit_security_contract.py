@@ -26,23 +26,38 @@ def test_demo_smoke_has_no_live_selector():
     assert "BYBIT_LIVE" not in smoke
 
 
-def test_operator_ui_never_reads_or_displays_secret_value():
+def test_operator_ui_uses_password_fields_and_clears_credential_form():
     ui = _read("bybit_operator_ui.py")
-    # Presence checks may use the environment variable names; the value must never
-    # be copied into Streamlit state or rendered.
-    assert "BYBIT_DEMO_API_SECRET" in ui
-    assert "os.getenv(\"BYBIT_DEMO_API_SECRET\")" in ui
+    assert 'type="password"' in ui
+    assert 'clear_on_submit=True' in ui
+    assert "Test & Save" in ui
+    assert "Test saved connection" in ui
     assert "st.session_state" not in ui
-    assert "api_secret =" not in ui
-    assert "api_key =" not in ui
+    assert "BYBIT_LIVE_API_KEY" not in ui
+    assert "BYBIT_LIVE_API_SECRET" not in ui
 
 
 def test_operator_child_process_never_accepts_secret_arguments():
     control = _read("bybit_operator_control.py")
-    assert "BYBIT_DEMO_API_KEY" not in control
-    assert "BYBIT_DEMO_API_SECRET" not in control
     assert '"--api-key"' not in control
     assert '"--api-secret"' not in control
+    assert "child_env[\"BYBIT_DEMO_API_KEY\"]" in control
+    assert "child_env[\"BYBIT_DEMO_API_SECRET\"]" in control
+    assert "json.dump(payload" in control
+    assert "0o600" in control
+    assert "BYBIT_LIVE_API_KEY" not in control
+    assert "BYBIT_LIVE_API_SECRET" not in control
+
+
+def test_dashboard_saved_secret_volume_is_isolated_from_other_services():
+    compose = _read("docker-compose.production.yml")
+    dashboard = compose.split("  research-dashboard:", 1)[0]
+    remainder = compose.split("  research-dashboard:", 1)[1]
+    assert "trade_secrets:/app/secrets" in dashboard
+    assert "trade_secrets:/app/secrets" not in remainder
+    assert "trade_secrets:" in compose
+    ignore = _read(".gitignore")
+    assert "secrets/" in ignore
 
 
 def test_bybit_runtime_contains_no_margin_or_leverage_toggle_endpoint_calls():
@@ -53,6 +68,7 @@ def test_bybit_runtime_contains_no_margin_or_leverage_toggle_endpoint_calls():
             "bybit_burnin.py",
             "bybit_management.py",
             "bybit_market_data.py",
+            "bybit_entry_intelligence.py",
         )
     )
     banned_calls = (
@@ -73,6 +89,14 @@ def test_production_root_is_simple_bybit_dashboard_and_research_is_separate():
     assert "--server.baseUrlPath=research" in compose
     assert "research-dashboard:8502" in caddy
     assert "reverse_proxy dashboard:8501" in caddy
+
+
+def test_mobile_push_observes_bybit_db_but_never_mounts_dashboard_secret_vault():
+    compose = _read("docker-compose.production.yml")
+    assert "MOBILE_PUSH_SOURCE_DB_PATH: /app/data/bybit_demo_trading.db" in compose
+    assert "MOBILE_PUSH_PREFERENCE_DB_PATH: /app/data/bybit_operator.db" in compose
+    mobile = compose.split("  mobile-api:", 1)[1].split("  caddy:", 1)[0]
+    assert "/app/secrets" not in mobile
 
 
 def test_environment_template_warns_against_withdrawal_permission():
