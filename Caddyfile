@@ -5,6 +5,10 @@
         reverse_proxy mobile-api:8000
     }
 
+    handle /research* {
+        reverse_proxy research-dashboard:8502
+    }
+
     handle {
         reverse_proxy dashboard:8501
     }
