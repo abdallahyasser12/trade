@@ -7,8 +7,9 @@ strategy, Quant Desk component, or risk model may concatenate/extract venue symb
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
-from typing import Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -43,7 +44,13 @@ class CanonicalInstrument:
     strategy_symbol: str
 
     def __post_init__(self) -> None:
-        for name in ("base_asset", "quote_asset", "canonical_symbol", "venue_symbol", "strategy_symbol"):
+        for name in (
+            "base_asset",
+            "quote_asset",
+            "canonical_symbol",
+            "venue_symbol",
+            "strategy_symbol",
+        ):
             value = getattr(self, name)
             if not value or value != value.upper():
                 raise ValueError(f"{name} must be non-empty uppercase text")
@@ -94,9 +101,15 @@ class InstrumentMetadata:
 
 
 _BYBIT_DEFAULTS: Mapping[str, CanonicalInstrument] = {
-    "BTC/USD": CanonicalInstrument("BTC", "USDT", "BTC/USDT", "BTCUSDT", CryptoVenue.BYBIT, "BTC/USD"),
-    "ETH/USD": CanonicalInstrument("ETH", "USDT", "ETH/USDT", "ETHUSDT", CryptoVenue.BYBIT, "ETH/USD"),
-    "SOL/USD": CanonicalInstrument("SOL", "USDT", "SOL/USDT", "SOLUSDT", CryptoVenue.BYBIT, "SOL/USD"),
+    "BTC/USD": CanonicalInstrument(
+        "BTC", "USDT", "BTC/USDT", "BTCUSDT", CryptoVenue.BYBIT, "BTC/USD"
+    ),
+    "ETH/USD": CanonicalInstrument(
+        "ETH", "USDT", "ETH/USDT", "ETHUSDT", CryptoVenue.BYBIT, "ETH/USD"
+    ),
+    "SOL/USD": CanonicalInstrument(
+        "SOL", "USDT", "SOL/USDT", "SOLUSDT", CryptoVenue.BYBIT, "SOL/USD"
+    ),
 }
 
 DEFAULT_BYBIT_SPOT_UNIVERSE = tuple(_BYBIT_DEFAULTS)
@@ -106,8 +119,6 @@ def bybit_instrument(symbol: str) -> CanonicalInstrument:
     token = str(symbol).upper().strip()
     if token in _BYBIT_DEFAULTS:
         return _BYBIT_DEFAULTS[token]
-    # Accept canonical and venue forms only for configured liquid pairs; this is
-    # deliberately not an implicit universe-expansion mechanism.
     for instrument in _BYBIT_DEFAULTS.values():
         if token in {instrument.canonical_symbol, instrument.venue_symbol}:
             return instrument
@@ -122,8 +133,6 @@ def build_bybit_instrument(base_asset: str, quote_asset: str = "USDT") -> Canoni
     quote = quote_asset.upper().strip()
     if not base.isalnum() or not quote.isalnum() or base == quote:
         raise ValueError("Invalid base/quote assets")
-    # The legacy strategy surface uses /USD as a compatibility label. Only the
-    # boundary knows the actual settlement asset is USDT.
     strategy = f"{base}/USD" if quote == "USDT" else f"{base}/{quote}"
     return CanonicalInstrument(
         base_asset=base,
@@ -137,29 +146,93 @@ def build_bybit_instrument(base_asset: str, quote_asset: str = "USDT") -> Canoni
 
 @runtime_checkable
 class InstrumentMetadataProvider(Protocol):
-    def get_instrument_metadata(self, symbol: str, *, force_refresh: bool = False) -> InstrumentMetadata: ...
+    def get_instrument_metadata(
+        self, symbol: str, *, force_refresh: bool = False
+    ) -> InstrumentMetadata: ...
 
 
 @runtime_checkable
 class CryptoBroker(Protocol):
-    @property
-    def environment(self) -> CryptoExecutionEnvironment: ...
+    """Minimum broker contract required by broker-backed crypto engines.
 
+    The method names intentionally match the established engine surface so Alpaca can
+    remain backward-compatible while Bybit implements the same canonical contract.
+    """
+
+    environment: CryptoExecutionEnvironment
+    instrument_provider: InstrumentMetadataProvider
+
+    def verify_environment(self) -> dict[str, Any]: ...
     def verify_account(self) -> AccountInfo: ...
     def get_account(self) -> AccountInfo: ...
-    def verify_crypto_assets(self, symbols: list[str] | tuple[str, ...]) -> dict[str, AssetInfo]: ...
+    def verify_crypto_assets(
+        self, symbols: list[str] | tuple[str, ...]
+    ) -> dict[str, AssetInfo]: ...
+    def get_asset(self, symbol: str) -> AssetInfo: ...
+
+    def submit_crypto_market_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        client_order_id: str,
+        *,
+        trade_increment: float,
+        min_order_size: float,
+        reference_price: Optional[float] = None,
+    ) -> OrderRecord: ...
+
+    def submit_crypto_stop_limit_order(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        limit_price: float,
+        client_order_id: str,
+        *,
+        trade_increment: float,
+        min_order_size: float,
+        price_increment: float,
+    ) -> OrderRecord: ...
+
+    def amend_protection(
+        self,
+        client_order_id: str,
+        *,
+        qty: float,
+        stop_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+    ) -> OrderRecord: ...
+
     def get_position(self, symbol: str) -> Optional[BrokerPosition]: ...
     def list_positions(self) -> list[BrokerPosition]: ...
     def list_open_orders(self, symbol: Optional[str] = None) -> list[OrderRecord]: ...
     def get_order(self, broker_order_id: str) -> OrderRecord: ...
     def get_order_by_client_id(self, client_order_id: str) -> Optional[OrderRecord]: ...
     def cancel_order(self, broker_order_id: str) -> None: ...
-    def broker_health(self) -> dict: ...
+
+    def sync_bot_executions(self, symbol: Optional[str] = None) -> int: ...
+    def bot_owned_quantity(self, symbol: str) -> float: ...
+    def broker_health(self) -> dict[str, Any]: ...
 
 
 @runtime_checkable
 class CryptoMarketDataFeed(Protocol):
+    """Canonical market-data contract above the venue provider boundary."""
+
     def set_interrupt_event(self, event) -> None: ...
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+
+    def get_bars(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: Optional[datetime] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame: ...
+
     def get_recent_bars(
         self,
         symbol: str,
@@ -169,5 +242,11 @@ class CryptoMarketDataFeed(Protocol):
         now=None,
         tolerance_seconds: float = 5.0,
     ) -> pd.DataFrame: ...
-    def get_latest_quotes(self, symbols: tuple[str, ...] | list[str]) -> dict[str, CryptoQuote]: ...
-    def market_health(self) -> dict: ...
+
+    def get_latest_quotes(
+        self, symbols: tuple[str, ...] | list[str]
+    ) -> dict[str, CryptoQuote]: ...
+
+    def market_context(self, symbol: str) -> Any: ...
+    def recent_trades(self, symbol: str, limit: int = 60) -> list[dict[str, Any]]: ...
+    def market_health(self) -> dict[str, Any]: ...
