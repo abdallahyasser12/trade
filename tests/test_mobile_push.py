@@ -65,6 +65,58 @@ def test_snapshot_reads_durable_engine_and_trade_state():
         store.close()
 
 
+def test_empty_ledger_baseline_notifies_first_real_fill():
+    store = StateStore(":memory:")
+    try:
+        before = snapshot(store)
+        assert before["latest_trade"]["id"] == 0
+        store.record_trade(
+            session_id="s",
+            symbol="BTC/USD",
+            action="BUY",
+            qty=0.01,
+            fill_price=100.0,
+            realized_pnl=None,
+            reason="first-fill",
+            signal_snapshot=None,
+            event_key="first-real-fill",
+        )
+        after = snapshot(store)
+        fill_events = [
+            event for event in events_between(before, after)
+            if event.data["kind"] == "trade_fill"
+        ]
+        assert len(fill_events) == 1
+        assert fill_events[0].data["trade_id"] == after["latest_trade"]["id"]
+        assert fill_events[0].data["symbol"] == "BTC/USD"
+    finally:
+        store.close()
+
+
+def test_restart_baseline_does_not_replay_existing_fill():
+    store = StateStore(":memory:")
+    try:
+        store.record_trade(
+            session_id="s",
+            symbol="ETH/USD",
+            action="BUY",
+            qty=0.1,
+            fill_price=200.0,
+            realized_pnl=None,
+            reason="historical",
+            signal_snapshot=None,
+            event_key="historical-fill",
+        )
+        baseline = snapshot(store)
+        immediately_after_restart = snapshot(store)
+        assert all(
+            event.data["kind"] != "trade_fill"
+            for event in events_between(baseline, immediately_after_restart)
+        )
+    finally:
+        store.close()
+
+
 def test_events_cover_engine_transition_safety_lock_and_new_fill():
     previous = {
         "stock_status": {"state": "STOPPED", "account_mode": "paper"},
@@ -98,7 +150,7 @@ def test_events_cover_engine_transition_safety_lock_and_new_fill():
     assert any("loss limit" in event.body for event in events)
 
 
-def test_initial_snapshot_does_not_generate_fill_without_previous_id():
+def test_manual_none_baseline_remains_non_replaying():
     previous = {
         "stock_status": {},
         "crypto_status": {},
