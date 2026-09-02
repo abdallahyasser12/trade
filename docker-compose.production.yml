@@ -84,6 +84,8 @@ services:
       MOBILE_API_DB_PATH: /app/data/trading_bot.db
       MOBILE_DASHBOARD_URL: https://${TRADE_DOMAIN}
       MOBILE_PUSH_ENABLED: "true"
+      MOBILE_PUSH_SOURCE_DB_PATH: /app/data/bybit_demo_trading.db
+      MOBILE_PUSH_PREFERENCE_DB_PATH: /app/data/bybit_operator.db
     volumes:
       - trade_data:/app/data
     restart: unless-stopped
