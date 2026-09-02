@@ -30,6 +30,7 @@ from bybit_burnin import (
     BybitDemoBurnInService,
     credentials_from_environment,
 )
+from bybit_entry_intelligence import wire_bybit_quality_layers
 from bybit_operator_control import OperatorControl
 from bybit_report import BybitBurnInReport
 from quant.exits import ExitPolicyConfig
@@ -99,6 +100,11 @@ def main() -> int:
             venue_db=args.venue_db,
             quant_db=args.quant_db,
         )
+        # Bybit-specific quality is negative-only and sits on top of the existing
+        # EvidenceQuantScanner. It adds live depth/impact/target-room rejection and
+        # feeds the accepted target plan into the existing TradeManagementPolicy.
+        # It does not create a second strategy or a second exit system.
+        wire_bybit_quality_layers(service)
 
         def graceful_stop(_signum, _frame):
             if service is not None:
@@ -106,8 +112,6 @@ def main() -> int:
 
         def emergency_stop(_signum, _frame):
             if service is not None:
-                # Service arms its normal engine kill switch; the dashboard path also
-                # persists it before sending this signal.
                 service.emergency_stop()
 
         signal.signal(signal.SIGTERM, graceful_stop)
@@ -131,7 +135,7 @@ def main() -> int:
                     print(f"Daily JSON report: {json_path}", flush=True)
                     print(f"Daily Markdown report: {md_path}", flush=True)
                     day += 1
-                except Exception as exc:  # reporting must not place/manage orders
+                except Exception as exc:
                     print(f"Daily report generation failed: {exc}", file=sys.stderr, flush=True)
 
         daily_thread = threading.Thread(
