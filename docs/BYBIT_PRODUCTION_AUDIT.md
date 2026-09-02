@@ -6,93 +6,76 @@
 
 ## Executive verdict
 
-The repository already has a substantial production-oriented trading architecture: durable SQLite state, deterministic economic intent, broker-truth reconciliation, protective-order recovery, a Quant Desk scanner, lifecycle promotion/degradation, portfolio/risk gating, causal Edge Intelligence, hold/exit intelligence, research simulation, mobile support, and CI coverage. The correct integration seam is the broker/data-provider boundary plus a Bybit-specific service runtime.
+The repository already had a substantial production-oriented trading architecture: durable SQLite state, deterministic economic intent, broker-truth reconciliation, protective-order recovery, a Quant Desk scanner, lifecycle promotion/degradation, portfolio/risk gating, causal Edge Intelligence, hold/exit intelligence, research simulation, mobile support, and CI definitions. The correct integration seam was the broker/data-provider boundary plus a Bybit-specific service runtime.
 
-The implementation must **not** replace `CryptoTradeEngine`, `QuantControlledCryptoTradeEngine`, `EvidenceQuantScanner`, `LifecycleManager`, `CryptoRiskManager`, `TradeManagementPolicy`, or the existing research stack. The Bybit runtime should reuse them and add venue-specific ownership, normalization, WebSocket, rate-limit, clock-skew, and burn-in controls below/around those existing boundaries.
+The implementation therefore preserves `CryptoTradeEngine`, `QuantControlledCryptoTradeEngine`, `EvidenceQuantScanner`, `LifecycleManager`, `CryptoRiskManager`, `TradeManagementPolicy`, and the existing research stack. Bybit-specific behavior lives below/around those boundaries: venue ownership, normalization, public/private WebSockets, rate-limit/clock safety, Demo isolation, multi-level liquidity/impact gating, target-room planning, burn-in evidence, and the simple operator control plane.
 
-The largest production gaps found at the audited base are:
+## Audited gaps and closure status
 
-1. Crypto broker/data-feed types and environment checks are explicitly Alpaca-shaped.
-2. `BTC/USD`-style strategy symbols are also used as venue symbols; no explicit instrument mapping object exists.
-3. Alpaca positions are treated as broker-side inventory. Bybit Spot needs a bot-owned execution ledger so manual wallet holdings are never adopted.
-4. The parent production crypto engine executes a plain ATR stop ratchet; the existing `TradeManagementPolicy` / hold intelligence is research-measurable but is not fully production-executable.
-5. Market data is REST/poll oriented and lacks Bybit public/private WebSocket supervision and microstructure snapshots.
-6. There is no Bybit Demo burn-in identity/event/report store, Demo/live isolation gate, or Bybit operator dashboard.
-7. The current Streamlit application is a combined research/operator surface and is too complex for routine burn-in operation.
+1. **Alpaca-shaped broker/data assumptions — CLOSED.** Venue-neutral contracts and explicit Bybit adapters now isolate SDK/venue semantics.
+2. **Implicit `BTC/USD` → venue symbol assumptions — CLOSED.** Canonical instruments map strategy, canonical and Bybit symbols explicitly.
+3. **Whole-wallet holdings vs bot ownership — CLOSED.** Bybit execution IDs and order mappings reconstruct only proven bot-owned inventory; manual holdings are not adopted/sold.
+4. **`TradeManagementPolicy` research/production gap — CLOSED for Bybit.** The Bybit path executes the existing policy; the old strategy ATR ratchet is neutralized there.
+5. **REST-only / missing Bybit microstructure — CLOSED.** Public Spot WS + private Demo WS + REST reconciliation are implemented; multi-level book context is a negative-only entry-quality gate.
+6. **Missing Demo burn-in identity/report/runtime — CLOSED.** 72h/120h frozen runs, daily snapshots, final reports, health samples and deterministic resume rules are implemented.
+7. **Research-heavy UI as operator surface — CLOSED.** Production `/` is the simple Bybit Demo dashboard; `/research` preserves the full existing application.
+8. **API-key setup too operationally complex — CLOSED.** SETTINGS provides masked Test / Test & Save / Test saved / Clear controls backed by an isolated server-only credential vault.
+9. **Target-room / market-impact layer not in actual execution path — CLOSED.** `bybit_entry_intelligence.py` is wired before service prepare/start. Target plans freeze only after global ranking and a positive portfolio risk grant, then feed into the existing exit policy.
+10. **Bybit mobile notification source — CLOSED.** The existing push service may observe the Bybit engine DB while device tokens remain in the mobile API DB; dashboard preference controls delivery and never trading.
 
-## Component classification
+## Component classification and implemented disposition
 
-| Component | Classification | Audit finding / required action |
-|---|---|---|
-| `broker.py` | GENERALIZE | Keep `AlpacaBroker` intact. Its normalized `OrderRecord`/account/asset semantics and deterministic retry approach are valuable, but client-ID length, URL checks, positions, and Alpaca SDK types must not leak into Bybit. Add a venue-neutral protocol and a Bybit adapter rather than rewriting Alpaca. |
-| `crypto_engine.py` | REUSE AS-IS + GENERALIZE AT BOUNDARY | Core economic sequencing is strong: persist intent before submit, reconcile timeout by deterministic ID, protect fills, cancel/confirm before exits, and recover after restart. Bybit should satisfy the canonical broker/feed contract. Bybit-specific runtime may extend management without duplicating entry strategy logic. |
-| `crypto_data_feed.py` | REUSE AS-IS / BYBIT ADAPTER REQUIRED | Preserve Alpaca feed. Add a Bybit feed implementing the same completed-bar/latest-quote contract plus public WS order book/trades/kline state. |
-| `crypto_config.py` | GENERALIZE | Preserve existing Alpaca configs. Add venue/environment and strategy-capital-budget configuration without weakening legacy validation. Existing canonical `BASE/USD` symbol validation is venue-specific enough that an explicit instrument mapper is required. |
-| `crypto_models.py` | GENERALIZE | Existing canonical `CryptoQuote`, decisions, engine status, and position state are reusable. Add venue/instrument/health/microstructure/burn-in structures outside the legacy model where possible. |
-| `crypto_strategy.py` | REUSE AS-IS | Strategy should continue to consume canonical bars/quotes and remain unaware of Bybit symbol formatting or SDK objects. |
-| `crypto_risk.py` | REUSE AS-IS + EXTEND INPUT CAP | Preserve sizing/correlation/session-risk logic. Bybit runtime must cap sizing equity/cash to `strategy_capital_budget_usdt`, never full Demo wallet balance. |
-| `intraday_crypto_engine.py` | REUSE AS-IS + GENERALIZE TYPE HINTS | Strict lifecycle and adaptive strategy adapters are the right production path. Bybit should reuse the adaptive strategy/Quant-controlled execution rather than add a second strategy engine. |
-| `advanced_crypto_engine.py` | REUSE AS-IS | Research/advanced strategy orchestration remains available; not the Bybit operator entry point. |
-| `cross_sectional_engine.py` | REUSE AS-IS | Existing cross-sectional logic is useful evidence/ranking infrastructure but does not need venue-specific behavior. |
-| `quant/` | REUSE AS-IS | Quant Desk remains authoritative for evidence and lifecycle. No replacement architecture. |
-| `quant/scanner.py` | REUSE AS-IS | Candidate ranking/portfolio/cost/lifecycle gates must remain in the economic entry path. |
-| `quant/production_runtime.py` | REUSE AS-IS + GENERALIZE ENVIRONMENT MAPPING | Already proves the Quant Scanner is in the broker-backed entry path. Bybit Demo must map to a non-live lifecycle execution stage and must not gain live promotion automatically. |
-| `quant/intraday.py` | REUSE AS-IS | Existing intraday research profile is retained. |
-| `quant/exits.py` | PRODUCTION GAP TO CLOSE | `TradeManagementPolicy` already owns trailing, partial take, break-even, time stop, profit target, smart exit, adaptive trail, and runners. Wire this policy into Bybit production management; do not implement a second exit policy. |
-| `quant/edge_intelligence.py` | REUSE AS-IS + EXTEND CONTEXT | Existing causal profile-aware edge assessment remains the setup-quality layer. Add microstructure/cross-asset observations as explicit causal inputs rather than indicator soup. |
-| `quant/exit_intelligence.py` | PRODUCTION GAP TO CLOSE | Existing causal hold score is advisory and research-measurable. Bybit runtime must feed it into `TradeManagementPolicy` behind explicit gates. |
-| `quant/lifecycle.py` | REUSE AS-IS | Preserve evidence ladder and degradation/quarantine. Bybit Demo burn-in cannot auto-promote to real money. |
-| `quant/store.py` | REUSE AS-IS | Keep Quant Desk evidence persistence separate from venue execution ownership. |
-| `scripts/run_adaptive_intraday_runtime.py` | REUSE AS-IS | Preserve Alpaca path; do not repurpose it for Bybit. |
-| `scripts/run_intraday_runtime.py` | REUSE AS-IS | Preserve existing runtime. Add a separate explicit Bybit Demo burn-in runner. |
-| `scripts/run_*research.py` | REUSE AS-IS | Chronological research remains the only route for parameter evidence. Burn-in must not tune toward a desired daily return. |
-| `state_store.py` | GENERALIZE / EXTEND | Existing WAL + FULL synchronous persistence and engine lock are strong. Add venue-order mapping, venue executions, bot inventory, burn-in identity/events/metrics while retaining backward-compatible schema migrations. |
-| `app.py` | PRODUCTION GAP / KEEP AS ADVANCED | Current Streamlit application is broad and research-heavy. Preserve it as advanced/research functionality; add a simple operator UI as the normal Bybit burn-in surface. |
-| `mobile_api.py` | REUSE AS-IS + EXTEND SAFE STATUS | Keep API; only expose sanitized Bybit status/health if added. Never expose secrets. |
-| `mobile/` | REUSE AS-IS | Do not break existing mobile application; no secret-bearing venue logic belongs in the client. |
-| `tests/` | EXTEND | Preserve all tests and add Bybit unit/contract/integration/chaos tests with injected fake REST/WS clients. No automated live order tests. |
-| `.github/workflows/` | EXTEND | Keep existing CI and add Bybit adapter/burn-in tests to Python/crypto jobs. Demo economic smoke remains explicitly opt-in and credential-gated. |
-| `README.md` and architecture docs | EXTEND | Add Bybit setup, Demo burn-in, architecture, UI, safety, and exact runner commands. |
+| Component | Disposition |
+|---|---|
+| `broker.py` | Preserved; canonical normalized models/IDs remain useful to both paths. |
+| `crypto_engine.py` | Preserved as economic sequencing/protection/reconciliation authority. |
+| `crypto_data_feed.py` | Alpaca path preserved; Bybit adapter added separately. |
+| `crypto_models.py` / config | Existing strategy-facing compatibility retained; venue contracts added outside strategy code. |
+| adaptive crypto strategy | Preserved. No Bybit SDK object or symbol concatenation leaks into it. |
+| `crypto_risk.py` | Preserved; Bybit strategy capital is capped independently of full Demo wallet. |
+| `intraday_crypto_engine.py` | Preserved; accepts a supplied scanner and strict lifecycle context. |
+| `quant/` | Preserved as evidence/lifecycle/ranking/risk authority. |
+| `quant/evidence_scanner.py` | Preserved; Bybit scanner subclasses it with negative-only venue quality gates. |
+| `quant/exits.py` / `quant/exit_intelligence.py` | Existing policy/intelligence is now broker-backed on the Bybit path. |
+| `state_store.py` | Existing engine state preserved; Bybit venue ownership/evidence is kept separately in `bybit_state.py`. |
+| `app.py` | Preserved as Advanced / Research at `/research`. |
+| `bybit_operator_ui.py` | Primary normal operator surface. |
+| mobile API / push | Existing API/token ownership preserved; Bybit source/preference observation added without secret access. |
+| CI/tests | Dedicated Bybit safety/chaos/credential/target/notification tests precede the full regression suite. |
 
-## Alpaca assumptions leaking above the broker/data boundary
-
-The following leaks are concrete in the audited source and must be contained rather than copied into Bybit:
-
-- `CryptoTradeEngine` and intraday constructors annotate concrete `AlpacaBroker` / `AlpacaCryptoDataFeed` types.
-- Engine startup compares `CryptoEngineConfig.account_mode` to `broker.account_mode` using Alpaca `PAPER/LIVE` semantics.
-- Startup error text and account checks name Alpaca directly.
-- `crypto_config.py` validates canonical symbols as `BASE/USD`; Bybit venue symbols are `BASEUSDT`.
-- `broker.make_client_order_id()` enforces Alpaca's 48-character contract. Bybit requires its own `orderLinkId` generator/length enforcement.
-- `AssetInfo` is documented as Alpaca-shaped, although its dynamic increments can be reused as a canonical compatibility shape.
-- Parent exposure logic consumes `list_positions()`. A Bybit adapter must define this as bot-owned Spot inventory, not whole-wallet holdings.
-- `AlpacaCryptoDataFeed` uses REST latest quotes and Alpaca timeframe conversion; it cannot provide the required Bybit WS order book/tape state.
-- Alpaca stop/market-order mechanics and Bybit Spot TP/SL/order-filter mechanics differ and must stay inside venue adapters.
-
-## Architecture to preserve
+## Architecture preserved
 
 ```text
-strategy / adaptive intraday hypothesis
+adaptive intraday strategy hypothesis
         ↓
 EvidenceQuantScanner + Edge Intelligence
         ↓
-lifecycle + degradation + portfolio/risk grants
+expected cost / execution-quality gate
         ↓
-CryptoTradeEngine economic sequencing
+Bybit-only stale/gap/depth/impact/target-room demotion gate
+        ↓
+global opportunity ranking
+        ↓
+portfolio correlation / exposure / heat allocation
+        ↓
+CryptoTradeEngine deterministic economic sequencing
         ↓
 venue-neutral crypto broker/feed contract
-        ├── Alpaca adapters (unchanged behavior)
+        ├── Alpaca adapters (preserved)
         └── Bybit V5 Spot adapters
                 ├── public Spot WS: kline/book/trades
-                ├── Demo REST: submit/amend/cancel/query
+                ├── Demo REST: submit/amend/cancel/query/reconcile
                 ├── private Demo WS: order/execution/wallet
-                └── REST reconciliation after uncertainty
+                └── bot-owned execution ledger
+        ↓
+existing TradeManagementPolicy + exit intelligence
 ```
 
-For Bybit Demo, WebSocket order entry is intentionally not implemented. Economic orders are REST-only; private WS is event delivery and REST reconciliation remains authoritative after gaps or uncertain disconnects.
+Bybit Demo WebSocket order entry is intentionally not implemented. Economic orders are REST-only; private WS is event delivery and REST reconciliation remains authoritative after uncertainty.
 
 ## Bybit Spot safety model
 
-Every Bybit economic request must pass one construction invariant immediately before network submission:
+Every Bybit economic request must pass the construction invariant immediately before network submission:
 
 - `category == "spot"`
 - `isLeverage == 0`
@@ -105,15 +88,58 @@ Every Bybit economic request must pass one construction invariant immediately be
 
 The application does not certify religious/Sharia compliance. It only enforces the requested Spot/no-borrow/no-leverage execution boundary and a user-configured permitted universe.
 
-## Smart-exit gap
+## Bybit entry-quality / target model
 
-`quant/exits.py` already contains the correct policy object. `quant/exit_intelligence.py` already provides a causal, profile-aware hold assessment. The Bybit production runtime must translate current persisted position state into `ManagedPosition`, evaluate only completed bars, and execute returned instructions through the existing broker-truth/protection machinery. Partial exits must be reconciled before residual protection is resized. Original quantity and remaining quantity must be persisted so a restart cannot forget partial-taking state.
+The existing adaptive hypothesis still creates the strategy signal. The Bybit layer cannot turn HOLD into BUY and cannot increase expected alpha.
+
+It can reject/demote based on:
+
+- missing/stale/gapped multi-level order-book context;
+- insufficient quote-denominated ask depth;
+- insufficient depth multiple for the estimated notional;
+- excessive conservative impact proxy;
+- adverse order-flow/book imbalance as a liquidity multiplier reduction;
+- insufficient target room after expected round-trip costs.
+
+The target planner combines initial risk, ATR, completed prior structure, recent realized movement and expected costs. Fixed +0.50/+0.75/+1.00 prices are retained only as report/research families.
+
+Candidate target plans are not persisted at candidate-construction time. They freeze only after `ScanReport.executable` confirms a positive portfolio risk grant, preventing rejected opportunities from appearing as accepted target plans in the dashboard.
+
+## Credential/control model
+
+Normal setup is Dashboard → SETTINGS → Connect Bybit Demo.
+
+- fields are password-masked and clear after submit;
+- Test connection is read-only and Demo-only;
+- Test & Save verifies before persisting;
+- saved values use a server-only JSON vault with restrictive permissions;
+- the vault path is Git-ignored;
+- production mounts its secret volume only in the operator dashboard;
+- no credential is written to operator/engine SQLite, reports, logs, URLs or child command arguments;
+- the detached child receives credentials only in its environment;
+- Bybit Live credential names are not read by the Demo operator/runner path.
+
+## Smart-exit closure
+
+`quant/exits.py` remains the single policy object and `quant/exit_intelligence.py` remains the causal hold assessment. The Bybit runtime translates persisted position state into `ManagedPosition`, evaluates completed bars, and executes policy instructions through broker-truth/protection machinery.
+
+The accepted Bybit target plan temporarily specializes the existing policy’s profit-target R/fraction for that managed position; after each management call the original policy object is restored. Partial exits reconcile before residual protection is resized.
 
 ## Burn-in acceptance boundary
 
-A 72–120 hour Bybit Demo run is an **operational acceptance test plus preliminary forward evidence**. It cannot establish durable profitability and must never auto-unlock live trading. Reports must issue two independent verdicts:
+A 72–120 hour Bybit Demo run is an **operational acceptance test plus preliminary forward evidence**. It cannot establish durable profitability and never auto-unlocks live trading. Reports issue two independent verdicts:
 
 - `OPERATIONAL_ACCEPT` / `OPERATIONAL_REJECT`
 - `EDGE_PRELIMINARY_POSITIVE` / `EDGE_INCONCLUSIVE` / `EDGE_PRELIMINARY_NEGATIVE`
 
-Live Bybit construction remains disabled by default and requires a separate explicit future gate/review.
+Live Bybit remains outside this mission.
+
+## Evidence still requiring external execution
+
+Implementation gaps above are closed, but three evidence gates cannot be fabricated:
+
+1. GitHub-hosted Actions must actually receive a runner and execute checkout/install/compile/pytest. Current repository Actions are failing before any step starts.
+2. The Demo economic smoke must be run with real Bybit Demo credentials.
+3. A real 72–120h forward burn-in must elapse and produce the final operational/edge report.
+
+These remain acceptance evidence requirements, not code TODOs.
