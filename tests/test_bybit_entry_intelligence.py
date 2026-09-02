@@ -8,10 +8,12 @@ import pytest
 
 from bybit_entry_intelligence import (
     BybitEntryQualityConfig,
+    BybitEvidenceQuantScanner,
     TargetAwareBybitTradeManagementExecutor,
     _target_plan,
 )
 from bybit_management import BybitTradeManagementExecutor
+from quant.evidence_scanner import EvidenceQuantScanner
 from quant.exits import ExitPolicyConfig, TradeManagementPolicy
 
 
@@ -62,9 +64,68 @@ def test_target_plan_rejects_when_nearby_resistance_leaves_insufficient_room():
     assert plan["target_r"] < 1.0
 
 
-def test_target_aware_executor_feeds_plan_into_existing_policy_only(monkeypatch):
+def test_scanner_freezes_only_executable_target_and_clears_rejected_stale_plan(monkeypatch):
+    good_plan = {
+        "tradeable": True,
+        "target_r": 1.25,
+        "target_fraction": 0.5,
+        "target_price": 102.5,
+    }
+    rejected_plan = {
+        "tradeable": True,
+        "target_r": 1.1,
+        "target_fraction": 0.5,
+        "target_price": 51.0,
+    }
+    btc_candidate = SimpleNamespace(
+        symbol="BTC/USD",
+        timestamp=pd.Timestamp("2026-01-01T00:00:00Z"),
+        strategy_id="crypto_intraday_adaptive",
+        signal_reason="adaptive_pullback_entry",
+        details={"bybit_target_plan": good_plan},
+    )
+    eth_candidate = SimpleNamespace(
+        symbol="ETH/USD",
+        timestamp=pd.Timestamp("2026-01-01T00:00:00Z"),
+        strategy_id="crypto_intraday_adaptive",
+        signal_reason="adaptive_momentum_entry",
+        details={"bybit_target_plan": rejected_plan},
+    )
+    executable = SimpleNamespace(candidate=btc_candidate, risk_allocation_pct=0.15)
+    rejected = SimpleNamespace(candidate=eth_candidate, risk_allocation_pct=0.0)
+    fake_report = SimpleNamespace(
+        executable=[executable],
+        decisions=[executable, rejected],
+    )
+
+    class Store:
+        def __init__(self):
+            self.values = {"bybit_target_plan:ETH/USD": "stale"}
+
+        def set_kv(self, key, value):
+            self.values[key] = value
+
+        def delete_kv(self, key):
+            self.values.pop(key, None)
+
+    store = Store()
+    monkeypatch.setattr(EvidenceQuantScanner, "scan", lambda self, *args, **kwargs: fake_report)
+    scanner = BybitEvidenceQuantScanner.__new__(BybitEvidenceQuantScanner)
+    scanner.target_plan_store = store
+
+    returned = scanner.scan()
+    assert returned is fake_report
+    frozen = json.loads(store.values["bybit_target_plan:BTC/USD"])
+    assert frozen["frozen_for_execution"] is True
+    assert frozen["target_price"] == pytest.approx(102.5)
+    assert frozen["risk_allocation_pct"] == pytest.approx(0.15)
+    assert "bybit_target_plan:ETH/USD" not in store.values
+
+
+def test_target_aware_executor_feeds_frozen_plan_into_existing_policy_only(monkeypatch):
     plan = {
         "tradeable": True,
+        "frozen_for_execution": True,
         "target_r": 1.4,
         "target_fraction": 0.5,
     }
@@ -92,7 +153,9 @@ def test_target_aware_executor_feeds_plan_into_existing_policy_only(monkeypatch)
         original,
         strategy_id="crypto_intraday_adaptive",
     )
-    result = executor.manage_symbol("BTC/USD", pd.DataFrame(), pd.Timestamp("2026-01-01", tz="UTC"))
+    result = executor.manage_symbol(
+        "BTC/USD", pd.DataFrame(), pd.Timestamp("2026-01-01", tz="UTC")
+    )
     assert result == []
     assert observed == {
         "symbol": "BTC/USD",
