@@ -94,6 +94,7 @@ class OperatorControl:
         *,
         hours: int,
         capital_usdt: float,
+        symbols: tuple[str, ...],
         repo_root: Optional[str] = None,
         smart_exits: bool = False,
         log_path: str = DEFAULT_LOG,
@@ -105,6 +106,9 @@ class OperatorControl:
             raise ValueError("Operator burn-in hours must be 72 or 120")
         if capital_usdt <= 0:
             raise ValueError("Capital allocation must be positive")
+        allowed = {"BTC/USD", "ETH/USD", "SOL/USD"}
+        if not symbols or any(symbol not in allowed for symbol in symbols):
+            raise ValueError("Operator universe must be a non-empty subset of BTC/ETH/SOL Spot")
         root = Path(repo_root or Path(__file__).resolve().parent)
         log = Path(log_path)
         if not log.is_absolute():
@@ -117,6 +121,8 @@ class OperatorControl:
             str(hours),
             "--capital-usdt",
             str(float(capital_usdt)),
+            "--symbols",
+            *symbols,
         ]
         if smart_exits:
             command.append("--enable-researched-smart-exits")
