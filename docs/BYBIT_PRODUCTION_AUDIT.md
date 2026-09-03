@@ -22,9 +22,9 @@ The implementation therefore preserves `CryptoTradeEngine`, `QuantControlledCryp
 8. **API-key setup too operationally complex — CLOSED.** SETTINGS provides masked Test / Test & Save / Test saved / Clear controls backed by an isolated server-only credential vault.
 9. **Target-room / market-impact layer not in actual execution path — CLOSED.** `bybit_entry_intelligence.py` is wired before service prepare/start. Target plans freeze only after global ranking and a positive portfolio risk grant, then feed into the existing exit policy.
 10. **Bybit mobile notification source — CLOSED.** Existing push may observe the Bybit engine DB while device tokens remain in the mobile API DB; dashboard preference controls delivery and never trading.
-11. **Economic smoke required CLI/manual coordination — CLOSED.** The production dashboard now exposes an explicit tiny Demo-only smoke and blocks the 72/120h start until it passes for the current credential pair.
-12. **Privileged production dashboards lacked an access gate — CLOSED.** Caddy now requires authenticated operator access for `/` and `/research`, while `/api/*` preserves its independent mobile bearer-token authentication.
-13. **Hosted-runner outage left no single local evidence path — CLOSED in source.** `scripts/run_bybit_acceptance.py` executes the hermetic safety/full regression surface and writes machine/human-readable acceptance evidence.
+11. **Economic smoke required CLI/manual coordination — CLOSED.** The production dashboard exposes an explicit tiny Demo-only smoke and blocks the 72/120h start until it passes for the current credential pair.
+12. **Privileged production dashboards lacked an access gate — CLOSED.** Caddy requires authenticated operator access for `/` and `/research`, while `/api/*` preserves independent mobile bearer-token authentication.
+13. **Hosted-runner outage left no single local evidence path — CLOSED in source.** `scripts/run_bybit_acceptance.py` is the single acceptance command used both locally and by Python CI and emits JSON/Markdown evidence.
 
 ## Component classification and implemented disposition
 
@@ -45,7 +45,7 @@ The implementation therefore preserves `CryptoTradeEngine`, `QuantControlledCryp
 | `bybit_operator_ui.py` | Reusable HOME/MARKETS/PERFORMANCE and credential UI implementation. |
 | `bybit_operator_app.py` | Primary production operator entrypoint with credential-bound Demo-smoke/start acceptance gate. |
 | mobile API / push | Existing API/token ownership preserved; Bybit source/preference observation added without secret access. |
-| CI/tests | Dedicated Bybit safety/chaos/credential/target/smoke/auth/notification tests precede the full regression suite. |
+| CI/tests | Dedicated Bybit safety/chaos/credential/target/smoke/auth/notification coverage plus full regression are executed through one acceptance runner on Python 3.11/3.13. |
 
 ## Architecture preserved
 
@@ -104,7 +104,7 @@ It can reject/demote based on missing/stale/gapped multi-level order-book contex
 
 The target planner combines initial risk, ATR, completed prior structure, recent realized movement and expected costs. Fixed +0.50/+0.75/+1.00 prices are retained only as report/research families.
 
-Candidate target plans are not persisted at candidate-construction time. They freeze only after `ScanReport.executable` confirms a positive portfolio risk grant, preventing rejected opportunities from appearing as accepted target plans in the dashboard.
+Candidate target plans freeze only after `ScanReport.executable` confirms a positive portfolio risk grant, preventing rejected opportunities from appearing as accepted target plans in the dashboard.
 
 ## Credential/control model
 
@@ -119,7 +119,7 @@ Normal setup is Dashboard → SETTINGS → Connect Bybit Demo.
 - the detached child receives credentials only in its environment;
 - Bybit Live credential names are not read by the Demo operator/runner path.
 
-Production browser access is privileged. Caddy authenticates `/` and `/research` over HTTPS with username `operator` and a deployment-supplied `TRADE_DASHBOARD_PASSWORD`; it derives the password hash at startup and fails closed if the password is absent. `/api/*` remains on the mobile API's independent bearer-token boundary.
+Production browser access is privileged. Caddy authenticates `/` and `/research` over HTTPS with username `operator` and deployment-supplied `TRADE_DASHBOARD_PASSWORD`; it derives the password hash at startup and fails closed if absent. `/api/*` remains on the mobile API's independent bearer-token boundary.
 
 ## Demo-smoke acceptance gate
 
@@ -144,15 +144,17 @@ A 72–120 hour Bybit Demo run is an **operational acceptance test plus prelimin
 
 Live Bybit remains outside this mission.
 
-## Repository acceptance evidence
+## Unified repository acceptance evidence
 
-When GitHub-hosted runners are unavailable, the equivalent source-controlled acceptance surface is:
+The source-controlled acceptance command is:
 
 ```bash
 python scripts/run_bybit_acceptance.py
 ```
 
 It runs byte-compilation, the dedicated Bybit/dashboard safety suite, the complete Alpaca/Quant/mobile/Bybit regression suite, tracked-secret checks and Docker Compose validation when Docker is installed, then writes JSON/Markdown evidence under `reports/`.
+
+`.github/workflows/python-ci.yml` invokes this same command on Python 3.11 and 3.13 and uploads the resulting acceptance reports as artifacts. Thus local and CI acceptance cannot silently drift apart.
 
 An optional real Demo-smoke phase remains explicit:
 
@@ -166,7 +168,7 @@ python scripts/run_bybit_acceptance.py \
 
 Implementation gaps above are closed, but three evidence gates cannot be fabricated:
 
-1. A real runner/local acceptance host must execute checkout/install/compile/pytest and produce test totals. GitHub-hosted Actions currently creates jobs but fails before any workflow step starts.
+1. A real runner/local acceptance host must execute install/compile/pytest and produce test totals. GitHub-hosted Actions currently creates jobs but fails before any workflow step starts.
 2. The Demo economic smoke must be run with real Bybit Demo credentials.
 3. A real 72–120h forward burn-in must elapse and produce the final operational/edge report.
 
