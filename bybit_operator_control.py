@@ -2,16 +2,18 @@
 
 The dashboard may accept Bybit *Demo* credentials from an operator, but credentials
 never enter SQLite, reports, logs, URLs, subprocess arguments, or browser-visible
-status payloads.  Saved credentials live in a dedicated server-side JSON vault with
-0600 permissions.  The detached trading backend receives them only in its process
+status payloads. Saved credentials live in a dedicated server-side JSON vault with
+0600 permissions. The detached trading backend receives them only in its process
 environment.
 
-The controller also owns the persistent emergency latch. Arming the kill switch is a
-SQLite write performed *before* signalling the engine, so a lost signal or process
-crash cannot allow a later restart to silently resume economic activity.
+The controller also owns the persistent emergency latch and Demo-smoke acceptance
+state. Arming the kill switch is a SQLite write performed *before* signalling the
+engine, so a lost signal or process crash cannot allow a later restart to silently
+resume economic activity.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -26,8 +28,11 @@ DEFAULT_CONTROL_DB = "data/bybit_operator.db"
 DEFAULT_ENGINE_DB = "data/bybit_demo_trading.db"
 DEFAULT_VENUE_DB = "data/bybit_demo_venue.db"
 DEFAULT_LOG = "logs/bybit_demo_burnin.log"
+DEFAULT_SMOKE_LOG = "logs/bybit_demo_smoke.log"
+DEFAULT_SMOKE_DB = "data/bybit_demo_smoke.db"
 DEFAULT_CREDENTIALS_FILE = "secrets/bybit_demo_credentials.json"
 KILL_SWITCH_KEY = "crypto_kill_switch"
+DEMO_SMOKE_ACK = "I_ACCEPT_BYBIT_DEMO_ORDER"
 
 
 class OperatorControl:
@@ -78,6 +83,22 @@ class OperatorControl:
             "INSERT OR IGNORE INTO operator_preferences(id,notifications_enabled,updated_at) VALUES(1,1,?)",
             (self._now(),),
         )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS operator_acceptance (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            demo_smoke_status TEXT NOT NULL DEFAULT 'NOT_RUN',
+            demo_smoke_at TEXT,
+            demo_smoke_detail TEXT,
+            credential_fingerprint TEXT,
+            updated_at TEXT NOT NULL
+            )"""
+        )
+        self._conn.execute(
+            """INSERT OR IGNORE INTO operator_acceptance(
+            id,demo_smoke_status,updated_at
+            ) VALUES(1,'NOT_RUN',?)""",
+            (self._now(),),
+        )
         self._conn.commit()
 
     @staticmethod
@@ -108,7 +129,9 @@ class OperatorControl:
         proc = Path(f"/proc/{int(pid)}/cmdline") if pid else None
         if proc is not None and proc.exists():
             try:
-                command = proc.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+                command = proc.read_bytes().replace(b"\x00", b" ").decode(
+                    "utf-8", "replace"
+                )
             except OSError:
                 return False
             return "run_bybit_demo_burnin.py" in command
@@ -129,6 +152,13 @@ class OperatorControl:
         if any(ch.isspace() or ord(ch) < 32 for ch in token):
             raise ValueError(f"{label} must not contain whitespace/control characters")
         return token
+
+    @staticmethod
+    def _credential_fingerprint(api_key: str, api_secret: str) -> str:
+        """One-way identity used only to invalidate stale smoke evidence."""
+        return hashlib.sha256(
+            ("BYBIT_DEMO\x00" + api_key + "\x00" + api_secret).encode("utf-8")
+        ).hexdigest()
 
     def _read_saved_credentials(self) -> Optional[tuple[str, str]]:
         path = Path(self.credentials_path)
@@ -152,14 +182,30 @@ class OperatorControl:
         except RuntimeError as exc:
             return {"configured": False, "source": "vault_error", "message": str(exc)}
         if saved is not None:
-            return {"configured": True, "source": "dashboard_vault", "message": "Saved securely on this server"}
+            return {
+                "configured": True,
+                "source": "dashboard_vault",
+                "message": "Saved securely on this server",
+            }
         env_key = os.environ.get("BYBIT_DEMO_API_KEY", "").strip()
         env_secret = os.environ.get("BYBIT_DEMO_API_SECRET", "").strip()
         if env_key and env_secret:
-            return {"configured": True, "source": "server_environment", "message": "Configured by server environment"}
+            return {
+                "configured": True,
+                "source": "server_environment",
+                "message": "Configured by server environment",
+            }
         if env_key or env_secret:
-            return {"configured": False, "source": "partial_environment", "message": "Only one Demo credential is configured"}
-        return {"configured": False, "source": "none", "message": "Add Bybit Demo API credentials below"}
+            return {
+                "configured": False,
+                "source": "partial_environment",
+                "message": "Only one Demo credential is configured",
+            }
+        return {
+            "configured": False,
+            "source": "none",
+            "message": "Add Bybit Demo API credentials below",
+        }
 
     def load_demo_credentials(self) -> tuple[str, str]:
         saved = self._read_saved_credentials()
@@ -169,7 +215,19 @@ class OperatorControl:
         secret = os.environ.get("BYBIT_DEMO_API_SECRET", "").strip()
         if not key or not secret:
             raise RuntimeError("Bybit Demo API credentials are not configured")
-        return self._validate_credential(key, "API key"), self._validate_credential(secret, "API secret")
+        return self._validate_credential(key, "API key"), self._validate_credential(
+            secret, "API secret"
+        )
+
+    def _reset_demo_smoke_status(self, detail: str) -> None:
+        self._conn.execute(
+            """UPDATE operator_acceptance
+               SET demo_smoke_status='NOT_RUN',demo_smoke_at=NULL,
+                   demo_smoke_detail=?,credential_fingerprint=NULL,updated_at=?
+               WHERE id=1""",
+            (detail[:500], self._now()),
+        )
+        self._conn.commit()
 
     def save_demo_credentials(self, api_key: str, api_secret: str) -> None:
         if self._current_backend_alive():
@@ -203,6 +261,7 @@ class OperatorControl:
                 path.chmod(0o600)
             except OSError:
                 pass
+            self._reset_demo_smoke_status("Demo credentials were changed")
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -220,9 +279,10 @@ class OperatorControl:
             if path.is_symlink():
                 raise RuntimeError("Refusing to follow a symlinked Bybit credential vault")
             path.unlink()
+        self._reset_demo_smoke_status("Dashboard-saved Demo credentials were cleared")
 
     def test_demo_credentials(self, api_key: str, api_secret: str) -> dict:
-        """Read-only Demo authentication/environment check; never submits an order."""
+        """Read-only Demo authentication/environment/metadata check; no order submit."""
         key = self._validate_credential(api_key, "API key")
         secret = self._validate_credential(api_secret, "API secret")
         from bybit_spot import BybitSpotBroker
@@ -241,6 +301,10 @@ class OperatorControl:
         )
         try:
             result = broker.verify_environment()
+            account = broker.get_account()
+            metadata = broker.instrument_provider.get_instrument_metadata(
+                "BTC/USD", force_refresh=True
+            )
             return {
                 "ok": True,
                 "environment": result.get("environment"),
@@ -248,6 +312,12 @@ class OperatorControl:
                 "clock_skew_ms": result.get("clock_skew_ms"),
                 "spot_only": result.get("spot_only") is True,
                 "isLeverage": result.get("isLeverage"),
+                "private_account_ok": bool(account.equity >= 0),
+                "instrument_metadata_ok": bool(
+                    metadata.tick_size > 0
+                    and metadata.quantity_step > 0
+                    and metadata.min_order_amount > 0
+                ),
             }
         finally:
             broker.close()
@@ -256,6 +326,183 @@ class OperatorControl:
     def test_saved_demo_credentials(self) -> dict:
         key, secret = self.load_demo_credentials()
         return self.test_demo_credentials(key, secret)
+
+    # ------------------------------------------------------------------
+    # Demo economic-smoke acceptance
+    # ------------------------------------------------------------------
+    def demo_smoke_status(self) -> dict:
+        row = self._conn.execute(
+            """SELECT demo_smoke_status,demo_smoke_at,demo_smoke_detail,
+                      credential_fingerprint,updated_at
+               FROM operator_acceptance WHERE id=1"""
+        ).fetchone()
+        if row is None:
+            return {"status": "NOT_RUN", "ok": False, "detail": "No smoke record"}
+        try:
+            key, secret = self.load_demo_credentials()
+        except RuntimeError:
+            return {
+                "status": "NOT_RUN",
+                "ok": False,
+                "at": row[1],
+                "detail": "Demo credentials are not configured",
+            }
+        fingerprint = self._credential_fingerprint(key, secret)
+        if not row[3] or row[3] != fingerprint:
+            return {
+                "status": "STALE" if row[0] == "PASS" else "NOT_RUN",
+                "ok": False,
+                "at": row[1],
+                "detail": "Run the Demo smoke for the currently configured credentials",
+            }
+        status = str(row[0] or "NOT_RUN")
+        return {
+            "status": status,
+            "ok": status == "PASS",
+            "at": row[1],
+            "detail": row[2] or "",
+            "updated_at": row[4],
+        }
+
+    def _record_demo_smoke(
+        self,
+        *,
+        status: str,
+        detail: str,
+        credential_fingerprint: str,
+    ) -> None:
+        if status not in {"PASS", "FAIL"}:
+            raise ValueError("Demo smoke status must be PASS or FAIL")
+        now = self._now()
+        self._conn.execute(
+            """UPDATE operator_acceptance
+               SET demo_smoke_status=?,demo_smoke_at=?,demo_smoke_detail=?,
+                   credential_fingerprint=?,updated_at=? WHERE id=1""",
+            (
+                status,
+                now,
+                detail[:2000],
+                credential_fingerprint,
+                now,
+            ),
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _redact_text(text: str, *secrets: str) -> str:
+        result = str(text or "")
+        for secret in secrets:
+            if secret:
+                result = result.replace(secret, "<redacted>")
+        return result
+
+    def run_demo_smoke(
+        self,
+        *,
+        symbol: str = "BTC/USD",
+        max_notional_usdt: float = 25.0,
+        repo_root: Optional[str] = None,
+        smoke_db: str = DEFAULT_SMOKE_DB,
+        log_path: str = DEFAULT_SMOKE_LOG,
+        timeout_seconds: float = 180.0,
+    ) -> dict:
+        """Run the explicit tiny Demo-only economic smoke from the server dashboard."""
+        current = self.status()
+        if current.get("process_alive"):
+            raise RuntimeError("Stop the burn-in backend before running the Demo smoke")
+        kill = current.get("kill_switch") or {}
+        if kill.get("armed"):
+            raise RuntimeError("Clear the emergency kill switch before running the Demo smoke")
+        if symbol not in {"BTC/USD", "ETH/USD", "SOL/USD"}:
+            raise ValueError("Demo smoke symbol must be BTC, ETH, or SOL Spot")
+        cap = float(max_notional_usdt)
+        if not (5.0 <= cap <= 100.0):
+            raise ValueError("Demo smoke cap must be within 5–100 USDT")
+        if timeout_seconds < 30 or timeout_seconds > 600:
+            raise ValueError("Demo smoke timeout must be within 30–600 seconds")
+
+        key, secret = self.load_demo_credentials()
+        fingerprint = self._credential_fingerprint(key, secret)
+        root = Path(repo_root or Path(__file__).resolve().parent).resolve()
+        runner = (root / "scripts" / "bybit_demo_smoke.py").resolve()
+        if not runner.is_file():
+            raise RuntimeError(f"Bybit Demo smoke runner is missing at {runner}")
+
+        state_path = Path(smoke_db)
+        if not state_path.is_absolute():
+            state_path = root / state_path
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        log = Path(log_path)
+        if not log.is_absolute():
+            log = root / log
+        log.parent.mkdir(parents=True, exist_ok=True)
+
+        command = [
+            sys.executable,
+            str(runner),
+            "--confirm",
+            DEMO_SMOKE_ACK,
+            "--symbol",
+            symbol,
+            "--max-notional-usdt",
+            str(cap),
+            "--state-db",
+            str(state_path.resolve()),
+        ]
+        child_env = os.environ.copy()
+        child_env["BYBIT_DEMO_API_KEY"] = key
+        child_env["BYBIT_DEMO_API_SECRET"] = secret
+
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=float(timeout_seconds),
+                check=False,
+                env=child_env,
+            )
+            raw = (completed.stdout or "") + "\n" + (completed.stderr or "")
+            redacted = self._redact_text(raw, key, secret).strip()
+            lines = [line[:500] for line in redacted.splitlines() if line.strip()]
+            detail = "\n".join(lines[-12:]) or f"Smoke exited with code {completed.returncode}"
+            passed = completed.returncode == 0 and any(
+                "DEMO_SMOKE_PASS" in line for line in lines
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            redacted = self._redact_text(stdout + "\n" + stderr, key, secret).strip()
+            detail = (redacted[-1500:] + "\nDemo smoke timed out").strip()
+            passed = False
+
+        try:
+            with open(log, "a", encoding="utf-8") as stream:
+                stream.write(f"\n[{self._now()}] {symbol} cap={cap:.2f} USDT\n{detail}\n")
+            try:
+                log.chmod(0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+        status = "PASS" if passed else "FAIL"
+        self._record_demo_smoke(
+            status=status,
+            detail=detail,
+            credential_fingerprint=fingerprint,
+        )
+        return {
+            "ok": passed,
+            "status": status,
+            "symbol": symbol,
+            "max_notional_usdt": cap,
+            "detail": detail,
+            "at": self.demo_smoke_status().get("at"),
+        }
 
     # ------------------------------------------------------------------
     # Operator preferences
@@ -283,12 +530,19 @@ class OperatorControl:
         engine = sqlite3.connect(self.engine_db, timeout=2.0)
         venue = sqlite3.connect(self.venue_db, timeout=2.0)
         try:
-            columns = {row[1] for row in venue.execute("PRAGMA table_info(management_state)").fetchall()}
+            columns = {
+                row[1]
+                for row in venue.execute("PRAGMA table_info(management_state)").fetchall()
+            }
             if not columns:
                 return
             if "current_stop_price" not in columns:
-                venue.execute("ALTER TABLE management_state ADD COLUMN current_stop_price REAL")
-            rows = engine.execute("SELECT key,value FROM kv WHERE key LIKE 'bot_position:%'").fetchall()
+                venue.execute(
+                    "ALTER TABLE management_state ADD COLUMN current_stop_price REAL"
+                )
+            rows = engine.execute(
+                "SELECT key,value FROM kv WHERE key LIKE 'bot_position:%'"
+            ).fetchall()
             for key, raw in rows:
                 try:
                     payload = json.loads(raw)
@@ -317,7 +571,11 @@ class OperatorControl:
         pid = result.get("pid")
         result["process_alive"] = self._owned_backend_alive(pid)
         result["kill_switch"] = self.read_kill_switch()
-        if pid and not result["process_alive"] and result.get("state") in {"RUNNING", "STOPPING", "HALTING"}:
+        if pid and not result["process_alive"] and result.get("state") in {
+            "RUNNING",
+            "STOPPING",
+            "HALTING",
+        }:
             self.mark_stopped("backend process is no longer alive")
             result = self.status()
         return result
@@ -355,7 +613,9 @@ class OperatorControl:
             return None
         connection = self._engine_kv()
         try:
-            row = connection.execute("SELECT value FROM kv WHERE key=?", (KILL_SWITCH_KEY,)).fetchone()
+            row = connection.execute(
+                "SELECT value FROM kv WHERE key=?", (KILL_SWITCH_KEY,)
+            ).fetchone()
         except sqlite3.Error:
             return {"armed": True, "reason": "KILL_SWITCH_STATE_UNREADABLE"}
         finally:
@@ -366,17 +626,27 @@ class OperatorControl:
             payload = json.loads(row[0])
         except (TypeError, json.JSONDecodeError):
             return {"armed": True, "reason": "KILL_SWITCH_STATE_CORRUPT"}
-        return payload if isinstance(payload, dict) else {"armed": True, "reason": "KILL_SWITCH_STATE_CORRUPT"}
+        return (
+            payload
+            if isinstance(payload, dict)
+            else {"armed": True, "reason": "KILL_SWITCH_STATE_CORRUPT"}
+        )
 
     def arm_kill_switch(self, reason: str = "EMERGENCY_STOP") -> None:
         payload = json.dumps(
-            {"armed": True, "reason": reason, "at": self._now(), "source": "operator_dashboard"},
+            {
+                "armed": True,
+                "reason": reason,
+                "at": self._now(),
+                "source": "operator_dashboard",
+            },
             sort_keys=True,
         )
         connection = self._engine_kv(create=True)
         try:
             connection.execute(
-                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                "INSERT INTO kv(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (KILL_SWITCH_KEY, payload),
             )
             connection.commit()
@@ -386,7 +656,9 @@ class OperatorControl:
     def acknowledge_kill_switch(self) -> None:
         status = self.status()
         if status.get("process_alive"):
-            raise RuntimeError("Cannot clear the kill switch while the trading backend is running")
+            raise RuntimeError(
+                "Cannot clear the kill switch while the trading backend is running"
+            )
         connection = self._engine_kv(create=True)
         try:
             connection.execute("DELETE FROM kv WHERE key=?", (KILL_SWITCH_KEY,))
@@ -403,13 +675,18 @@ class OperatorControl:
         repo_root: Optional[str] = None,
         smart_exits: bool = False,
         log_path: str = DEFAULT_LOG,
+        require_demo_smoke: bool = True,
     ) -> int:
         current = self.status()
         if current.get("process_alive"):
-            raise RuntimeError(f"Bybit Demo backend is already running as PID {current['pid']}")
+            raise RuntimeError(
+                f"Bybit Demo backend is already running as PID {current['pid']}"
+            )
         kill = current.get("kill_switch")
         if kill and kill.get("armed"):
-            raise RuntimeError("Emergency kill switch is armed. Review its reason and acknowledge it before starting.")
+            raise RuntimeError(
+                "Emergency kill switch is armed. Review its reason and acknowledge it before starting."
+            )
         if hours not in {72, 120}:
             raise ValueError("Operator burn-in hours must be 72 or 120")
         if not (20.0 <= float(capital_usdt) <= 1_000_000.0):
@@ -417,8 +694,17 @@ class OperatorControl:
         allowed = {"BTC/USD", "ETH/USD", "SOL/USD"}
         normalized = tuple(dict.fromkeys(symbols))
         if not normalized or any(symbol not in allowed for symbol in normalized):
-            raise ValueError("Operator universe must be a non-empty subset of BTC/ETH/SOL Spot")
+            raise ValueError(
+                "Operator universe must be a non-empty subset of BTC/ETH/SOL Spot"
+            )
         key, secret = self.load_demo_credentials()
+        if require_demo_smoke:
+            smoke = self.demo_smoke_status()
+            if not smoke.get("ok"):
+                raise RuntimeError(
+                    "Bybit Demo economic smoke has not passed for the current credentials. "
+                    "Run the tiny Demo smoke from Settings before starting the 3–5 day burn-in."
+                )
         root = Path(repo_root or Path(__file__).resolve().parent).resolve()
         runner = (root / "scripts" / "run_bybit_demo_burnin.py").resolve()
         if not runner.is_file():
