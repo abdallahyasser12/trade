@@ -1,6 +1,6 @@
 # Simple operator UI
 
-The primary production dashboard is `bybit_operator_ui.py`. It intentionally exposes the minimum information an operator needs to supervise a Bybit Spot Demo burn-in.
+The primary production dashboard entrypoint is `bybit_operator_app.py`, which composes the existing `bybit_operator_ui.py` HOME/MARKETS/PERFORMANCE surfaces with the acceptance-aware SETTINGS flow. It intentionally exposes the minimum information an operator needs to supervise a Bybit Spot Demo burn-in.
 
 The legacy research-heavy application remains available at `/research`; none of its underlying capabilities are deleted.
 
@@ -86,7 +86,7 @@ Operational and preliminary-edge verdicts are shown separately. The screen alway
 
 ## SETTINGS
 
-SETTINGS is intentionally a three-step workflow.
+SETTINGS is intentionally a four-step workflow.
 
 ### 1. Connect Bybit Demo
 
@@ -94,14 +94,24 @@ The operator can paste the Bybit Demo API key and secret directly into password-
 
 Actions:
 
-- **Test connection** — read-only Demo environment/account verification; no order is submitted.
+- **Test connection** — read-only Demo environment/account/metadata verification; no order is submitted.
 - **Test & Save** — verifies first, then stores the credentials in the isolated server-side credential vault.
 - **Test saved connection** — re-validates the current saved/environment credentials.
 - **Clear dashboard-saved credentials** — deletes only the dashboard vault copy while the backend is stopped.
 
 The secret is never displayed back to the browser. It is not stored in SQLite, logs, reports or subprocess arguments.
 
-### 2. Choose run settings
+### 2. Verify tiny Demo order path
+
+The dashboard exposes the acceptance smoke directly so normal operation never requires CLI.
+
+The operator selects BTC/ETH/SOL, chooses a small explicit maximum notional, checks an acknowledgement that one tiny **Bybit Demo Spot** order will be opened and closed, then presses **Run Demo economic smoke**.
+
+The smoke verifies current instrument metadata, private account access, public/private streams, Spot order submission, execution reconciliation, bot-owned inventory accounting, a clean close and no residual bot-owned exposure. It cannot select Live, margin, leverage, derivatives or shorts.
+
+A PASS is bound to the currently configured credential pair. Changing or clearing dashboard-saved credentials invalidates it. The burn-in Start action is blocked until the current credential pair has a PASS.
+
+### 3. Choose run settings
 
 Normal settings are limited to:
 
@@ -117,11 +127,12 @@ The smart-exit switch enables existing `TradeManagementPolicy` consumers. It doe
 
 The phone-notification preference controls the existing mobile push observer when that service/device registration is configured. Notification failure never affects trading.
 
-### 3. Start / stop
+### 4. Start / stop
 
 A readiness row shows clear pass/fail markers for:
 
 - Demo API configured
+- Demo economic smoke PASS
 - lifecycle eligible
 - permitted universe non-empty
 - safety latch clear
@@ -139,6 +150,12 @@ Start is disabled until all readiness checks pass and no backend is already runn
 Local dashboard-saved credentials live under `secrets/`, which is Git-ignored. Production Docker mounts a dedicated `trade_secrets` volume only into the operator dashboard container. The research dashboard and mobile API do not mount it.
 
 The vault is written atomically with `0600` permissions. The detached backend receives the Demo key and secret only in its process environment; no secret-bearing command-line argument exists.
+
+## Production browser authentication
+
+Production Docker requires `TRADE_DASHBOARD_PASSWORD` in the private `.env`. Caddy protects both `/` and `/research` with HTTP Basic Auth over HTTPS using username `operator`. Caddy hashes the password at container startup and fails closed when it is missing.
+
+The mobile `/api/*` route is deliberately excluded from browser Basic Auth because the mobile API keeps its own bearer-token authentication.
 
 ## Emergency latch
 
@@ -160,8 +177,8 @@ The Settings expander links to `/research`, which hosts the existing `app.py` UI
 
 `docker-compose.production.yml` runs:
 
-- `bybit_operator_ui.py` on port 8501 as the root dashboard;
+- `bybit_operator_app.py` on port 8501 as the root operator dashboard;
 - `app.py` on port 8502 with Streamlit base path `/research`;
 - the existing mobile API on port 8000.
 
-Caddy routes `/api/*` to the API, `/research*` to the research dashboard, and everything else to the simple Bybit operator dashboard.
+Caddy routes `/api/*` to the API, and authenticates `/research*` plus the root dashboard before proxying them.
