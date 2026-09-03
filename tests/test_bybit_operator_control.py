@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ def _runner_root(tmp_path: Path) -> Path:
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
     (scripts / "run_bybit_demo_burnin.py").write_text("print('stub')\n", encoding="utf-8")
+    (scripts / "bybit_demo_smoke.py").write_text("print('stub')\n", encoding="utf-8")
     return root
 
 
@@ -30,6 +32,31 @@ def _control(tmp_path: Path) -> OperatorControl:
         venue_db=str(tmp_path / "venue.db"),
         credentials_path=str(tmp_path / "secrets" / "bybit.json"),
     )
+
+
+def _pass_smoke(control: OperatorControl, root: Path, monkeypatch) -> dict:
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout="DEMO verified: Spot only\nDEMO_SMOKE_PASS: no bot-owned residual.\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    result = control.run_demo_smoke(
+        symbol="BTC/USD",
+        max_notional_usdt=25.0,
+        repo_root=str(root),
+        smoke_db=str(tmp_path := root.parent / "smoke.db"),
+        log_path=str(root.parent / "smoke.log"),
+    )
+    captured["result"] = result
+    captured["smoke_db"] = tmp_path
+    return captured
 
 
 def test_dashboard_credential_vault_is_server_file_not_sqlite(tmp_path):
@@ -43,6 +70,7 @@ def test_dashboard_credential_vault_is_server_file_not_sqlite(tmp_path):
         assert status["configured"] is True
         assert status["source"] == "dashboard_vault"
         assert control.load_demo_credentials() == (key, secret)
+        assert control.demo_smoke_status()["status"] == "NOT_RUN"
         vault = tmp_path / "secrets" / "bybit.json"
         assert vault.exists()
         if os.name == "posix":
@@ -54,11 +82,79 @@ def test_dashboard_credential_vault_is_server_file_not_sqlite(tmp_path):
         assert secret not in json.dumps(status)
         control.clear_saved_demo_credentials()
         assert not vault.exists()
+        assert control.demo_smoke_status()["status"] == "NOT_RUN"
     finally:
         control.close()
 
 
-def test_dashboard_start_freezes_selected_universe_and_passes_secrets_only_in_child_env(tmp_path, monkeypatch):
+def test_demo_smoke_pass_is_bound_to_current_credentials_and_secrets_stay_off_cli(tmp_path, monkeypatch):
+    root = _runner_root(tmp_path)
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    try:
+        control.save_demo_credentials(key, secret)
+        captured = _pass_smoke(control, root, monkeypatch)
+        result = captured["result"]
+        assert result["ok"] is True
+        assert control.demo_smoke_status()["status"] == "PASS"
+        command = captured["command"]
+        joined = " ".join(command)
+        assert "--confirm" in command
+        assert "I_ACCEPT_BYBIT_DEMO_ORDER" in command
+        assert key not in joined
+        assert secret not in joined
+        assert "--api-key" not in joined
+        assert "--api-secret" not in joined
+        child_env = captured["kwargs"]["env"]
+        assert child_env["BYBIT_DEMO_API_KEY"] == key
+        assert child_env["BYBIT_DEMO_API_SECRET"] == secret
+        db_bytes = (tmp_path / "operator.db").read_bytes()
+        assert key.encode() not in db_bytes
+        assert secret.encode() not in db_bytes
+
+        control.save_demo_credentials("new-demo-key-123456", "new-demo-secret-123456")
+        assert control.demo_smoke_status()["status"] == "NOT_RUN"
+    finally:
+        control.close()
+
+
+def test_demo_smoke_output_is_redacted_before_return_or_log(tmp_path, monkeypatch):
+    root = _runner_root(tmp_path)
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    log = tmp_path / "smoke.log"
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(
+            returncode=2,
+            stdout=f"provider rejected key={key}\n",
+            stderr=f"secret={secret}\nDEMO_SMOKE_FAIL\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    try:
+        control.save_demo_credentials(key, secret)
+        result = control.run_demo_smoke(
+            repo_root=str(root),
+            log_path=str(log),
+            smoke_db=str(tmp_path / "smoke.db"),
+        )
+        assert result["ok"] is False
+        assert result["status"] == "FAIL"
+        assert key not in result["detail"]
+        assert secret not in result["detail"]
+        assert "<redacted>" in result["detail"]
+        logged = log.read_text(encoding="utf-8")
+        assert key not in logged
+        assert secret not in logged
+        assert control.demo_smoke_status()["status"] == "FAIL"
+    finally:
+        control.close()
+
+
+def test_dashboard_start_requires_smoke_then_freezes_universe_and_uses_child_env(tmp_path, monkeypatch):
     root = _runner_root(tmp_path)
     captured = {}
 
@@ -73,6 +169,14 @@ def test_dashboard_start_freezes_selected_universe_and_passes_secrets_only_in_ch
     secret = "demo-api-secret-abcdef123456"
     try:
         control.save_demo_credentials(key, secret)
+        with pytest.raises(RuntimeError, match="economic smoke has not passed"):
+            control.start_detached(
+                hours=72,
+                capital_usdt=750,
+                symbols=("BTC/USD", "SOL/USD"),
+                repo_root=str(root),
+            )
+        _pass_smoke(control, root, monkeypatch)
         pid = control.start_detached(
             hours=72,
             capital_usdt=750,
@@ -117,7 +221,11 @@ def test_start_refuses_when_demo_credentials_are_missing(tmp_path):
 
 def test_emergency_latch_blocks_restart_until_explicit_ack(tmp_path, monkeypatch):
     root = _runner_root(tmp_path)
-    monkeypatch.setattr(OperatorControl, "_owned_backend_alive", classmethod(lambda cls, pid: False))
+    monkeypatch.setattr(
+        OperatorControl,
+        "_owned_backend_alive",
+        classmethod(lambda cls, pid: False),
+    )
     control = _control(tmp_path)
     try:
         control.save_demo_credentials("demo-key-12345678", "demo-secret-12345678")
@@ -132,6 +240,8 @@ def test_emergency_latch_blocks_restart_until_explicit_ack(tmp_path, monkeypatch
                 symbols=("BTC/USD",),
                 repo_root=str(root),
             )
+        with pytest.raises(RuntimeError, match="kill switch"):
+            control.run_demo_smoke(repo_root=str(root))
         control.acknowledge_kill_switch()
         assert control.read_kill_switch() is None
     finally:
@@ -162,7 +272,10 @@ def test_dashboard_projection_uses_engine_authoritative_current_stop(tmp_path):
     venue = tmp_path / "venue.db"
     e = sqlite3.connect(engine)
     e.execute("CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT)")
-    e.execute("INSERT INTO kv VALUES(?,?)", ("bot_position:BTC/USD", json.dumps({"stop_price": 101.25})))
+    e.execute(
+        "INSERT INTO kv VALUES(?,?)",
+        ("bot_position:BTC/USD", json.dumps({"stop_price": 101.25})),
+    )
     e.commit()
     e.close()
     v = sqlite3.connect(venue)
