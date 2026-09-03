@@ -1,15 +1,26 @@
 {$TRADE_DOMAIN} {
     encode zstd gzip
 
+    # The mobile API keeps its own bearer-token authentication and must not inherit
+    # browser Basic Auth, otherwise native clients would be double-gated.
     handle_path /api/* {
         reverse_proxy mobile-api:8000
     }
 
+    # Both browser dashboards are privileged operator surfaces. The Caddy container
+    # derives this hash at startup from TRADE_DASHBOARD_PASSWORD; plaintext never
+    # appears in the Caddyfile.
     handle /research* {
+        basic_auth {
+            operator {$TRADE_DASHBOARD_PASSWORD_HASH}
+        }
         reverse_proxy research-dashboard:8502
     }
 
     handle {
+        basic_auth {
+            operator {$TRADE_DASHBOARD_PASSWORD_HASH}
+        }
         reverse_proxy dashboard:8501
     }
 }
