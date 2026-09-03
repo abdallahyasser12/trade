@@ -92,6 +92,28 @@ def test_production_dashboards_require_caddy_basic_auth_but_mobile_api_does_not(
     assert "TRADE_DASHBOARD_PASSWORD=" in env
 
 
+def test_unified_acceptance_runner_is_clean_checkout_safe_and_redacts_demo_secrets():
+    runner = _read("scripts/run_bybit_acceptance.py")
+    assert "TemporaryDirectory" in runner
+    assert "docker-compose.acceptance.yml" in runner
+    assert 'ROOT / ".env"' not in runner
+    assert "redact_values" in runner
+    assert 'smoke_env.get("BYBIT_DEMO_API_KEY"' in runner
+    assert 'smoke_env.get("BYBIT_DEMO_API_SECRET"' in runner
+    assert "full_regression_test_totals" in runner
+    assert "profitability_claim\": False" in runner
+    assert "live_trading_tested\": False" in runner
+
+
+def test_python_ci_uses_same_acceptance_runner_and_uploads_receipts():
+    workflow = _read(".github/workflows/python-ci.yml")
+    assert "python scripts/run_bybit_acceptance.py" in workflow
+    assert 'python-version: ["3.11", "3.13"]' in workflow
+    assert "actions/upload-artifact@v4" in workflow
+    assert "reports/bybit_acceptance_*.json" in workflow
+    assert "reports/bybit_acceptance_*.md" in workflow
+
+
 def test_bybit_runtime_contains_no_margin_or_leverage_toggle_endpoint_calls():
     runtime = "\n".join(
         _read(path)
