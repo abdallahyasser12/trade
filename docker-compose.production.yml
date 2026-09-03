@@ -6,7 +6,7 @@ services:
     command:
       - streamlit
       - run
-      - bybit_operator_ui.py
+      - bybit_operator_app.py
       - --server.address=0.0.0.0
       - --server.port=8501
       - --server.headless=true
@@ -111,6 +111,17 @@ services:
         condition: service_healthy
     environment:
       TRADE_DOMAIN: ${TRADE_DOMAIN}
+      TRADE_DASHBOARD_PASSWORD: ${TRADE_DASHBOARD_PASSWORD}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -z "$$TRADE_DASHBOARD_PASSWORD" ]; then
+          echo "TRADE_DASHBOARD_PASSWORD is required for production dashboard access" >&2
+          exit 1
+        fi
+        export TRADE_DASHBOARD_PASSWORD_HASH="$$(caddy hash-password --plaintext "$$TRADE_DASHBOARD_PASSWORD")"
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     ports:
       - "80:80"
       - "443:443"
