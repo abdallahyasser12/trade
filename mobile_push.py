@@ -3,6 +3,11 @@
 The iOS app is not the trading runtime. This module lets the always-on backend
 notify a closed/suspended phone when the server-side engine changes state or a
 new fill is persisted. Push failures never affect trading or reconciliation.
+
+The notifier may observe a different StateStore from the one that owns Expo tokens.
+That lets the production mobile API keep its existing token/auth database while the
+notification observer watches the dedicated Bybit Demo engine database. A separate
+operator-preference SQLite file can disable delivery without restarting services.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -38,10 +44,7 @@ def valid_expo_push_token(token: str) -> bool:
     token = token.strip()
     return (
         20 <= len(token) <= 256
-        and (
-            token.startswith("ExpoPushToken[")
-            or token.startswith("ExponentPushToken[")
-        )
+        and (token.startswith("ExpoPushToken[") or token.startswith("ExponentPushToken["))
         and token.endswith("]")
     )
 
@@ -56,9 +59,7 @@ def get_push_tokens(store: StateStore) -> list[str]:
         return []
     if not isinstance(values, list):
         return []
-    return [str(value) for value in values if valid_expo_push_token(str(value))][
-        :MAX_PUSH_TOKENS
-    ]
+    return [str(value) for value in values if valid_expo_push_token(str(value))][:MAX_PUSH_TOKENS]
 
 
 def register_push_token(store: StateStore, token: str) -> list[str]:
@@ -97,18 +98,23 @@ def _is_armed(value: dict[str, Any]) -> bool:
 
 def snapshot(store: StateStore) -> dict[str, Any]:
     trades = store.get_trades(limit=1)
+    # A zero-id sentinel has two important properties:
+    # 1) if the notifier starts with no historical trades, the first real fill
+    #    (SQLite id >= 1) is observable as a transition and produces a notification;
+    # 2) if the notifier restarts after historical fills exist, the baseline is the
+    #    latest real id, so that old fill is not replayed as new.
+    latest_trade = trades[0] if trades else {"id": 0}
     return {
         "stock_status": _json(store.get_kv(ENGINE_STATUS_KEY)),
         "crypto_status": _json(store.get_kv(CRYPTO_ENGINE_STATUS_KEY)),
         "stock_kill": _json(store.get_kv(KILL_SWITCH_KEY)),
         "crypto_kill": _json(store.get_kv(CRYPTO_KILL_SWITCH_KEY)),
-        "latest_trade": trades[0] if trades else None,
+        "latest_trade": latest_trade,
     }
 
 
 def events_between(previous: dict[str, Any], current: dict[str, Any]) -> list[PushEvent]:
     events: list[PushEvent] = []
-
     for key, label in (("stock_status", "Stocks"), ("crypto_status", "Crypto")):
         before = previous.get(key) or {}
         after = current.get(key) or {}
@@ -167,7 +173,6 @@ def events_between(previous: dict[str, Any], current: dict[str, Any]) -> list[Pu
                 data={"kind": "trade_fill", "trade_id": new_id, "symbol": symbol},
             )
         )
-
     return events
 
 
@@ -175,22 +180,14 @@ async def send_push_event(store: StateStore, event: PushEvent) -> None:
     tokens = get_push_tokens(store)
     if not tokens:
         return
-
     payload = [
-        {
-            "to": token,
-            "title": event.title,
-            "body": event.body,
-            "sound": "default",
-            "data": event.data,
-        }
+        {"to": token, "title": event.title, "body": event.body, "sound": "default", "data": event.data}
         for token in tokens
     ]
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     access_token = os.environ.get("EXPO_ACCESS_TOKEN", "").strip()
     if access_token:
         headers["Authorization"] = f"Bearer {access_token}"
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(EXPO_PUSH_URL, headers=headers, json=payload)
@@ -198,7 +195,6 @@ async def send_push_event(store: StateStore, event: PushEvent) -> None:
             body = response.json()
     except Exception:
         return
-
     tickets = body.get("data") if isinstance(body, dict) else None
     if not isinstance(tickets, list):
         return
@@ -210,22 +206,44 @@ async def send_push_event(store: StateStore, event: PushEvent) -> None:
         if isinstance(details, dict) and details.get("error") == "DeviceNotRegistered":
             invalid.add(token)
     if invalid:
-        store.set_kv(
-            PUSH_TOKENS_KEY,
-            json.dumps([token for token in tokens if token not in invalid]),
-        )
+        store.set_kv(PUSH_TOKENS_KEY, json.dumps([token for token in tokens if token not in invalid]))
+
+
+def operator_notifications_enabled(path: Optional[str]) -> bool:
+    """Read the dashboard preference fail-open for notifications, never for trading."""
+    if not path or not os.path.exists(path):
+        return True
+    connection = sqlite3.connect(path, timeout=1.0)
+    try:
+        row = connection.execute(
+            "SELECT notifications_enabled FROM operator_preferences WHERE id=1"
+        ).fetchone()
+        return bool(row[0]) if row else True
+    except sqlite3.Error:
+        return True
+    finally:
+        connection.close()
 
 
 class MobilePushNotifier:
     """Low-frequency observer of durable engine state.
 
-    It never calls Alpaca and never mutates trading state. Its only writes are
-    push-token housekeeping. The first snapshot is a baseline, so service restarts
-    do not replay old fills as new notifications.
+    ``store`` is the state being observed. ``token_store`` owns Expo device tokens and
+    defaults to the same store for backward compatibility. A preference database may
+    disable delivery. None of these paths can mutate trading/protection state.
     """
 
-    def __init__(self, store: StateStore, interval_seconds: float = 10.0):
+    def __init__(
+        self,
+        store: StateStore,
+        interval_seconds: float = 10.0,
+        *,
+        token_store: Optional[StateStore] = None,
+        preference_db_path: Optional[str] = None,
+    ):
         self.store = store
+        self.token_store = token_store or store
+        self.preference_db_path = preference_db_path
         self.interval_seconds = max(5.0, float(interval_seconds))
         self._stop = asyncio.Event()
 
@@ -241,6 +259,8 @@ class MobilePushNotifier:
             except asyncio.TimeoutError:
                 pass
             current = snapshot(self.store)
-            for event in events_between(previous, current):
-                await send_push_event(self.store, event)
+            events = events_between(previous, current)
+            if operator_notifications_enabled(self.preference_db_path):
+                for event in events:
+                    await send_push_event(self.token_store, event)
             previous = current

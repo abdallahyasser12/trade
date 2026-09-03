@@ -1,366 +1,269 @@
-# Trend & Crypto Bot — Alpaca
+# Trade Bot
 
-A deterministic, long-only trading research and execution application with a
-Streamlit dashboard, Alpaca `alpaca-py`, chronological backtests, walk-forward
-promotion gates, SQLite recovery state, and background engines.
+A research-first trading platform with a production-oriented **Bybit Spot Demo** operator path and preserved Alpaca/Quant Desk research workflows.
 
-The repository contains two deliberately separate workspaces plus a
-cross-market research layer:
+The current Bybit mission is deliberately constrained:
 
-- **US stocks:** the independently audited moving-average trend bot remains
-  **Alpaca paper-only**.
-- **Spot crypto:** a 24/7 multi-asset regime/breakout system defaults to paper and
-  exposes an explicitly gated live-account mode. Live mode uses real money and is
-  disabled in a normal installation.
-- **Quant desk (`quant/`):** a multi-market strategy registry, probabilistic
-  regime engine, opportunity ranker, portfolio-heat governor, execution-cost
-  gate, shadow executor, drift monitors, and an evidence-based strategy
-  lifecycle (RESEARCH → SHADOW → PAPER → LIVE_CANARY → LIVE) with its own
-  walk-forward research factory (Monte Carlo stress + deflated-Sharpe
-  multiple-testing control). It journals every decision — including
-  rejections and abstentions — and never promotes a strategy into a live
-  state without recorded evidence plus an explicit operator acknowledgement.
-  Architecture, methodology, and the honest validation status are in
-  [`QUANT_DESK.md`](QUANT_DESK.md). All new strategies ship in RESEARCH
-  state and deploy no capital.
+- Spot only
+- `category=spot`
+- `isLeverage=0`
+- long-only ownership-aware execution
+- BTC / ETH / SOL permitted universe by default
+- no margin borrowing
+- no leverage
+- no perpetuals/futures/inverse/options
+- no shorts
+- no lending/borrowing execution
+- no martingale, loss doubling, averaging down or grid-loss recovery
+- Bybit Live disabled
 
-No strategy is guaranteed to make money. Historical or paper performance is not a
-forecast. Crypto can move sharply, liquidity can disappear, and Alpaca crypto
-stop-limit orders can remain unfilled through a gap. This software is not investment
-advice and is not described as live-money production-ready merely because live API
-access exists.
+A 3–5 day Demo burn-in is an operational acceptance experiment plus preliminary forward evidence. It does **not** prove profitability or a durable edge.
 
-An audit of every subsystem against professional systematic-desk practice, with
-a ranked and sequenced improvement plan, is in
-[`ELITE_TRADER_ROADMAP.md`](ELITE_TRADER_ROADMAP.md).
+## Primary operator dashboard
 
-The implemented stock design is documented in
-[`SMART_STRATEGY_PLAN.md`](SMART_STRATEGY_PLAN.md). The crypto architecture, safety
-boundary, execution model, and acceptance gates are documented in
-[`CRYPTO_TRADING_PLAN.md`](CRYPTO_TRADING_PLAN.md).
-
-To run this on an iPhone with an always-on backend, follow
-[`GET_THE_APP.md`](GET_THE_APP.md): `scripts/deploy_backend.sh` starts and verifies
-the server side, then either the **Build unsigned iOS IPA** workflow (free Apple
-ID sideloading, no paid membership, no push notifications, 7-day re-signing) or
-the **Build production iOS app** workflow (paid Apple Developer account, signed
-install link or TestFlight) produces the app itself.
-
-## Installation
-
-Requirements:
-
-- Python 3.11 or newer
-- Alpaca paper credentials for paper order execution
-- Separate Alpaca live credentials only if you deliberately enable crypto live mode
+Normal operation is dashboard-first:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-streamlit run app.py
+python -m pip install -r requirements.txt -r requirements-mobile-api.txt
+streamlit run bybit_operator_app.py
 ```
 
-Run verification with:
+Then open **SETTINGS** and follow four steps:
+
+1. Paste your **Bybit Demo API key + secret** and click **Test & Save**.
+2. Explicitly acknowledge and run the tiny **Demo economic smoke**. The 3–5 day burn-in stays blocked until this passes for the currently configured credentials.
+3. Choose the capital allocation, BTC/ETH/SOL subset and 3-day or 5-day burn-in.
+4. Click **Start Bybit Demo**.
+
+Create the key under **Bybit Demo Trading**, not Testnet or Live. Grant only the read/trade permissions needed for Spot Demo. **Do not grant withdrawal permission.**
+
+Dashboard-saved credentials are written to a server-only credential vault with restrictive permissions. They are not stored in SQLite, reports, logs, URLs or subprocess arguments, and are never rendered back to the browser. Production Docker mounts the vault only into the operator dashboard container. Existing deployments may still use `BYBIT_DEMO_API_KEY` / `BYBIT_DEMO_API_SECRET` in a private `.env` as an optional fallback.
+
+The dashboard navigation is intentionally small:
+
+```text
+HOME
+MARKETS
+PERFORMANCE
+SETTINGS
+```
+
+The browser is not the trading process: Start launches a detached server-side backend, so closing the browser does not terminate protection, reconciliation or WebSocket supervision.
+
+The existing comprehensive research application remains available separately as Advanced / Research.
+
+## Production Docker
+
+Set `TRADE_DOMAIN`, a strong `TRADE_DASHBOARD_PASSWORD`, and the existing mobile token/settings in your private `.env`, then run:
 
 ```bash
-python -m compileall .
-python -m pytest -q
+docker compose -f docker-compose.production.yml up -d --build
 ```
 
-Do not commit `.env`, SQLite databases, API keys, virtual environments, or generated
-caches.
+Production routing:
 
-## Credentials and account modes
+- `/` → authenticated simple Bybit Demo operator dashboard
+- `/research` → authenticated existing full research/Alpaca/Quant Desk Streamlit application
+- `/api/*` → existing mobile API, which keeps its own bearer-token authentication
 
-Paper keys use the namespaced variables below. The legacy paper names remain supported
-so existing installations continue to work:
+Caddy requires HTTP Basic Auth for both browser dashboards. Username is `operator`; the password is `TRADE_DASHBOARD_PASSWORD`. Caddy derives a one-way hash at container startup and fails closed if the password is missing. Do not reuse the mobile bearer token or Bybit API secret as the dashboard password.
 
-```dotenv
-ALPACA_PAPER_API_KEY=
-ALPACA_PAPER_SECRET_KEY=
+Persistent volumes are separated for runtime state, reports, logs and the dashboard-only secret vault.
 
-# Legacy paper aliases:
-ALPACA_API_KEY=
-ALPACA_SECRET_KEY=
-```
+## Architecture
 
-Crypto live mode requires all three separate settings:
-
-```dotenv
-ENABLE_LIVE_TRADING=true
-ALPACA_LIVE_API_KEY=
-ALPACA_LIVE_SECRET_KEY=
-```
-
-Paper credentials are never used as live credentials. The broker accepts no URL
-override. Before Start, it compares the SDK's base URL for exact equality with either
-`https://paper-api.alpaca.markets` or `https://api.alpaca.markets`, then requires an
-ACTIVE, unblocked account.
-
-The Streamlit live switch is intentionally more than one click. It requires the
-deployment flag, separate keys, an inactive engine, a checked risk acknowledgement,
-the exact typed phrase `LIVE`, account verification, crypto asset verification, and
-hard live notional/exposure caps. The unlock exists only in the current Streamlit
-process and is cleared on mode change or restart. A red **LIVE ACCOUNT — REAL MONEY**
-banner is always rendered in that mode.
-
-## Recommended operating sequence
-
-1. Start in Paper mode.
-2. Configure a small USD crypto universe and realistic nonzero fees, spread, and
-   slippage.
-3. Run the causal portfolio backtest over enough history for indicator warmup.
-4. Inspect individual trades, drawdown, exposure time, fee burden, and the BTC
-   benchmark—not only total return.
-5. Run bounded chronological walk-forward research with at least three non-overlapping
-   test folds.
-6. Reject the configuration if any promotion gate fails.
-7. If every gate passes, freeze it and run supervised paper trading through different
-   market regimes. Compare observed fills and reconciliation behavior with simulation.
-8. Keep live mode disabled until independent review, operational monitoring, and a
-   personally acceptable loss budget are in place.
-
-Walk-forward PASS means only “eligible for controlled paper testing.” The application
-never copies a selected candidate into a running engine or unlocks live trading.
-
-## Runtime architecture
+The venue adapter is below the strategy/Quant Desk boundary:
 
 ```text
-Streamlit
-  |-- Stock configuration -> TrendStrategy + RiskManager
-  |                         -> Backtester OR paper TradeEngine
-  |                         -> AlpacaPaperBroker / StockDataFeed
-  |
-  `-- Crypto configuration + frozen AccountMode
-                            -> CryptoRegimeStrategy + CryptoRiskManager
-                            -> CryptoBacktester / WalkForward / CryptoTradeEngine
-                            -> AlpacaBroker / CryptoDataFeed
-
-All engines -> StateStore -> SQLite -> dashboard state/logs
+Operator dashboard
+        |
+credential-bound tiny Demo smoke
+        |
+Detached Bybit Demo service
+        |
+Quant-controlled adaptive crypto engine
+        |
++-- existing regime/adaptive strategy
++-- existing EvidenceQuantScanner / Edge Intelligence
++-- Bybit-only depth / impact / target-room rejection layer
++-- existing portfolio + risk governor
++-- existing lifecycle/degradation supervision
++-- existing execution-quality journal
++-- existing TradeManagementPolicy / exit intelligence
+        |
+Venue-neutral crypto contracts
+        |
++-- BybitSpotBroker / instrument metadata
++-- public Spot WebSocket + REST recovery
++-- private Demo WebSocket
++-- deterministic orderLinkId reconciliation
++-- bot-owned Spot inventory ledger
 ```
 
-The process-level `EngineController` permits at most one active background engine, so
-Streamlit reruns cannot create a second stock or crypto loop. Start is idempotent and
-polling/backoff waits are interruptible.
+The existing Alpaca broker/data-feed path remains intact for regression, paper workflows and research.
 
-Exclusion also holds **across processes**: stock-engine startup takes an OS-level lock
-on a sibling of the SQLite file and holds it until shutdown, so a second app instance —
-or an engine orphaned by a source reload — refuses to trade against the same state
-database. The lock dies with its process, so a crash can never leave it stuck.
+See [`docs/TRADING_ENGINE_ARCHITECTURE.md`](docs/TRADING_ENGINE_ARCHITECTURE.md).
 
-After an emergency stop, daily-loss halt, or fatal error the kill switch is enforced by
-the stock engine itself, not only by the dashboard's Start button: startup refuses until
-the unclean stop is acknowledged.
+## Bybit Demo topology
 
-## Stock strategy and execution
+The implementation uses current V5 semantics:
 
-The stock workspace remains the audited deterministic system:
+- public Spot WebSocket for order book/trades/klines;
+- Demo REST for account/instrument/order submit-amend-cancel-query and reconciliation;
+- private Demo WebSocket for order/execution/wallet events;
+- REST recovery/backfill after uncertain WebSocket state.
 
-- A BUY needs a **fresh** crossover: previous short MA <= previous long MA and current
-  short MA > current long MA.
-- EXIT is the exact mirror: previous short MA >= previous long MA and current short MA
-  < current long MA.
-- RSI, volume, ATR percentile, ADX, Kaufman efficiency, broad-market regime, and
-  relative strength provide causal confirmation.
-- Risk sizing is the minimum of risk-at-stop, exposure, and buying-power shares.
-- Fills are reconciled before local position state becomes authoritative; partial fills
-  are protected at broker-reported quantity.
-- Stock decisions use completed regular-session bars and Alpaca's market clock. New
-  entries fail closed on market-status, stale-data, benchmark, or clock-skew errors.
+Demo WebSocket order entry is not fabricated.
 
-The stock trading client is always constructed with `paper=True`; the crypto account
-switch cannot redirect the stock engine to live money.
+`pybit` is pinned to the exact tested version in `requirements.txt`.
 
-## Crypto analyst model
+## Instrument and order safety
 
-The crypto system is deterministic and long-only spot. It does not use leverage,
-shorting, martingale, grid averaging, averaging down, mutable online learning, an LLM,
-or news sentiment to place orders.
-
-For each configured USD pair it calculates, from completed bars only:
-
-- fast, slow, and BTC benchmark regime moving averages;
-- RSI with Wilder smoothing;
-- ATR with Wilder smoothing and a causal ATR percentile;
-- ADX with Wilder smoothing;
-- Kaufman path-efficiency ratio;
-- relative volume, momentum, and BTC-relative strength;
-- a prior-window Donchian high computed with `close.shift(1)`.
-
-A long entry requires a **new** breakout transition plus fast/slow trend, rising BTC
-regime, RSI band, ADX, efficiency, nonzero-volume confirmation, positive momentum,
-volatility, and relative-strength filters. Simultaneous candidates receive a stable
-cross-sectional score and symbol tie-break. Remaining in an uptrend alone does not emit
-BUY repeatedly.
-
-Held positions exit on fast-trend failure, benchmark-regime failure, or volatility
-stress. Initial stop arithmetic is based on the actual fill and signal-bar ATR. A
-completed-bar trailing stop can only tighten and first applies to a future bar.
-
-## Crypto portfolio risk
-
-Fractional sizing is floored to Alpaca's asset-specific `min_trade_increment` and must
-also meet the dynamic `min_order_size` and configured minimum notional. Quantity is the
-minimum allowed by:
+The canonical instrument layer maps the existing strategy identity to the venue explicitly, for example:
 
 ```text
-risk budget / (entry - stop)
-per-position exposure / entry
-remaining total portfolio exposure / entry
-cash and buying power / entry
-live order-notional cap / entry          # live buys only
+strategy_symbol  BTC/USD
+canonical_pair   BTC/USDT
+venue_symbol     BTCUSDT
+venue            bybit
 ```
 
-Risk is scaled down as peak-equity drawdown or ATR percentile rises; it never scales
-above the configured base. Maximum concurrent positions and a trailing-return
-correlation gate reduce concentration. Missing correlation evidence fails closed.
+Tick size, quantity step and venue minimums are read dynamically from Bybit instrument metadata. They are not hardcoded into strategy code.
 
-The session-loss latch triggers at the exact configured threshold and cannot silently
-reactivate if equity later rebounds. It blocks new entries while reconciliation,
-protective stops, and exits continue.
+Every economic intent has a deterministic Bybit `orderLinkId` within the venue length contract. A request timeout is reconciled by that same ID; an HTTP response is never treated as a fill.
 
-## Crypto order lifecycle and recovery
+## Bot-owned Spot quantity
 
-Alpaca supports crypto market, limit, and stop-limit orders with GTC/IOC time in force.
-This implementation uses fractional GTC market orders and GTC sell stop-limit protection.
+A wallet balance is not treated as a derivative-style position.
 
-- Submitting an order is never treated as a fill.
-- Every order carries a deterministic, <=48-character `trendbot-` client ID containing
-  a sanitized symbol, purpose, session namespace, and bar/attempt identity.
-- If submission times out after broker acceptance, the engine queries that exact client
-  ID before doing anything else. Reprocessing the same bar reuses the same economic ID.
-- A GTC entry that remains incomplete beyond the configured timeout is canceled and
-  confirmed so it cannot fill long after the signal; any raced partial fill is then
-  reconciled and protected.
-- Broker-reported fill quantity and average price are authoritative. Incremental fill
-  events are persisted idempotently.
-- A partially filled BUY is protected at the filled broker quantity. If more shares
-  fill, the old bot-owned stop is canceled and confirmed before a correctly sized stop
-  replaces it.
-- Before a strategy market EXIT, the engine cancels and confirms its protective stop,
-  then re-reads position quantity. A stop fill racing with cancellation therefore
-  reduces or eliminates the exit instead of creating an oversized sell or short.
-- The bot lists/cancels only orders in its own `trendbot-` namespace and cancels them
-  individually. It never performs account-wide cancellation.
-
-A stop-limit can trigger but fail to execute if price moves below its limit. The 24/7
-watchdog records the first breach, waits the configured grace period, refreshes the
-order, cancels and confirms only that bot-owned stop, re-reads broker quantity, and
-submits one deterministic market exit for the remaining long quantity. That reduces
-risk but cannot guarantee a price or protect against an Alpaca/API/network outage.
-
-On restart, broker truth wins:
-
-- persisted position + matching broker position/stop is reconciled and retained;
-- a broker-flat symbol clears local position state and cancels an orphan bot stop;
-- a broker position without local state is adopted only when refreshed bot-owned fills
-  prove that exact net quantity;
-- an unexplained/manual position causes startup to fail rather than being traded;
-- a pending order is refreshed by its deterministic client ID before another economic
-  intent is considered.
-
-## Historical simulation
-
-Both stock and crypto backtests enforce the same causality rule:
+The bot may sell only:
 
 ```text
-bar N closes
--> indicators and signal use data <= N
--> execution occurs no earlier than bar N+1 open
+min(proven bot-owned execution quantity, currently available wallet quantity)
 ```
 
-For a long stop `S`, if the next bar opens at or below `S`, the simulated fill is the
-adverse open after sell costs—not `S`. Otherwise an intrabar low touching `S` fills at
-`S` after sell costs. Trailing levels calculated after bar N cannot trigger against bar
-N's low.
+Manual/external holdings are not adopted merely because they are in the wallet. An unexplained wallet deficit fails closed.
 
-The crypto simulator models cash, fractional quantity, directional slippage, half-spread
-on each side, percentage taker fees, multiple open positions, and forced final
-liquidation. Equity is `cash + market value(open positions)` exactly once. Realized P&L
-subtracts entry and exit fees exactly once.
+## Quant decision path
 
-The walk-forward protocol selects a bounded candidate grid using training data only,
-skips an embargo bar, evaluates non-overlapping test windows, compares the fixed
-baseline, and reruns with stressed costs. Promotion has independent gates for fold/trade
-count, positive-fold ratio, compounded and excess return, Sharpe, profit factor,
-drawdown, and stressed return. One score cannot hide a failed gate.
+The production entry path remains evidence/risk driven:
 
-## Persistence and security
+```text
+completed causal data
+  -> adaptive setup/regime
+  -> EvidenceQuantScanner + Edge Intelligence
+  -> spread/slippage/fee/participation cost gate
+  -> Bybit multi-level depth + impact proxy + structural target-room gate
+  -> portfolio/risk governor
+  -> burn-in rolling-loss/cooldown/entry ceiling
+  -> Bybit Spot Demo order intent
+```
 
-`StateStore` uses SQLite WAL mode, a shared connection guarded by an `RLock`, short
-transactions with rollback, timezone-aware ISO timestamps, and uniqueness constraints
-for processed bars, client order IDs, and fill event keys. Streamlit session state is
-never authoritative for positions or orders; the live unlock is intentionally the only
-ephemeral safety acknowledgement.
+The Bybit-specific layer is negative-only: favorable depth/order flow cannot manufacture alpha; adverse liquidity, stale/gapped books, excessive impact or insufficient target room can only demote/reject a candidate.
 
-API secrets are loaded only from environment variables. They are never rendered,
-logged, written to SQLite, included in configuration snapshots, or used in result
-fingerprints. Broker error messages are sanitized. The application uses no `eval`,
-`exec`, shell command, or symbol-derived filesystem operation.
+Target selection is not a fixed `+0.5%` order. An accepted target plan combines initial R, ATR, recent realized movement, completed-bar resistance and expected round-trip costs. The +0.25/+0.50/+0.75/+1.00 families remain research measurements in the burn-in report.
 
-## Important limitations
+BTC, ETH and SOL compete for capital. The maximum allowed high-quality entries per rolling 24h is five by default. The minimum required trades is zero.
 
-- Profit is not promised. A strategy can pass every historical gate and still lose.
-- The live engine uses completed-bar REST polling and latest quote snapshots, not a
-  co-located low-latency execution stack. It is unsuitable for latency-sensitive
-  scalping.
-- Bar-volume zero can represent a midpoint-derived Alpaca crypto bar. The price bar is
-  retained for continuity but fails the entry liquidity filter.
-- The backtest cannot reproduce queue position, order-book impact, partial fills,
-  exchange outages, fee-tier changes, or stop-limit nonexecution exactly.
-- Crypto is 24/7, but Alpaca maintenance or API/data outages can still prevent an exit.
-  Broker-side protection and the watchdog reduce risk; they do not eliminate it.
-- Manually altering bot positions or orders while an engine runs can trigger a fail-safe
-  halt. Stop the engine before manual account intervention whenever possible.
-- Live configuration is a capability for explicitly authorized controlled use, not a
-  certification that the repository is suitable for unattended live-money operation.
+The software does not target a daily trade quota or guaranteed daily return.
 
-## Files
+## Smart exits
 
-| File | Responsibility |
-| --- | --- |
-| `app.py` | Streamlit stock/crypto research, verification, and engine controls. |
-| `config.py` | Stock config, account modes, isolated credential loading. |
-| `crypto_config.py` | Frozen crypto strategy, portfolio risk, engine, and simulation config. |
-| `indicators.py` | Causal SMA, Wilder RSI/ATR/ADX, efficiency, volume, ATR percentile. |
-| `strategy.py` / `risk_manager.py` | Shared stock decision and risk implementation. |
-| `crypto_strategy.py` / `crypto_risk.py` | Shared crypto decision, ranking, sizing, correlation, and loss latch. |
-| `backtest.py` / `research.py` | Stock backtest and walk-forward promotion. |
-| `crypto_backtest.py` / `crypto_research.py` | Multi-asset crypto simulation and promotion. |
-| `trade_engine.py` | Audited paper stock order lifecycle. |
-| `crypto_engine.py` | 24/7 crypto reconciliation, partial fills, stops, watchdog, restart. |
-| `broker.py` | Exact environment verification and stock/crypto Alpaca requests. |
-| `data_feed.py` / `crypto_data_feed.py` | Completed bars, staleness, retries, crypto quotes. |
-| `state_store.py` | SQLite sessions, bars, orders, fills, equity, logs, positions. |
-| `models.py` / `crypto_models.py` | Typed boundary structures. |
-| `mobile_api.py` / `mobile_push.py` | Read-only mobile API and server-side push observer. |
-| `scripts/deploy_backend.sh` | One-command production stack bring-up and app connection details. |
-| `scripts/verify_backend.sh` | External reachability and authentication check for the mobile API. |
+The Bybit production path executes the existing `quant.exits.TradeManagementPolicy`; it does not introduce another exit system.
 
-## Troubleshooting
+Supported policy mechanics include initial protective stop, partial profit taking, break-even transition, stagnation/time exit, smart full exit, adaptive trailing stop, runner management, emergency market exit, and the accepted structure/ATR/R target plan fed into the same policy.
 
-- **Paper account will not verify:** confirm paper keys and exact names in `.env`. A 401
-  means Alpaca rejected the credentials.
-- **Live remains disabled:** set `ENABLE_LIVE_TRADING=true`, configure separate live
-  keys, restart Streamlit, select Live, acknowledge risk, type `LIVE`, and verify.
-- **Live selection resets:** an active engine freezes mode; stop it first. A process
-  restart intentionally clears the typed live unlock.
-- **Crypto asset rejected:** use an active Alpaca USD pair in `BASE/USD` format. The app
-  also requires tradable, fractionable, non-marginable, non-shortable metadata and
-  dynamic increments.
-- **No crypto entry:** inspect every filter and quote guard. Zero volume, wide/stale
-  quote, stale/misaligned bars, regime stress, correlation, exposure, or loss latch all
-  fail closed.
-- **Not enough history:** widen the period or use a slower timeframe. The regime and ATR
-  percentile require a substantial causal warmup.
-- **Walk-forward cannot form folds:** the requested train + embargo + test windows exceed
-  aligned history, or no candidate produced the minimum training trade count.
-- **Kill switch blocks Start:** inspect logs and Alpaca account/order state, then use the
-  explicit dashboard acknowledgement and re-verify the account.
-- **Manual position blocks startup:** the bot cannot prove ownership. Resolve it manually
-  in Alpaca; the application will not adopt or liquidate an unexplained position.
+The legacy strategy ATR ratchet is made inert on this path so the existing policy is the single source of post-entry decisions. Broker protection/reconciliation remains owned by the existing engine.
 
-Use Paper mode unless you independently understand and accept every live-money failure
-mode above.
+## Notifications
+
+If the existing mobile/Expo push service is configured, SETTINGS exposes a **Phone push notifications** switch. Device tokens stay in the existing mobile API database while the push observer watches the dedicated Bybit engine database for new fills, safety locks and engine-state changes. Notification delivery is observational only and can never block or modify trading/protection.
+
+## Burn-in evidence
+
+A run freezes run ID, Git SHA, strategy version, configuration hash, universe, start/planned end, and environment. Restart recovery can resume only an exact matching identity.
+
+Every completed decision is journaled, including **NO TRADE**. Operational samples include WebSocket health/reconnects, stale/gap evidence, spread, clock skew, rate limits, REST failures, pending intents and unprotected quantity.
+
+Trade evidence includes execution IDs, fees/slippage, P&L, R where measurable, MFE/MAE, holding time, regime/setup context, and +0.25/+0.50/+0.75/+1.00 reach timing.
+
+Daily time-causal JSON/Markdown snapshots are emitted while the run is active. The final report is written on shutdown and separates `OPERATIONAL_ACCEPT` / `OPERATIONAL_REJECT` from `EDGE_PRELIMINARY_POSITIVE` / `EDGE_INCONCLUSIVE` / `EDGE_PRELIMINARY_NEGATIVE`. It always states `strategy_proven: false` for this burn-in horizon.
+
+## Demo economic smoke
+
+Normal operators run this from **SETTINGS → Verify tiny Demo order path**. The equivalent service command is:
+
+```bash
+python scripts/bybit_demo_smoke.py --confirm I_ACCEPT_BYBIT_DEMO_ORDER
+```
+
+It validates account/metadata/public/private connectivity, submits only a dynamically-valid tiny Demo Spot order inside the smoke cap, reconciles it, closes only proven bot-owned quantity and refuses to pass with residual bot-owned exposure.
+
+Changing dashboard-saved credentials invalidates the stored smoke PASS. The next burn-in cannot start until the smoke passes again for the new credential pair.
+
+No automated test places a Live order.
+
+## One-command acceptance evidence
+
+Local and Python CI acceptance intentionally use the **same command**:
+
+```bash
+python scripts/run_bybit_acceptance.py
+```
+
+It byte-compiles the repository, runs the dedicated Bybit/dashboard safety suite, runs the entire Alpaca/Quant/mobile/Bybit regression suite, checks tracked-secret hygiene, validates Docker Compose when Docker is installed, and writes:
+
+```text
+reports/bybit_acceptance_<SHA>.json
+reports/bybit_acceptance_<SHA>.md
+```
+
+`.github/workflows/python-ci.yml` runs this command on Python 3.11 and 3.13 and uploads those receipts as artifacts, eliminating drift between CI and the local fallback.
+
+To append the explicit real Demo smoke after the hermetic suite passes:
+
+```bash
+python scripts/run_bybit_acceptance.py \
+  --demo-smoke \
+  --confirm-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+```
+
+This still requires real Bybit Demo credentials. It never selects Bybit Live.
+
+## Exact 3-day and 5-day service commands
+
+The dashboard launches equivalent backend semantics, but the exact service commands remain:
+
+```bash
+python scripts/run_bybit_demo_burnin.py --hours 72
+python scripts/run_bybit_demo_burnin.py --hours 120
+```
+
+Normal dashboard operation additionally requires a credential-bound Demo-smoke PASS before it starts either run.
+
+## Emergency stop
+
+The dashboard **EMERGENCY STOP** writes a persistent kill latch before signalling the backend. Restart remains blocked until the operator reviews the reason and explicitly acknowledges the latch while the backend is stopped.
+
+Use **Stop gracefully** for ordinary shutdown.
+
+## Documentation
+
+- [`docs/BYBIT_PRODUCTION_AUDIT.md`](docs/BYBIT_PRODUCTION_AUDIT.md) — source-of-truth architecture audit
+- [`docs/BYBIT_SETUP.md`](docs/BYBIT_SETUP.md) — dashboard credential and Demo setup
+- [`docs/BYBIT_DEMO_BURNIN.md`](docs/BYBIT_DEMO_BURNIN.md) — burn-in procedure and evidence
+- [`docs/TRADING_ENGINE_ARCHITECTURE.md`](docs/TRADING_ENGINE_ARCHITECTURE.md) — execution/data/ownership boundaries
+- [`docs/SIMPLE_UI.md`](docs/SIMPLE_UI.md) — normal operator UX
+- [`QUANT_DESK.md`](QUANT_DESK.md) — existing Quant Desk
+- [`ADAPTIVE_INTRADAY_V2.md`](ADAPTIVE_INTRADAY_V2.md) — existing adaptive intraday research
+- [`INTRADAY_PRODUCTION.md`](INTRADAY_PRODUCTION.md) — existing intraday production/lifecycle background
+
+## Security
+
+Never commit `.env`, `secrets/` or API keys. The application does not require withdrawal permission. Bybit API secrets must not appear in SQLite, reports, logs, subprocess arguments, frontend status, or API responses.
+
+Production browser dashboards are protected by Caddy Basic Auth over HTTPS and fail closed when `TRADE_DASHBOARD_PASSWORD` is missing. The mobile API remains independently bearer-token authenticated.
+
+Live trading remains outside the current Bybit acceptance boundary and requires a separate future review.

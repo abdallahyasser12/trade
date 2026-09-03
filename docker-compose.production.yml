@@ -6,7 +6,7 @@ services:
     command:
       - streamlit
       - run
-      - app.py
+      - bybit_operator_app.py
       - --server.address=0.0.0.0
       - --server.port=8501
       - --server.headless=true
@@ -17,6 +17,9 @@ services:
       DEFAULT_DB_PATH: /app/data/trading_bot.db
     volumes:
       - trade_data:/app/data
+      - trade_reports:/app/reports
+      - trade_logs:/app/logs
+      - trade_secrets:/app/secrets
     restart: unless-stopped
     healthcheck:
       test:
@@ -24,6 +27,39 @@ services:
         - python
         - -c
         - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3).read()"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  research-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    command:
+      - streamlit
+      - run
+      - app.py
+      - --server.address=0.0.0.0
+      - --server.port=8502
+      - --server.baseUrlPath=research
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    env_file:
+      - .env
+    environment:
+      DEFAULT_DB_PATH: /app/data/trading_bot.db
+    volumes:
+      - trade_data:/app/data
+      - trade_reports:/app/reports
+      - trade_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8502/research/_stcore/health', timeout=3).read()"
       interval: 20s
       timeout: 5s
       retries: 5
@@ -48,6 +84,8 @@ services:
       MOBILE_API_DB_PATH: /app/data/trading_bot.db
       MOBILE_DASHBOARD_URL: https://${TRADE_DOMAIN}
       MOBILE_PUSH_ENABLED: "true"
+      MOBILE_PUSH_SOURCE_DB_PATH: /app/data/bybit_demo_trading.db
+      MOBILE_PUSH_PREFERENCE_DB_PATH: /app/data/bybit_operator.db
     volumes:
       - trade_data:/app/data
     restart: unless-stopped
@@ -67,10 +105,23 @@ services:
     depends_on:
       dashboard:
         condition: service_healthy
+      research-dashboard:
+        condition: service_healthy
       mobile-api:
         condition: service_healthy
     environment:
       TRADE_DOMAIN: ${TRADE_DOMAIN}
+      TRADE_DASHBOARD_PASSWORD: ${TRADE_DASHBOARD_PASSWORD}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -z "$$TRADE_DASHBOARD_PASSWORD" ]; then
+          echo "TRADE_DASHBOARD_PASSWORD is required for production dashboard access" >&2
+          exit 1
+        fi
+        export TRADE_DASHBOARD_PASSWORD_HASH="$$(caddy hash-password --plaintext "$$TRADE_DASHBOARD_PASSWORD")"
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     ports:
       - "80:80"
       - "443:443"
@@ -82,5 +133,8 @@ services:
 
 volumes:
   trade_data:
+  trade_reports:
+  trade_logs:
+  trade_secrets:
   caddy_data:
   caddy_config:

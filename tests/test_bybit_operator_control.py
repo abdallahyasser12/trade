@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import bybit_operator_control as module
+from bybit_operator_control import OperatorControl
+
+
+class _Process:
+    pid = 424242
+
+
+def _runner_root(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "run_bybit_demo_burnin.py").write_text("print('stub')\n", encoding="utf-8")
+    (scripts / "bybit_demo_smoke.py").write_text("print('stub')\n", encoding="utf-8")
+    return root
+
+
+def _control(tmp_path: Path) -> OperatorControl:
+    return OperatorControl(
+        str(tmp_path / "operator.db"),
+        engine_db=str(tmp_path / "engine.db"),
+        venue_db=str(tmp_path / "venue.db"),
+        credentials_path=str(tmp_path / "secrets" / "bybit.json"),
+    )
+
+
+def _pass_smoke(control: OperatorControl, root: Path, monkeypatch) -> dict:
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout="DEMO verified: Spot only\nDEMO_SMOKE_PASS: no bot-owned residual.\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    result = control.run_demo_smoke(
+        symbol="BTC/USD",
+        max_notional_usdt=25.0,
+        repo_root=str(root),
+        smoke_db=str(tmp_path := root.parent / "smoke.db"),
+        log_path=str(root.parent / "smoke.log"),
+    )
+    captured["result"] = result
+    captured["smoke_db"] = tmp_path
+    return captured
+
+
+def test_dashboard_credential_vault_is_server_file_not_sqlite(tmp_path):
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    try:
+        assert control.credentials_status()["configured"] is False
+        control.save_demo_credentials(key, secret)
+        status = control.credentials_status()
+        assert status["configured"] is True
+        assert status["source"] == "dashboard_vault"
+        assert control.load_demo_credentials() == (key, secret)
+        assert control.demo_smoke_status()["status"] == "NOT_RUN"
+        vault = tmp_path / "secrets" / "bybit.json"
+        assert vault.exists()
+        if os.name == "posix":
+            assert vault.stat().st_mode & 0o777 == 0o600
+        db_bytes = (tmp_path / "operator.db").read_bytes()
+        assert key.encode() not in db_bytes
+        assert secret.encode() not in db_bytes
+        assert key not in json.dumps(status)
+        assert secret not in json.dumps(status)
+        control.clear_saved_demo_credentials()
+        assert not vault.exists()
+        assert control.demo_smoke_status()["status"] == "NOT_RUN"
+    finally:
+        control.close()
+
+
+def test_demo_smoke_pass_is_bound_to_current_credentials_and_secrets_stay_off_cli(tmp_path, monkeypatch):
+    root = _runner_root(tmp_path)
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    try:
+        control.save_demo_credentials(key, secret)
+        captured = _pass_smoke(control, root, monkeypatch)
+        result = captured["result"]
+        assert result["ok"] is True
+        assert control.demo_smoke_status()["status"] == "PASS"
+        command = captured["command"]
+        joined = " ".join(command)
+        assert "--confirm" in command
+        assert "I_ACCEPT_BYBIT_DEMO_ORDER" in command
+        assert key not in joined
+        assert secret not in joined
+        assert "--api-key" not in joined
+        assert "--api-secret" not in joined
+        child_env = captured["kwargs"]["env"]
+        assert child_env["BYBIT_DEMO_API_KEY"] == key
+        assert child_env["BYBIT_DEMO_API_SECRET"] == secret
+        db_bytes = (tmp_path / "operator.db").read_bytes()
+        assert key.encode() not in db_bytes
+        assert secret.encode() not in db_bytes
+
+        control.save_demo_credentials("new-demo-key-123456", "new-demo-secret-123456")
+        assert control.demo_smoke_status()["status"] == "NOT_RUN"
+    finally:
+        control.close()
+
+
+def test_demo_smoke_output_is_redacted_before_return_or_log(tmp_path, monkeypatch):
+    root = _runner_root(tmp_path)
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    log = tmp_path / "smoke.log"
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(
+            returncode=2,
+            stdout=f"provider rejected key={key}\n",
+            stderr=f"secret={secret}\nDEMO_SMOKE_FAIL\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    try:
+        control.save_demo_credentials(key, secret)
+        result = control.run_demo_smoke(
+            repo_root=str(root),
+            log_path=str(log),
+            smoke_db=str(tmp_path / "smoke.db"),
+        )
+        assert result["ok"] is False
+        assert result["status"] == "FAIL"
+        assert key not in result["detail"]
+        assert secret not in result["detail"]
+        assert "<redacted>" in result["detail"]
+        logged = log.read_text(encoding="utf-8")
+        assert key not in logged
+        assert secret not in logged
+        assert control.demo_smoke_status()["status"] == "FAIL"
+    finally:
+        control.close()
+
+
+def test_dashboard_start_requires_smoke_then_freezes_universe_and_uses_child_env(tmp_path, monkeypatch):
+    root = _runner_root(tmp_path)
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = list(command)
+        captured["kwargs"] = kwargs
+        return _Process()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    control = _control(tmp_path)
+    key = "demo-api-key-123456"
+    secret = "demo-api-secret-abcdef123456"
+    try:
+        control.save_demo_credentials(key, secret)
+        with pytest.raises(RuntimeError, match="economic smoke has not passed"):
+            control.start_detached(
+                hours=72,
+                capital_usdt=750,
+                symbols=("BTC/USD", "SOL/USD"),
+                repo_root=str(root),
+            )
+        _pass_smoke(control, root, monkeypatch)
+        pid = control.start_detached(
+            hours=72,
+            capital_usdt=750,
+            symbols=("BTC/USD", "SOL/USD"),
+            repo_root=str(root),
+            log_path=str(tmp_path / "bot.log"),
+        )
+        assert pid == _Process.pid
+        command = captured["command"]
+        assert "--hours" in command and "72" in command
+        assert "--capital-usdt" in command and "750.0" in command
+        assert "BTC/USD" in command and "SOL/USD" in command
+        assert "ETH/USD" not in command
+        joined = " ".join(command)
+        assert key not in joined
+        assert secret not in joined
+        assert "--api-key" not in joined
+        assert "--api-secret" not in joined
+        assert "live" not in joined.lower()
+        child_env = captured["kwargs"]["env"]
+        assert child_env["BYBIT_DEMO_API_KEY"] == key
+        assert child_env["BYBIT_DEMO_API_SECRET"] == secret
+        assert captured["kwargs"]["start_new_session"] is True
+    finally:
+        control.close()
+
+
+def test_start_refuses_when_demo_credentials_are_missing(tmp_path):
+    root = _runner_root(tmp_path)
+    control = _control(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="credentials are not configured"):
+            control.start_detached(
+                hours=72,
+                capital_usdt=100,
+                symbols=("BTC/USD",),
+                repo_root=str(root),
+            )
+    finally:
+        control.close()
+
+
+def test_emergency_latch_blocks_restart_until_explicit_ack(tmp_path, monkeypatch):
+    root = _runner_root(tmp_path)
+    monkeypatch.setattr(
+        OperatorControl,
+        "_owned_backend_alive",
+        classmethod(lambda cls, pid: False),
+    )
+    control = _control(tmp_path)
+    try:
+        control.save_demo_credentials("demo-key-12345678", "demo-secret-12345678")
+        control.emergency_stop()
+        kill = control.read_kill_switch()
+        assert kill and kill["armed"] is True
+        assert kill["reason"] == "EMERGENCY_STOP"
+        with pytest.raises(RuntimeError, match="kill switch is armed"):
+            control.start_detached(
+                hours=72,
+                capital_usdt=100,
+                symbols=("BTC/USD",),
+                repo_root=str(root),
+            )
+        with pytest.raises(RuntimeError, match="kill switch"):
+            control.run_demo_smoke(repo_root=str(root))
+        control.acknowledge_kill_switch()
+        assert control.read_kill_switch() is None
+    finally:
+        control.close()
+
+
+def test_corrupt_kill_switch_fails_closed(tmp_path):
+    engine = tmp_path / "engine.db"
+    connection = sqlite3.connect(engine)
+    connection.execute("CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT)")
+    connection.execute("INSERT INTO kv VALUES('crypto_kill_switch','not-json')")
+    connection.commit()
+    connection.close()
+    control = OperatorControl(
+        str(tmp_path / "operator.db"),
+        engine_db=str(engine),
+        venue_db=str(tmp_path / "venue.db"),
+        credentials_path=str(tmp_path / "secrets" / "bybit.json"),
+    )
+    try:
+        assert control.read_kill_switch()["armed"] is True
+    finally:
+        control.close()
+
+
+def test_dashboard_projection_uses_engine_authoritative_current_stop(tmp_path):
+    engine = tmp_path / "engine.db"
+    venue = tmp_path / "venue.db"
+    e = sqlite3.connect(engine)
+    e.execute("CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT)")
+    e.execute(
+        "INSERT INTO kv VALUES(?,?)",
+        ("bot_position:BTC/USD", json.dumps({"stop_price": 101.25})),
+    )
+    e.commit()
+    e.close()
+    v = sqlite3.connect(venue)
+    v.execute(
+        """CREATE TABLE management_state(
+        strategy_symbol TEXT PRIMARY KEY, initial_stop_price REAL, updated_at TEXT
+        )"""
+    )
+    v.execute("INSERT INTO management_state VALUES('BTC/USD',95.0,'old')")
+    v.commit()
+    v.close()
+
+    control = OperatorControl(
+        str(tmp_path / "operator.db"),
+        engine_db=str(engine),
+        venue_db=str(venue),
+        credentials_path=str(tmp_path / "secrets" / "bybit.json"),
+    )
+    try:
+        control.status()
+    finally:
+        control.close()
+    v = sqlite3.connect(venue)
+    try:
+        value = v.execute(
+            "SELECT current_stop_price FROM management_state WHERE strategy_symbol='BTC/USD'"
+        ).fetchone()[0]
+        assert value == pytest.approx(101.25)
+    finally:
+        v.close()
+
+
+def test_notification_preference_is_persistent_and_contains_no_credentials(tmp_path):
+    control = _control(tmp_path)
+    try:
+        assert control.notifications_enabled() is True
+        control.set_notifications_enabled(False)
+        assert control.notifications_enabled() is False
+        control.set_notifications_enabled(True)
+        assert control.notifications_enabled() is True
+    finally:
+        control.close()
