@@ -36,13 +36,17 @@ def test_demo_smoke_has_no_live_selector():
 
 def test_operator_ui_uses_password_fields_and_clears_credential_form():
     ui = _read("bybit_operator_ui.py")
+    app = _read("bybit_operator_app.py")
     assert 'type="password"' in ui
     assert 'clear_on_submit=True' in ui
     assert "Test & Save" in ui
     assert "Test saved connection" in ui
     assert "st.session_state" not in ui
-    assert "BYBIT_LIVE_API_KEY" not in ui
-    assert "BYBIT_LIVE_API_SECRET" not in ui
+    assert "BYBIT_LIVE_API_KEY" not in ui + app
+    assert "BYBIT_LIVE_API_SECRET" not in ui + app
+    assert "Run Demo economic smoke" in app
+    assert "control.demo_smoke_status()" in app
+    assert '"Demo smoke": bool(smoke.get("ok"))' in app
 
 
 def test_operator_child_process_never_accepts_secret_arguments():
@@ -53,6 +57,8 @@ def test_operator_child_process_never_accepts_secret_arguments():
     assert "child_env[\"BYBIT_DEMO_API_SECRET\"]" in control
     assert "json.dump(payload" in control
     assert "0o600" in control
+    assert "require_demo_smoke: bool = True" in control
+    assert "Bybit Demo economic smoke has not passed" in control
     assert "BYBIT_LIVE_API_KEY" not in control
     assert "BYBIT_LIVE_API_SECRET" not in control
 
@@ -66,6 +72,24 @@ def test_dashboard_saved_secret_volume_is_isolated_from_other_services():
     assert "trade_secrets:" in compose
     ignore = _read(".gitignore")
     assert "secrets/" in ignore
+
+
+def test_production_dashboards_require_caddy_basic_auth_but_mobile_api_does_not():
+    compose = _read("docker-compose.production.yml")
+    caddy = _read("Caddyfile")
+    env = _read(".env.example")
+    assert "TRADE_DASHBOARD_PASSWORD: ${TRADE_DASHBOARD_PASSWORD}" in compose
+    assert "caddy hash-password --plaintext" in compose
+    assert "TRADE_DASHBOARD_PASSWORD is required" in compose
+    assert caddy.count("basic_auth") == 2
+    research = caddy.split("handle /research*", 1)[1].split("handle {", 1)[0]
+    root = caddy.rsplit("handle {", 1)[1]
+    api = caddy.split("handle_path /api/*", 1)[1].split("handle /research*", 1)[0]
+    assert "basic_auth" in research
+    assert "basic_auth" in root
+    assert "basic_auth" not in api
+    assert "operator {$TRADE_DASHBOARD_PASSWORD_HASH}" in caddy
+    assert "TRADE_DASHBOARD_PASSWORD=" in env
 
 
 def test_bybit_runtime_contains_no_margin_or_leverage_toggle_endpoint_calls():
@@ -90,10 +114,10 @@ def test_bybit_runtime_contains_no_margin_or_leverage_toggle_endpoint_calls():
         assert call not in runtime
 
 
-def test_production_root_is_simple_bybit_dashboard_and_research_is_separate():
+def test_production_root_is_acceptance_aware_bybit_dashboard_and_research_is_separate():
     compose = _read("docker-compose.production.yml")
     caddy = _read("Caddyfile")
-    assert "bybit_operator_ui.py" in compose
+    assert "bybit_operator_app.py" in compose
     assert "--server.baseUrlPath=research" in compose
     assert "research-dashboard:8502" in caddy
     assert "reverse_proxy dashboard:8501" in caddy
