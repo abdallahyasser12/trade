@@ -12,16 +12,19 @@ The implementation therefore preserves `CryptoTradeEngine`, `QuantControlledCryp
 
 ## Audited gaps and closure status
 
-1. **Alpaca-shaped broker/data assumptions — CLOSED.** Venue-neutral contracts and explicit Bybit adapters now isolate SDK/venue semantics.
+1. **Alpaca-shaped broker/data assumptions — CLOSED.** Venue-neutral contracts and explicit Bybit adapters isolate SDK/venue semantics.
 2. **Implicit `BTC/USD` → venue symbol assumptions — CLOSED.** Canonical instruments map strategy, canonical and Bybit symbols explicitly.
-3. **Whole-wallet holdings vs bot ownership — CLOSED.** Bybit execution IDs and order mappings reconstruct only proven bot-owned inventory; manual holdings are not adopted/sold.
+3. **Whole-wallet holdings vs bot ownership — CLOSED.** Bybit execution IDs/order mappings reconstruct only proven bot-owned inventory; manual holdings are not adopted/sold.
 4. **`TradeManagementPolicy` research/production gap — CLOSED for Bybit.** The Bybit path executes the existing policy; the old strategy ATR ratchet is neutralized there.
 5. **REST-only / missing Bybit microstructure — CLOSED.** Public Spot WS + private Demo WS + REST reconciliation are implemented; multi-level book context is a negative-only entry-quality gate.
 6. **Missing Demo burn-in identity/report/runtime — CLOSED.** 72h/120h frozen runs, daily snapshots, final reports, health samples and deterministic resume rules are implemented.
 7. **Research-heavy UI as operator surface — CLOSED.** Production `/` is the simple Bybit Demo dashboard; `/research` preserves the full existing application.
 8. **API-key setup too operationally complex — CLOSED.** SETTINGS provides masked Test / Test & Save / Test saved / Clear controls backed by an isolated server-only credential vault.
 9. **Target-room / market-impact layer not in actual execution path — CLOSED.** `bybit_entry_intelligence.py` is wired before service prepare/start. Target plans freeze only after global ranking and a positive portfolio risk grant, then feed into the existing exit policy.
-10. **Bybit mobile notification source — CLOSED.** The existing push service may observe the Bybit engine DB while device tokens remain in the mobile API DB; dashboard preference controls delivery and never trading.
+10. **Bybit mobile notification source — CLOSED.** Existing push may observe the Bybit engine DB while device tokens remain in the mobile API DB; dashboard preference controls delivery and never trading.
+11. **Economic smoke required CLI/manual coordination — CLOSED.** The production dashboard now exposes an explicit tiny Demo-only smoke and blocks the 72/120h start until it passes for the current credential pair.
+12. **Privileged production dashboards lacked an access gate — CLOSED.** Caddy now requires authenticated operator access for `/` and `/research`, while `/api/*` preserves its independent mobile bearer-token authentication.
+13. **Hosted-runner outage left no single local evidence path — CLOSED in source.** `scripts/run_bybit_acceptance.py` executes the hermetic safety/full regression surface and writes machine/human-readable acceptance evidence.
 
 ## Component classification and implemented disposition
 
@@ -36,16 +39,21 @@ The implementation therefore preserves `CryptoTradeEngine`, `QuantControlledCryp
 | `intraday_crypto_engine.py` | Preserved; accepts a supplied scanner and strict lifecycle context. |
 | `quant/` | Preserved as evidence/lifecycle/ranking/risk authority. |
 | `quant/evidence_scanner.py` | Preserved; Bybit scanner subclasses it with negative-only venue quality gates. |
-| `quant/exits.py` / `quant/exit_intelligence.py` | Existing policy/intelligence is now broker-backed on the Bybit path. |
+| `quant/exits.py` / `quant/exit_intelligence.py` | Existing policy/intelligence is broker-backed on the Bybit path. |
 | `state_store.py` | Existing engine state preserved; Bybit venue ownership/evidence is kept separately in `bybit_state.py`. |
 | `app.py` | Preserved as Advanced / Research at `/research`. |
-| `bybit_operator_ui.py` | Primary normal operator surface. |
+| `bybit_operator_ui.py` | Reusable HOME/MARKETS/PERFORMANCE and credential UI implementation. |
+| `bybit_operator_app.py` | Primary production operator entrypoint with credential-bound Demo-smoke/start acceptance gate. |
 | mobile API / push | Existing API/token ownership preserved; Bybit source/preference observation added without secret access. |
-| CI/tests | Dedicated Bybit safety/chaos/credential/target/notification tests precede the full regression suite. |
+| CI/tests | Dedicated Bybit safety/chaos/credential/target/smoke/auth/notification tests precede the full regression suite. |
 
 ## Architecture preserved
 
 ```text
+authenticated operator dashboard
+        ↓
+credential-bound tiny Bybit Demo smoke
+        ↓
 adaptive intraday strategy hypothesis
         ↓
 EvidenceQuantScanner + Edge Intelligence
@@ -92,14 +100,7 @@ The application does not certify religious/Sharia compliance. It only enforces t
 
 The existing adaptive hypothesis still creates the strategy signal. The Bybit layer cannot turn HOLD into BUY and cannot increase expected alpha.
 
-It can reject/demote based on:
-
-- missing/stale/gapped multi-level order-book context;
-- insufficient quote-denominated ask depth;
-- insufficient depth multiple for the estimated notional;
-- excessive conservative impact proxy;
-- adverse order-flow/book imbalance as a liquidity multiplier reduction;
-- insufficient target room after expected round-trip costs.
+It can reject/demote based on missing/stale/gapped multi-level order-book context, insufficient quote-denominated ask depth, insufficient depth multiple for estimated notional, excessive conservative impact proxy, adverse order-flow/book imbalance, and insufficient target room after expected round-trip costs.
 
 The target planner combines initial risk, ATR, completed prior structure, recent realized movement and expected costs. Fixed +0.50/+0.75/+1.00 prices are retained only as report/research families.
 
@@ -113,17 +114,26 @@ Normal setup is Dashboard → SETTINGS → Connect Bybit Demo.
 - Test connection is read-only and Demo-only;
 - Test & Save verifies before persisting;
 - saved values use a server-only JSON vault with restrictive permissions;
-- the vault path is Git-ignored;
-- production mounts its secret volume only in the operator dashboard;
-- no credential is written to operator/engine SQLite, reports, logs, URLs or child command arguments;
+- the vault path is Git-ignored and production mounts it only in the operator dashboard;
+- no raw credential is written to operator/engine SQLite, reports, logs, URLs or child command arguments;
 - the detached child receives credentials only in its environment;
 - Bybit Live credential names are not read by the Demo operator/runner path.
+
+Production browser access is privileged. Caddy authenticates `/` and `/research` over HTTPS with username `operator` and a deployment-supplied `TRADE_DASHBOARD_PASSWORD`; it derives the password hash at startup and fails closed if the password is absent. `/api/*` remains on the mobile API's independent bearer-token boundary.
+
+## Demo-smoke acceptance gate
+
+Normal dashboard start requires a real tiny Bybit Demo economic smoke to PASS first. The operator explicitly acknowledges that the smoke will open and close one small Demo Spot order.
+
+The smoke verifies current private account access, instrument metadata, public/private streams, Spot submission, execution reconciliation, bot-owned inventory accounting, close, and zero bot-owned residual. It cannot select Live, margin, leverage, derivatives or shorts.
+
+The persisted PASS is bound to a one-way fingerprint of the currently configured Demo credential pair. Changing or clearing dashboard-saved credentials invalidates the result and blocks burn-in start until a new PASS is obtained.
 
 ## Smart-exit closure
 
 `quant/exits.py` remains the single policy object and `quant/exit_intelligence.py` remains the causal hold assessment. The Bybit runtime translates persisted position state into `ManagedPosition`, evaluates completed bars, and executes policy instructions through broker-truth/protection machinery.
 
-The accepted Bybit target plan temporarily specializes the existing policy’s profit-target R/fraction for that managed position; after each management call the original policy object is restored. Partial exits reconcile before residual protection is resized.
+The accepted Bybit target plan temporarily specializes the existing policy's profit-target R/fraction for that managed position; after each management call the original policy object is restored. Partial exits reconcile before residual protection is resized.
 
 ## Burn-in acceptance boundary
 
@@ -134,11 +144,29 @@ A 72–120 hour Bybit Demo run is an **operational acceptance test plus prelimin
 
 Live Bybit remains outside this mission.
 
+## Repository acceptance evidence
+
+When GitHub-hosted runners are unavailable, the equivalent source-controlled acceptance surface is:
+
+```bash
+python scripts/run_bybit_acceptance.py
+```
+
+It runs byte-compilation, the dedicated Bybit/dashboard safety suite, the complete Alpaca/Quant/mobile/Bybit regression suite, tracked-secret checks and Docker Compose validation when Docker is installed, then writes JSON/Markdown evidence under `reports/`.
+
+An optional real Demo-smoke phase remains explicit:
+
+```bash
+python scripts/run_bybit_acceptance.py \
+  --demo-smoke \
+  --confirm-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+```
+
 ## Evidence still requiring external execution
 
 Implementation gaps above are closed, but three evidence gates cannot be fabricated:
 
-1. GitHub-hosted Actions must actually receive a runner and execute checkout/install/compile/pytest. Current repository Actions are failing before any step starts.
+1. A real runner/local acceptance host must execute checkout/install/compile/pytest and produce test totals. GitHub-hosted Actions currently creates jobs but fails before any workflow step starts.
 2. The Demo economic smoke must be run with real Bybit Demo credentials.
 3. A real 72–120h forward burn-in must elapse and produce the final operational/edge report.
 
