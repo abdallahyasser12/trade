@@ -20,16 +20,18 @@ Local:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt -r requirements-mobile-api.txt
-streamlit run bybit_operator_ui.py
+streamlit run bybit_operator_app.py
 ```
 
-Production Docker:
+Production Docker requires a private `.env` containing at least `TRADE_DOMAIN` and a strong `TRADE_DASHBOARD_PASSWORD`:
 
 ```bash
 docker compose -f docker-compose.production.yml up -d --build
 ```
 
 The production root route serves the simple Bybit operator dashboard. The existing full research application is preserved at `/research`.
+
+Both browser dashboards are protected by Caddy HTTP Basic Auth over HTTPS. The username is `operator`; the password is `TRADE_DASHBOARD_PASSWORD`. Caddy hashes it at container startup and refuses to start if it is missing. `/api/*` keeps the existing mobile bearer-token authentication and is not put behind browser Basic Auth.
 
 ## 3. Add the API key through SETTINGS
 
@@ -58,11 +60,27 @@ BYBIT_DEMO_API_SECRET=...
 
 in the private server `.env`. Dashboard-saved credentials take precedence when present. `BYBIT_LIVE_API_KEY` and `BYBIT_LIVE_API_SECRET` remain separate and the normal Bybit operator path cannot select Live trading.
 
-## 4. Readiness checks
+## 4. Run the required tiny Demo smoke
 
-SETTINGS shows a simple readiness row before Start:
+Before the 72–120 hour burn-in can start, open **SETTINGS → Verify tiny Demo order path**.
+
+1. Choose BTC, ETH, or SOL for the smoke.
+2. Leave the default maximum Demo notional at 25 USDT unless the current Bybit minimum requires a slightly higher explicit cap.
+3. Check the acknowledgement that one tiny **Bybit Demo Spot** order will be opened and closed.
+4. Click **Run Demo economic smoke**.
+
+The smoke is economic but **Demo only**. It verifies private account access, current instrument metadata, public/private streams, Spot order submission, execution reconciliation, bot-owned inventory accounting, and a clean close with no residual bot-owned exposure.
+
+The stored PASS is tied to the currently configured credential pair. Changing or clearing dashboard-saved credentials invalidates the smoke result automatically. The burn-in Start button remains blocked until the current credentials have a PASS.
+
+The smoke never selects Bybit Live, margin, leverage, derivatives, or shorts.
+
+## 5. Readiness checks
+
+SETTINGS shows a readiness row before Start:
 
 - Demo API: ready
+- Demo economic smoke: PASS for the current credentials
 - Strategy lifecycle: PAPER or another already-approved broker-backed state
 - Coin universe: non-empty BTC/ETH/SOL subset
 - Safety latch: clear
@@ -72,7 +90,7 @@ The dashboard never auto-promotes a strategy from RESEARCH/SHADOW just to obtain
 
 After the backend starts, HOME shows public/private WebSocket status, engine status, health, clock skew, unprotected quantity, capital allocation, P&L, exposure, opportunities, positions and recent activity.
 
-## 5. Choose the permitted Spot universe
+## 6. Choose the permitted Spot universe
 
 Normal settings permit only:
 
@@ -84,7 +102,7 @@ The dashboard maps these to the canonical strategy symbols `BTC/USD`, `ETH/USD`,
 
 No meme coin or microcap is added automatically. Software does not certify Sharia compliance; the list is simply a user-controlled permitted Spot universe.
 
-## 6. Capital, duration, smart exits and notifications
+## 7. Capital, duration, smart exits and notifications
 
 Set a **strategy capital allocation** in USDT. This is independent of the total virtual wallet balance in Bybit Demo. Sizing is capped by the configured allocation and does not automatically scale to the full Demo wallet.
 
@@ -101,22 +119,23 @@ If the existing mobile app / Expo push service is configured, the **Phone push n
 
 An optional EGP reference rate in the UI is display-only and does not affect sizing or risk mathematics.
 
-## 7. Start from the dashboard
+## 8. Start from the dashboard
 
 In **SETTINGS**, click **Start Bybit Demo**.
 
-The dashboard launches a detached server-side backend. The browser is not the trading process. Closing the tab or restarting Streamlit does not stop the backend, protective orders, reconciliation, or WebSocket supervision.
+The dashboard launches a detached server-side backend. The browser is not the trading process. Closing the tab does not stop the backend, protective orders, reconciliation, or WebSocket supervision.
 
 The start path refuses to run if:
 
 - Demo credentials are missing
+- the current credentials do not have a PASS from the Demo economic smoke
 - the strategy lifecycle is not broker-eligible
 - the emergency kill switch is armed
 - another owned backend is already running
 - the permitted universe is empty or outside BTC/ETH/SOL
 - the capital allocation is invalid
 
-## 8. Emergency stop
+## 9. Emergency stop
 
 Use **EMERGENCY STOP** when the engine must halt. The dashboard persists the kill-switch latch **before** signalling the backend. A later restart remains blocked even if the process disappeared before receiving the signal.
 
@@ -124,7 +143,7 @@ After the incident is understood, go to SETTINGS, review the recorded reason/tim
 
 For ordinary shutdown use **Stop gracefully**. The backend owns reconciliation and protection during shutdown.
 
-## 9. Resume after restart
+## 10. Resume after restart
 
 The burn-in identity includes:
 
@@ -139,11 +158,29 @@ The burn-in identity includes:
 
 A process restart resumes an active run only when the code/config/universe/environment match exactly. Changed strategy parameters create a different experiment and cannot silently resume the old identity.
 
-## 10. Reports
+## 11. Reports
 
 HOME and PERFORMANCE read persisted evidence while a run is active. Final JSON and Markdown reports are written under `reports/` when the run ends.
 
 A 72–120 hour run is an operational acceptance experiment and preliminary forward sample. The software never labels it "strategy proven" and never claims a guaranteed return.
+
+## 12. One-command local acceptance
+
+If GitHub-hosted Actions is unavailable, run:
+
+```bash
+python scripts/run_bybit_acceptance.py
+```
+
+This byte-compiles the repository, runs the dedicated Bybit/dashboard safety suite, runs the complete Alpaca/Quant/mobile/Bybit regression suite, checks tracked-secret hygiene, validates Docker Compose when Docker is installed, and writes JSON/Markdown acceptance evidence under `reports/`.
+
+To append the real Demo economic smoke after the hermetic checks pass:
+
+```bash
+python scripts/run_bybit_acceptance.py \
+  --demo-smoke \
+  --confirm-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+```
 
 ## Service / diagnostic commands
 
