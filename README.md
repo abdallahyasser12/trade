@@ -79,6 +79,8 @@ The venue adapter is below the strategy/Quant Desk boundary:
 ```text
 Operator dashboard
         |
+credential-bound tiny Demo smoke
+        |
 Detached Bybit Demo service
         |
 Quant-controlled adaptive crypto engine
@@ -171,17 +173,7 @@ The software does not target a daily trade quota or guaranteed daily return.
 
 The Bybit production path executes the existing `quant.exits.TradeManagementPolicy`; it does not introduce another exit system.
 
-Supported policy mechanics include:
-
-- initial protective stop
-- partial profit taking
-- break-even transition
-- stagnation/time exit
-- smart full exit
-- adaptive trailing stop
-- runner management
-- emergency market exit
-- accepted structure/ATR/R target plan fed into the same policy
+Supported policy mechanics include initial protective stop, partial profit taking, break-even transition, stagnation/time exit, smart full exit, adaptive trailing stop, runner management, emergency market exit, and the accepted structure/ATR/R target plan fed into the same policy.
 
 The legacy strategy ATR ratchet is made inert on this path so the existing policy is the single source of post-entry decisions. Broker protection/reconciliation remains owned by the existing engine.
 
@@ -191,41 +183,13 @@ If the existing mobile/Expo push service is configured, SETTINGS exposes a **Pho
 
 ## Burn-in evidence
 
-A run freezes:
-
-- run ID
-- Git SHA
-- strategy version
-- configuration hash
-- universe
-- start/planned end
-- environment
-
-Restart recovery can resume only an exact matching identity.
+A run freezes run ID, Git SHA, strategy version, configuration hash, universe, start/planned end, and environment. Restart recovery can resume only an exact matching identity.
 
 Every completed decision is journaled, including **NO TRADE**. Operational samples include WebSocket health/reconnects, stale/gap evidence, spread, clock skew, rate limits, REST failures, pending intents and unprotected quantity.
 
 Trade evidence includes execution IDs, fees/slippage, P&L, R where measurable, MFE/MAE, holding time, regime/setup context, and +0.25/+0.50/+0.75/+1.00 reach timing.
 
-Daily time-causal JSON/Markdown snapshots are emitted while the run is active. The final report is written on shutdown.
-
-Final reports separate:
-
-- `OPERATIONAL_ACCEPT` / `OPERATIONAL_REJECT`
-- `EDGE_PRELIMINARY_POSITIVE` / `EDGE_INCONCLUSIVE` / `EDGE_PRELIMINARY_NEGATIVE`
-
-and always state `strategy_proven: false` for this burn-in horizon.
-
-## Exact 3-day and 5-day service commands
-
-The dashboard launches equivalent backend semantics, but the exact service commands remain:
-
-```bash
-python scripts/run_bybit_demo_burnin.py --hours 72
-python scripts/run_bybit_demo_burnin.py --hours 120
-```
-
-Normal dashboard operation additionally requires a credential-bound Demo-smoke PASS before it will start either run.
+Daily time-causal JSON/Markdown snapshots are emitted while the run is active. The final report is written on shutdown and separates `OPERATIONAL_ACCEPT` / `OPERATIONAL_REJECT` from `EDGE_PRELIMINARY_POSITIVE` / `EDGE_INCONCLUSIVE` / `EDGE_PRELIMINARY_NEGATIVE`. It always states `strategy_proven: false` for this burn-in horizon.
 
 ## Demo economic smoke
 
@@ -243,7 +207,7 @@ No automated test places a Live order.
 
 ## One-command acceptance evidence
 
-When GitHub-hosted Actions is unavailable, run the same repository acceptance surface locally:
+Local and Python CI acceptance intentionally use the **same command**:
 
 ```bash
 python scripts/run_bybit_acceptance.py
@@ -256,6 +220,8 @@ reports/bybit_acceptance_<SHA>.json
 reports/bybit_acceptance_<SHA>.md
 ```
 
+`.github/workflows/python-ci.yml` runs this command on Python 3.11 and 3.13 and uploads those receipts as artifacts, eliminating drift between CI and the local fallback.
+
 To append the explicit real Demo smoke after the hermetic suite passes:
 
 ```bash
@@ -264,7 +230,18 @@ python scripts/run_bybit_acceptance.py \
   --confirm-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
 ```
 
-This still requires real Bybit Demo credentials in the server environment. It never selects Bybit Live.
+This still requires real Bybit Demo credentials. It never selects Bybit Live.
+
+## Exact 3-day and 5-day service commands
+
+The dashboard launches equivalent backend semantics, but the exact service commands remain:
+
+```bash
+python scripts/run_bybit_demo_burnin.py --hours 72
+python scripts/run_bybit_demo_burnin.py --hours 120
+```
+
+Normal dashboard operation additionally requires a credential-bound Demo-smoke PASS before it starts either run.
 
 ## Emergency stop
 
@@ -282,18 +259,6 @@ Use **Stop gracefully** for ordinary shutdown.
 - [`QUANT_DESK.md`](QUANT_DESK.md) — existing Quant Desk
 - [`ADAPTIVE_INTRADAY_V2.md`](ADAPTIVE_INTRADAY_V2.md) — existing adaptive intraday research
 - [`INTRADAY_PRODUCTION.md`](INTRADAY_PRODUCTION.md) — existing intraday production/lifecycle background
-
-## Testing
-
-Hermetic unit/integration tests cover the legacy Alpaca workflows and the Bybit venue path, including Spot/leverage invariants, symbol mapping, dynamic metadata changes, deterministic IDs, timeout reconciliation, wallet ownership, execution idempotency, order-book gaps/staleness, WebSocket duplicate tolerance, target-room intelligence, smart-exit single-policy wiring, secure dashboard credential storage, credential-bound Demo-smoke gating, production dashboard authentication, notification separation, active-report causality, dashboard process ownership and emergency-latch behavior.
-
-Run locally:
-
-```bash
-python scripts/run_bybit_acceptance.py
-```
-
-CI uses no trading credentials and cannot place economic orders.
 
 ## Security
 
