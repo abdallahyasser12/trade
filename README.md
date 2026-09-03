@@ -27,14 +27,15 @@ Normal operation is dashboard-first:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt -r requirements-mobile-api.txt
-streamlit run bybit_operator_ui.py
+streamlit run bybit_operator_app.py
 ```
 
-Then open **SETTINGS** and follow three steps:
+Then open **SETTINGS** and follow four steps:
 
 1. Paste your **Bybit Demo API key + secret** and click **Test & Save**.
-2. Choose the capital allocation, BTC/ETH/SOL subset and 3-day or 5-day burn-in.
-3. Click **Start Bybit Demo**.
+2. Explicitly acknowledge and run the tiny **Demo economic smoke**. The 3–5 day burn-in stays blocked until this passes for the currently configured credentials.
+3. Choose the capital allocation, BTC/ETH/SOL subset and 3-day or 5-day burn-in.
+4. Click **Start Bybit Demo**.
 
 Create the key under **Bybit Demo Trading**, not Testnet or Live. Grant only the read/trade permissions needed for Spot Demo. **Do not grant withdrawal permission.**
 
@@ -55,15 +56,19 @@ The existing comprehensive research application remains available separately as 
 
 ## Production Docker
 
+Set `TRADE_DOMAIN`, a strong `TRADE_DASHBOARD_PASSWORD`, and the existing mobile token/settings in your private `.env`, then run:
+
 ```bash
 docker compose -f docker-compose.production.yml up -d --build
 ```
 
 Production routing:
 
-- `/` → simple Bybit Demo operator dashboard
-- `/research` → existing full research/Alpaca/Quant Desk Streamlit application
-- `/api/*` → existing mobile API
+- `/` → authenticated simple Bybit Demo operator dashboard
+- `/research` → authenticated existing full research/Alpaca/Quant Desk Streamlit application
+- `/api/*` → existing mobile API, which keeps its own bearer-token authentication
+
+Caddy requires HTTP Basic Auth for both browser dashboards. Username is `operator`; the password is `TRADE_DASHBOARD_PASSWORD`. Caddy derives a one-way hash at container startup and fails closed if the password is missing. Do not reuse the mobile bearer token or Bybit API secret as the dashboard password.
 
 Persistent volumes are separated for runtime state, reports, logs and the dashboard-only secret vault.
 
@@ -213,16 +218,18 @@ and always state `strategy_proven: false` for this burn-in horizon.
 
 ## Exact 3-day and 5-day service commands
 
-The dashboard launches equivalent backend semantics, but the exact acceptance commands remain:
+The dashboard launches equivalent backend semantics, but the exact service commands remain:
 
 ```bash
 python scripts/run_bybit_demo_burnin.py --hours 72
 python scripts/run_bybit_demo_burnin.py --hours 120
 ```
 
+Normal dashboard operation additionally requires a credential-bound Demo-smoke PASS before it will start either run.
+
 ## Demo economic smoke
 
-The smoke is explicit, tiny, Spot-only and Demo-only:
+Normal operators run this from **SETTINGS → Verify tiny Demo order path**. The equivalent service command is:
 
 ```bash
 python scripts/bybit_demo_smoke.py --confirm I_ACCEPT_BYBIT_DEMO_ORDER
@@ -230,7 +237,34 @@ python scripts/bybit_demo_smoke.py --confirm I_ACCEPT_BYBIT_DEMO_ORDER
 
 It validates account/metadata/public/private connectivity, submits only a dynamically-valid tiny Demo Spot order inside the smoke cap, reconciles it, closes only proven bot-owned quantity and refuses to pass with residual bot-owned exposure.
 
+Changing dashboard-saved credentials invalidates the stored smoke PASS. The next burn-in cannot start until the smoke passes again for the new credential pair.
+
 No automated test places a Live order.
+
+## One-command acceptance evidence
+
+When GitHub-hosted Actions is unavailable, run the same repository acceptance surface locally:
+
+```bash
+python scripts/run_bybit_acceptance.py
+```
+
+It byte-compiles the repository, runs the dedicated Bybit/dashboard safety suite, runs the entire Alpaca/Quant/mobile/Bybit regression suite, checks tracked-secret hygiene, validates Docker Compose when Docker is installed, and writes:
+
+```text
+reports/bybit_acceptance_<SHA>.json
+reports/bybit_acceptance_<SHA>.md
+```
+
+To append the explicit real Demo smoke after the hermetic suite passes:
+
+```bash
+python scripts/run_bybit_acceptance.py \
+  --demo-smoke \
+  --confirm-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+```
+
+This still requires real Bybit Demo credentials in the server environment. It never selects Bybit Live.
 
 ## Emergency stop
 
@@ -251,13 +285,12 @@ Use **Stop gracefully** for ordinary shutdown.
 
 ## Testing
 
-Hermetic unit/integration tests cover the legacy Alpaca workflows and the Bybit venue path, including Spot/leverage invariants, symbol mapping, dynamic metadata changes, deterministic IDs, timeout reconciliation, wallet ownership, execution idempotency, order-book gaps/staleness, WebSocket duplicate tolerance, target-room intelligence, smart-exit single-policy wiring, secure dashboard credential storage, notification separation, active-report causality, dashboard process ownership and emergency-latch behavior.
+Hermetic unit/integration tests cover the legacy Alpaca workflows and the Bybit venue path, including Spot/leverage invariants, symbol mapping, dynamic metadata changes, deterministic IDs, timeout reconciliation, wallet ownership, execution idempotency, order-book gaps/staleness, WebSocket duplicate tolerance, target-room intelligence, smart-exit single-policy wiring, secure dashboard credential storage, credential-bound Demo-smoke gating, production dashboard authentication, notification separation, active-report causality, dashboard process ownership and emergency-latch behavior.
 
 Run locally:
 
 ```bash
-python -m compileall -q .
-python -m pytest -q
+python scripts/run_bybit_acceptance.py
 ```
 
 CI uses no trading credentials and cannot place economic orders.
@@ -265,5 +298,7 @@ CI uses no trading credentials and cannot place economic orders.
 ## Security
 
 Never commit `.env`, `secrets/` or API keys. The application does not require withdrawal permission. Bybit API secrets must not appear in SQLite, reports, logs, subprocess arguments, frontend status, or API responses.
+
+Production browser dashboards are protected by Caddy Basic Auth over HTTPS and fail closed when `TRADE_DASHBOARD_PASSWORD` is missing. The mobile API remains independently bearer-token authenticated.
 
 Live trading remains outside the current Bybit acceptance boundary and requires a separate future review.
