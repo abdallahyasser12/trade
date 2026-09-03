@@ -1,7 +1,8 @@
 name: Python CI
 
 # Hermetic CI only. No trading credentials are configured and no test is allowed to
-# place an economic Demo or Live order.
+# place an economic Demo or Live order. The exact same acceptance runner is usable
+# locally when GitHub-hosted runner allocation is unavailable.
 
 on:
   push:
@@ -31,7 +32,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -49,36 +50,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-mobile-api.txt
 
-      - name: Byte-compile every module
-        run: python -m compileall -q .
+      - name: Run repository acceptance
+        run: python scripts/run_bybit_acceptance.py
 
-      - name: Bybit Spot / dashboard safety contract
-        run: |
-          python -m pytest -q \
-            tests/test_bybit_spot.py \
-            tests/test_bybit_state.py \
-            tests/test_bybit_market_data.py \
-            tests/test_bybit_management.py \
-            tests/test_bybit_entry_intelligence.py \
-            tests/test_bybit_burnin.py \
-            tests/test_bybit_operator_control.py \
-            tests/test_bybit_security_contract.py \
-            tests/test_bybit_chaos.py \
-            tests/test_mobile_push.py
-
-      - name: Full Alpaca Quant Desk mobile and Bybit regression suite
-        run: python -m pytest -q --durations=10
-
-      - name: Confirm no credential-shaped literal is committed
-        run: |
-          # Alpaca key ids are PK/AK followed by uppercase alphanumerics.
-          if git grep -nIE '\b(PK|AK)[A-Z0-9]{16,}\b' -- . ':(exclude).github/workflows/python-ci.yml'; then
-            echo "::error::A credential-shaped literal is committed. Rotate the key and remove it."
-            exit 1
-          fi
-          # Private env files and dashboard credential vaults are forbidden in git.
-          if git ls-files | grep -E '(^|/)\.env$|(^|/)secrets/'; then
-            echo "::error::A private env/credential-vault file is tracked. Remove it and rotate exposed credentials."
-            exit 1
-          fi
-          echo "No committed credential-shaped literal, .env, or dashboard vault found."
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bybit-acceptance-py${{ matrix.python-version }}
+          path: |
+            reports/bybit_acceptance_*.json
+            reports/bybit_acceptance_*.md
+          if-no-files-found: warn
+          retention-days: 14
