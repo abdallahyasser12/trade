@@ -8,18 +8,23 @@ Use the primary dashboard:
 
 1. Open **SETTINGS → Connect Bybit Demo**.
 2. Paste a key/secret created under **Bybit Demo Trading** and click **Test & Save**. Do not grant withdrawal permission.
-3. Confirm the readiness row shows the Demo API ready, the adaptive strategy lifecycle eligible, a BTC/ETH/SOL universe selected, and the emergency latch clear.
-4. Choose 72 or 120 hours.
-5. Set the USDT strategy capital allocation.
-6. Leave **researched smart-exit consumers** enabled for the full management-policy burn-in unless deliberately testing the conservative baseline.
-7. Enable/disable phone push notifications as desired; notification delivery never affects trading.
-8. Click **Start Bybit Demo**.
-9. Monitor HOME, MARKETS and PERFORMANCE.
-10. Use **Stop gracefully** for ordinary shutdown; use **EMERGENCY STOP** only for a fail-safe halt.
+3. Under **Verify tiny Demo order path**, explicitly acknowledge the small economic Demo order and run the smoke. It must PASS for the current credential pair.
+4. Confirm the readiness row shows the Demo API ready, Demo smoke PASS, adaptive strategy lifecycle eligible, a BTC/ETH/SOL universe selected, and the emergency latch clear.
+5. Choose 72 or 120 hours.
+6. Set the USDT strategy capital allocation.
+7. Leave **researched smart-exit consumers** enabled for the full management-policy burn-in unless deliberately testing the conservative baseline.
+8. Enable/disable phone push notifications as desired; notification delivery never affects trading.
+9. Click **Start Bybit Demo**.
+10. Monitor HOME, MARKETS and PERFORMANCE.
+11. Use **Stop gracefully** for ordinary shutdown; use **EMERGENCY STOP** only for a fail-safe halt.
 
 The backend remains alive when the browser closes.
 
 Dashboard-saved credentials live only in the server-side credential vault (`secrets/bybit_demo_credentials.json`, or `/app/secrets/...` in production), with restrictive file permissions. The vault is Git-ignored and mounted only into the operator dashboard container. Credentials are never written to SQLite, reports, logs, URLs, API responses or subprocess arguments; the detached backend receives them only through its environment.
+
+Changing or clearing dashboard-saved credentials invalidates the stored Demo-smoke PASS. The dashboard refuses to start the burn-in until the smoke passes again for the new credential pair.
+
+Production browser access itself is protected by Caddy Basic Auth over HTTPS. Both `/` and `/research` require username `operator` plus the private `TRADE_DASHBOARD_PASSWORD`; `/api/*` retains its separate bearer-token authentication.
 
 ## Frozen identity
 
@@ -127,9 +132,29 @@ and always states that the strategy is **not proven** by a 3–5 day sample.
 
 During an active run the dashboard uses a time-causal report boundary ending at the current time, never the future planned stop time.
 
+## One-command repository acceptance
+
+When GitHub-hosted runners are unavailable, run:
+
+```bash
+python scripts/run_bybit_acceptance.py
+```
+
+This runs the hermetic Bybit/dashboard safety suite plus the complete legacy regression suite and writes `reports/bybit_acceptance_<SHA>.json` and `.md` evidence.
+
+To append the real Demo smoke after the hermetic checks pass:
+
+```bash
+python scripts/run_bybit_acceptance.py \
+  --demo-smoke \
+  --confirm-demo-order I_ACCEPT_BYBIT_DEMO_ORDER
+```
+
+The optional economic smoke remains Demo-only and requires real Demo credentials.
+
 ## Exact service commands
 
-The dashboard launches these semantics itself, but the exact acceptance commands are:
+The dashboard launches these semantics itself, but the exact service commands are:
 
 ```bash
 python scripts/run_bybit_demo_burnin.py --hours 72
@@ -142,9 +167,11 @@ Optional server-side universe/capital assertions can be supplied, for example:
 python scripts/run_bybit_demo_burnin.py --hours 72 --capital-usdt 1000 --symbols BTC/USD ETH/USD SOL/USD
 ```
 
+The service command remains available for recovery/diagnostics, but normal dashboard operation enforces the credential-bound smoke gate first.
+
 ## Demo smoke
 
-The economic smoke is explicitly opt-in and Demo-only:
+The economic smoke is explicitly opt-in and Demo-only. Normal operators run it from SETTINGS; the equivalent command is:
 
 ```bash
 python scripts/bybit_demo_smoke.py --confirm I_ACCEPT_BYBIT_DEMO_ORDER
